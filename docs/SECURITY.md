@@ -148,7 +148,7 @@ Responses include these browser-facing headers:
 - a Permissions Policy disabling camera, microphone, geolocation, and payment.
 
 API responses receive `Cache-Control: no-store`. The service worker caches only an exact list of
-same-origin shell resources under the versioned `kegpulse-shell-v1-network-first` cache. It bypasses
+same-origin shell resources under the versioned `kegpulse-shell-v2-demo-guide` cache. It bypasses
 every `/api/` request and every non-GET request, uses a cached `/` only as the offline navigation
 fallback, and deletes only obsolete caches whose names begin with `kegpulse-shell-`. Shell requests
 are network-first, and install/activation immediately replaces an old worker so a cached shell

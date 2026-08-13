@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v1-network-first";
+const CACHE_NAME = "kegpulse-shell-v2-demo-guide";
 const SHELL = [
   "/",
   "/static/styles.css",

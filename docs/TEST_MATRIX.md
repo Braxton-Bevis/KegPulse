@@ -45,6 +45,7 @@ Evidence types: **U** unit/property, **I** integration, **E** browser, **P** pac
 | UI-02 | 800x480, 1024x600, desktop; no overflow/touch-size failures | parametrized browser test; physical touchscreens | PASS-A / OPEN-M |
 | UI-03 | Keyboard focus, labels, non-color status/live regions | browser semantic/focus checks; screen reader/contrast | PASS-A / OPEN-M |
 | UI-04 | Refresh/second tab converge during an active session | browser active-session refresh/multi-page test | PASS-A |
+| UI-05 | Demo-only contextual tutorial covers all persistent/live/completion screens and stays absent in hardware mode | tutorial navigation, dismiss/reopen, touch geometry, mode-isolation browser tests + screenshots | PASS-A |
 | OS-01 | Fresh non-admin setup from paths with spaces | Windows setup locally; Linux jobs | Windows PASS-P / Linux CI-CONFIGURED |
 | OS-02 | Occupied port, external data path, graceful shutdown | CLI unit and Windows frozen smoke | PASS-A |
 | PKG-01 | Native one-folder assets; no writes inside bundle | Windows package smoke; Linux package job | Windows PASS-P / Linux CI-CONFIGURED |
@@ -78,6 +79,6 @@ These presentation checks are deliberately not represented as hardware or automa
 The complete gate is Ruff format/lint, strict mypy, pytest with at least 90% branch coverage over domain/protocol/calibration/reconciliation modules, PlatformIO native tests, Nano compilation, Playwright Chromium at the required viewports, fixture-generation checks, target-native packaging, and frozen demo smoke. Linux and Python 3.11 evidence remains target-native CI evidence until those jobs actually run; it is not inferred from this Windows/Python 3.12 workstation.
 
 Final local Windows evidence: 259 host tests passed with 2 Linux-only skips; all named core branch
-targets exceeded 90%; 16 Chromium tests passed; 17 native firmware tests passed; the Nano target
+targets exceeded 90%; 19 Chromium tests passed; 17 native firmware tests passed; the Nano target
 compiled at 14,664/30,720 bytes flash and 1,612/2,048 bytes RAM; and the Windows x64 frozen package
 passed its calibrated-pour, restart, asset, lock, occupied-port, Unicode-path, and integrity smoke.

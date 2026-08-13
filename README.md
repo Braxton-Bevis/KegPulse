@@ -52,7 +52,7 @@ Windows PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
-.\scripts\run-windows.ps1 -Demo
+powershell -ExecutionPolicy Bypass -File .\scripts\run-windows.ps1 -Demo
 ```
 
 Linux:
@@ -77,6 +77,26 @@ In demo mode, use Device & settings for deterministic pulses, disconnect/reconne
 corrupt/duplicate/delayed frame controls. Demo API/UI controls do not exist in hardware mode and
 demo cannot be combined with LAN mode.
 
+Every demo screen includes a contextual **Demo guide** with its purpose, concrete actions, and
+Previous/Next links through the recommended journey. The six persistent pages form the main tour;
+the live-pour and completion screens add their own just-in-time instructions. Choose **Hide tips**
+to collapse a guide for the current browser session and **Show demo guide** to reopen it. These
+guides and controls are never rendered in hardware mode.
+
+![Guided demo dashboard](artifacts/browser/demo-tutorial-home.png)
+
+### Screenshot tour
+
+- [Dashboard guide](artifacts/browser/demo-tutorial-home.png)
+- [Keg inventory guide](artifacts/browser/demo-tutorial-keg.png)
+- [Calibration guide](artifacts/browser/demo-tutorial-calibration.png)
+- [People guide](artifacts/browser/demo-tutorial-people.png)
+- [Device and settings guide](artifacts/browser/demo-tutorial-device.png)
+- [Live-pour guide](artifacts/browser/demo-tutorial-live-pour.png)
+- [Simulator controls](artifacts/browser/demo-tutorial-simulator-controls.png)
+- [Completed-pour guide](artifacts/browser/demo-tutorial-complete.png)
+- [History guide](artifacts/browser/demo-tutorial-history.png)
+
 ## First demo journey
 
 1. Install a test keg from **Keg**.
@@ -87,6 +107,10 @@ demo cannot be combined with LAN mode.
 5. Add pulses without arming to create a guest/unattributed pour; assign it from **History**.
 6. Replace the keg, export CSV/JSON, create a backup, restart with the same data directory, and
    confirm history and inventory remain.
+
+The on-screen guide links follow this same workflow: **Dashboard → Keg → Calibration → People →
+Device & settings → History**. When a pour is armed, its live guide explains how to use the
+simulator controls; the completion guide then points to the durable history record.
 
 Raw flow captured before calibration is preserved as `needs_review` with unknown volume; it is
 never erased or converted later using a guessed factor.

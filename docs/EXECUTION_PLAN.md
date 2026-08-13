@@ -55,7 +55,7 @@ were explicitly sequenced before integration and the complete gate.
 Test reports, coverage XML/HTML, browser traces/screenshots where available, native firmware output, board compilation output, package-smoke logs, and artifact SHA-256 values are generated under `artifacts/` or CI. Hardware-only items remain marked manual until recorded on the actual sensor, Nano-compatible board, line, scale, Windows host, and Pi.
 
 The final Windows/Python 3.12 gate completed with 259 host tests passing and 2 Linux-only skips,
-16 Chromium journeys passing, 17 native firmware tests passing, a successful Nano build, and a
+19 Chromium journeys passing, 17 native firmware tests passing, a successful Nano build, and a
 successful frozen Windows package smoke. Windows package, process-lock, restart, asset, and
 external-data-path checks passed. Linux/Python 3.11 jobs are configured for target-native CI but
 were not executed on this workstation. The final specialist reviews left no unresolved

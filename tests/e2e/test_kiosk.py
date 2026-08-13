@@ -34,6 +34,26 @@ def populate_calibration(repo: Repository, liquid: str) -> dict[str, object]:
     return calibration
 
 
+def open_demo_simulator_controls(page: Page, guide_title: str) -> None:
+    page.get_by_role("link", name="Simulator controls", exact=False).click()
+    expect(page).to_have_url(re.compile(r"#/settings$"))
+    guide = page.get_by_role("region", name=guide_title)
+    expect(guide).to_be_visible()
+    guide.get_by_role("link", name="Use simulator controls", exact=False).click()
+    expect(page.locator("#demo-simulator-controls")).to_be_focused()
+
+
+def add_demo_pulses(page: Page, *, batches: int = 10) -> None:
+    pulse = page.locator("#demo-simulator-controls").get_by_role("button", name="Add 25 pulses")
+    for _ in range(batches):
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/demo/action")
+            and response.request.method == "POST"
+        ):
+            pulse.click()
+        expect(pulse).to_be_enabled()
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("viewport", [(800, 480), (1024, 600), (1440, 900)])
 def test_required_viewports_are_touch_safe_and_local_only(
@@ -54,7 +74,7 @@ def test_required_viewports_are_touch_safe_and_local_only(
             """() => ({
               scroll: document.documentElement.scrollWidth,
               width: window.innerWidth,
-              buttons: [...document.querySelectorAll('button')]
+              controls: [...document.querySelectorAll('button, a.button')]
                 .filter((x) => x.offsetParent !== null)
                 .map((x) => ({
                   w: x.getBoundingClientRect().width,
@@ -63,7 +83,7 @@ def test_required_viewports_are_touch_safe_and_local_only(
             })"""
         )
         assert metrics["scroll"] <= metrics["width"]
-        assert all(item["h"] >= 44 and item["w"] >= 44 for item in metrics["buttons"])
+        assert all(item["h"] >= 44 and item["w"] >= 44 for item in metrics["controls"])
         page.keyboard.press("Tab")
         assert page.locator(":focus").is_visible()
         assert all(url.startswith(live_app.url) for url in requests)
@@ -73,6 +93,227 @@ def test_required_viewports_are_touch_safe_and_local_only(
         )
     finally:
         context.close()
+
+
+@pytest.mark.e2e
+def test_demo_tutorial_covers_every_screen_and_captures_walkthrough(
+    page: Page, live_app: LiveApp
+) -> None:
+    repo = live_app.app.state.repository
+    configure_measurement(repo)
+    repo.create_participant("Morgan")
+    repo.create_participant("Riley")
+    repo.set_setting("completion_seconds", 60)
+    wait_connected(page, live_app)
+
+    def capture(filename: str) -> None:
+        # A normal desktop viewport shows the sticky header exactly once and is
+        # tall enough to include the contextual guide plus surrounding UI.
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.evaluate("window.scrollTo(0, 0)")
+        page.evaluate("document.activeElement?.blur()")
+        page.screenshot(path=live_app.artifacts / filename)
+        page.set_viewport_size({"width": 1024, "height": 600})
+
+    def assert_guide(title: str) -> None:
+        page.set_viewport_size({"width": 800, "height": 480})
+        guide = page.get_by_role("region", name=title)
+        expect(guide).to_be_visible()
+        expect(guide.locator("li")).not_to_have_count(0)
+        expect(guide.get_by_role("navigation", name="Demo tutorial navigation")).to_be_visible()
+        geometry = guide.evaluate(
+            """(element) => ({
+              documentWidth: document.documentElement.scrollWidth,
+              viewportWidth: window.innerWidth,
+              viewportHeight: window.innerHeight,
+              guide: element.getBoundingClientRect().toJSON(),
+              controls: [...element.querySelectorAll('button, a.button')].map((control) => ({
+                width: control.getBoundingClientRect().width,
+                height: control.getBoundingClientRect().height
+              }))
+            })"""
+        )
+        assert geometry["documentWidth"] <= geometry["viewportWidth"]
+        assert geometry["guide"]["top"] < geometry["viewportHeight"]
+        assert geometry["guide"]["bottom"] > 0
+        assert all(
+            control["width"] >= 44 and control["height"] >= 44 for control in geometry["controls"]
+        )
+        page.set_viewport_size({"width": 1024, "height": 600})
+
+    guides = [
+        ("Start from the dashboard", "demo-tutorial-home.png", "Set up a keg"),
+        ("Give the demo an inventory", "demo-tutorial-keg.png", "Calibrate"),
+        (
+            "Teach KegPulse the pulse-to-volume factor",
+            "demo-tutorial-calibration.png",
+            "Add people",
+        ),
+        ("Add people without changing history", "demo-tutorial-people.png", "Run the simulator"),
+        ("Drive the virtual flow meter", "demo-tutorial-device.png", "Review history"),
+        ("Audit what the demo recorded", "demo-tutorial-history.png", "Finish at dashboard"),
+    ]
+    for guide_title, filename, next_label in guides:
+        assert_guide(guide_title)
+        if guide_title == "Teach KegPulse the pulse-to-volume factor":
+            page.get_by_role("button", name="Load calibration runs").click()
+            expect(page.locator('[data-calibration-status="active"]')).to_be_visible()
+        elif guide_title == "Add people without changing history":
+            page.get_by_role("button", name="Load all profiles").click()
+            expect(page.locator('input[value="Morgan"]')).to_be_visible()
+        capture(filename)
+        page.get_by_role("link", name=next_label, exact=False).click()
+
+    expect(page.get_by_role("region", name="Start from the dashboard")).to_be_visible()
+    page.get_by_role("link", name="Pour history", exact=False).click()
+    expect(page.get_by_role("region", name="Audit what the demo recorded")).to_be_visible()
+    page.get_by_role("link", name="Finish at dashboard", exact=False).click()
+
+    page.goto(f"{live_app.url}/#/complete")
+    expect(page.get_by_role("region", name="Start from the dashboard")).to_be_visible()
+    expect(page.get_by_role("region", name="Confirm what was saved")).to_have_count(0)
+    page.goto(f"{live_app.url}/#/")
+
+    page.get_by_role("button", name="Hide the demo guide on this page").click()
+    expect(page.locator("[data-demo-guide]")).to_have_count(0)
+    opener = page.get_by_role("button", name="Show demo guide")
+    expect(opener).to_be_focused()
+    page.reload()
+    expect(page.get_by_role("button", name="Show demo guide")).to_be_visible()
+    page.goto(f"{live_app.url}/#/keg")
+    expect(page.get_by_role("region", name="Give the demo an inventory")).to_be_visible()
+    page.goto(f"{live_app.url}/#/")
+    opener = page.get_by_role("button", name="Show demo guide")
+    opener.click()
+    dashboard_guide = page.get_by_role("region", name="Start from the dashboard")
+    expect(dashboard_guide).to_be_focused()
+    next_guide_link = page.get_by_role("link", name="Set up a keg", exact=False)
+    next_guide_link.focus()
+    expect(next_guide_link).to_be_focused()
+    live_app.simulator.disconnect_device()
+    expect(page.locator("#connection-badge")).to_contain_text("Reconnecting", timeout=5000)
+    expect(next_guide_link).to_be_focused()
+    live_app.simulator.reconnect_device()
+    expect(page.locator("#connection-badge")).to_contain_text("connected", timeout=10_000)
+    expect(next_guide_link).to_be_focused()
+
+    page.get_by_role("button", name="Morgan", exact=True).click()
+    expect(page).to_have_url(re.compile(r"#/pour$"))
+    expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
+    expect(page.get_by_text(re.compile(r"seconds? left to open the tap"))).to_be_visible()
+    assert_guide("Watch an authoritative measurement")
+    capture("demo-tutorial-live-pour.png")
+
+    open_demo_simulator_controls(page, "Watch an authoritative measurement")
+    controls = page.locator("#demo-simulator-controls")
+    expect(controls.get_by_role("heading", name="Demo simulator controls")).to_be_visible()
+    page.set_viewport_size({"width": 1440, "height": 900})
+    controls.scroll_into_view_if_needed()
+    page.evaluate(
+        """() => {
+          const controls = document.querySelector('#demo-simulator-controls');
+          const header = document.querySelector('.app-header');
+          const top = controls.getBoundingClientRect().top + window.scrollY;
+          window.scrollTo(0, Math.max(0, top - header.getBoundingClientRect().height - 12));
+        }"""
+    )
+    page.evaluate("document.activeElement?.blur()")
+    page.screenshot(path=live_app.artifacts / "demo-tutorial-simulator-controls.png")
+    page.set_viewport_size({"width": 1024, "height": 600})
+    add_demo_pulses(page, batches=20)
+    expect(page.get_by_text("pouring", exact=True)).to_be_visible(timeout=5000)
+    controls.get_by_role("button", name="Finish pour").click()
+    expect(page).to_have_url(re.compile(r"#/complete$"), timeout=5000)
+    assert_guide("Confirm what was saved")
+    expect(page.get_by_text("500 raw pulses", exact=False)).to_be_visible()
+    page.get_by_role("button", name="Stay here").click()
+    capture("demo-tutorial-complete.png")
+
+    page.goto(f"{live_app.url}/#/history")
+    assert_guide("Audit what the demo recorded")
+    page.get_by_role("button", name="Refresh history").click()
+    expect(page.get_by_role("cell", name="Morgan", exact=True)).to_be_visible()
+    capture("demo-tutorial-history.png")
+
+
+@pytest.mark.e2e
+def test_demo_tutorial_is_absent_from_every_hardware_screen(
+    hardware_page: Page, live_hardware_app: LiveApp
+) -> None:
+    page = hardware_page
+    wait_connected(page, live_hardware_app)
+    for path in ("/", "/keg", "/calibration", "/participants", "/settings", "/history"):
+        page.goto(f"{live_hardware_app.url}/#{path}")
+        expect(page.locator("[data-demo-guide], [data-demo-guide-slot]")).to_have_count(0)
+        expect(page.get_by_role("button", name="Show demo guide")).to_have_count(0)
+
+    page.goto(f"{live_hardware_app.url}/#/")
+    page.get_by_role("button", name="Start pour").click()
+    expect(page).to_have_url(re.compile(r"#/pour$"))
+    expect(page.locator("[data-demo-guide], [data-demo-guide-slot]")).to_have_count(0)
+    live_hardware_app.simulator.inject_pulses(25)
+    live_hardware_app.simulator.finish_pour()
+    expect(page).to_have_url(re.compile(r"#/complete$"), timeout=5000)
+    expect(page.locator("[data-demo-guide], [data-demo-guide-slot]")).to_have_count(0)
+
+
+@pytest.mark.e2e
+def test_demo_tutorial_tracks_calibration_verification_and_interruption_states(
+    page: Page, live_app: LiveApp
+) -> None:
+    repo = live_app.app.state.repository
+    configure_measurement(repo)
+    draft = repo.create_calibration("demo-water", 1)
+    wait_connected(page, live_app)
+
+    page.goto(f"{live_app.url}/#/calibration")
+    page.get_by_role("button", name="Load calibration runs").click()
+    draft_run = page.locator('[data-calibration-status="draft"]:has-text("demo-water")')
+    draft_run.get_by_role("button", name="Capture sample 1").click()
+    expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
+    expect(page.get_by_role("region", name="Simulate a weighed calibration pour")).to_be_visible()
+    open_demo_simulator_controls(page, "Simulate a weighed calibration pour")
+    add_demo_pulses(page)
+    page.locator("#demo-simulator-controls").get_by_role("button", name="Finish pour").click()
+    weighed_guide = page.get_by_role("region", name="Enter the weighed sample")
+    expect(weighed_guide).to_be_visible(timeout=5000)
+    expect(weighed_guide).to_be_focused()
+    expect(page.locator("#announcer")).to_contain_text("Next: Open Calibration page")
+    page.get_by_role("link", name="Open Calibration page", exact=False).click()
+    page.get_by_label("Scale mass (g)").fill("50")
+    page.get_by_role("button", name="Save measured check").click()
+    expect(page.get_by_role("button", name="Capture sample 2")).to_be_visible(timeout=5000)
+    assert repo.calibration_detail(draft["id"])["samples"][0]["raw_pulses"] == 250
+
+    page.get_by_role("button", name="Start weighed verification pour").click()
+    expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
+    expect(page.get_by_role("region", name="Simulate a weighed verification pour")).to_be_visible()
+    open_demo_simulator_controls(page, "Simulate a weighed verification pour")
+    add_demo_pulses(page)
+    page.locator("#demo-simulator-controls").get_by_role("button", name="Finish pour").click()
+    verification_guide = page.get_by_role("region", name="Enter the verification mass")
+    expect(verification_guide).to_be_visible(timeout=5000)
+    expect(verification_guide).to_be_focused()
+    expect(page.locator("#announcer")).to_contain_text("Next: Open Calibration page")
+    page.get_by_role("link", name="Open Calibration page", exact=False).click()
+    page.get_by_label("Scale mass (g)").fill("50")
+    page.get_by_role("button", name="Save measured check").click()
+    expect(page.get_by_role("heading", name="Latest verification")).to_be_visible(timeout=5000)
+
+    page.get_by_role("button", name="Start weighed verification pour").click()
+    expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
+    open_demo_simulator_controls(page, "Simulate a weighed verification pour")
+    add_demo_pulses(page, batches=1)
+    page.locator("#demo-simulator-controls").get_by_role("button", name="Reset device").click()
+    expect(page.get_by_role("dialog")).to_be_visible()
+    page.locator("#confirm-accept").click()
+    recovery_guide = page.get_by_role("region", name="Review the interrupted verification")
+    expect(recovery_guide).to_be_visible(timeout=10_000)
+    expect(recovery_guide).to_be_focused()
+    expect(page.locator("#announcer")).to_contain_text("Next: Return to Calibration")
+    page.get_by_role("link", name="Return to Calibration", exact=True).click()
+    expect(page.get_by_role("heading", name="Latest verification")).to_be_visible(timeout=5000)
+    assert len(repo.list_verifications()) == 1
 
 
 @pytest.mark.e2e
@@ -304,7 +545,7 @@ def test_ten_capture_calibration_outlier_activation_and_verification(
     expect(page.get_by_text(re.compile(r"5\.000000 pulses/mL"))).to_be_visible(timeout=5000)
 
     page.get_by_role("button", name="Start weighed verification pour").click()
-    expect(page.get_by_role("heading", name="Verification pour")).to_be_visible()
+    expect(page.get_by_role("heading", name="Verification pour", exact=True)).to_be_visible()
     live_app.simulator.inject_pulses(500)
     live_app.simulator.finish_pour()
     expect(page.get_by_role("link", name="Enter scale mass")).to_be_visible(timeout=5000)

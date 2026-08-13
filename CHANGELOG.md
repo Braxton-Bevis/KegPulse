@@ -33,6 +33,8 @@
   preserved failed-form input, exposed unattributed device flow, and completed calibration evidence.
 - Synchronized PIN lock/unlock controls without discarding unrelated form edits and made active or
   superseded calibration evidence explicitly read-only.
+- Added a demo-only contextual tutorial on every persistent, live-pour, and completion screen with
+  accessible hide/reopen controls, guided navigation, responsive styling, and screenshot coverage.
 
 Hardware-dependent characteristics—sensor electrical behavior, plumbing/food-contact suitability,
 physical pulse accuracy, Windows COM and Raspberry Pi deployment—remain explicitly unverified

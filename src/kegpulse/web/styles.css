@@ -156,6 +156,20 @@ input, select, textarea {
   width: 100%; min-height: 48px; border: 2px solid var(--border); border-radius: 10px;
   padding: .65rem .75rem; background: var(--surface); color: var(--text);
 }
+label:has(input[type="checkbox"]) {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+}
+input[type="checkbox"] {
+  width: 1.4rem;
+  height: 1.4rem;
+  min-height: 1.4rem;
+  flex: 0 0 auto;
+  padding: 0;
+  accent-color: var(--brand);
+}
 textarea { min-height: 90px; resize: vertical; }
 fieldset { border: 1px solid var(--border); border-radius: 12px; padding: 1rem; }
 legend { font-weight: 800; padding: 0 .35rem; }
@@ -163,6 +177,19 @@ legend { font-weight: 800; padding: 0 .35rem; }
 
 .pour-screen { min-height: calc(100vh - 130px); display: grid; place-items: center; text-align: center; }
 .pour-panel { width: min(720px, 100%); }
+.pour-screen.with-demo-guide {
+  grid-template-columns: minmax(260px, .75fr) minmax(420px, 1.25fr);
+  gap: 1rem;
+  align-items: center;
+}
+.pour-screen.with-demo-guide .pour-panel { width: 100%; }
+.pour-screen.with-demo-guide .pour-amount {
+  font-size: clamp(2.25rem, 5vw, 4rem);
+  white-space: nowrap;
+}
+.pour-screen .demo-guide-slot { width: 100%; margin: 0; }
+.pour-screen .demo-guide { text-align: left; }
+.pour-screen .demo-guide-steps { grid-template-columns: repeat(2, minmax(170px, 1fr)); }
 .pour-state { text-transform: uppercase; letter-spacing: .08em; font-weight: 850; color: var(--brand-strong); }
 .pour-amount { font-size: clamp(3rem, 13vw, 7rem); font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; margin: 1rem 0; }
 .countdown { font-size: 1.25rem; font-variant-numeric: tabular-nums; }
@@ -204,6 +231,62 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
 .empty { padding: 1.5rem; text-align: center; color: var(--muted); border: 2px dashed var(--border); border-radius: 12px; }
 .setup-callout { border-left: 7px solid var(--accent); }
 
+.demo-guide-slot { margin: 1rem 0 1.25rem; }
+.demo-guide {
+  border-color: var(--accent);
+  border-left: 7px solid var(--accent);
+  background: var(--surface);
+}
+.demo-guide-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.demo-guide-heading h2 { margin: .15rem 0 .35rem; }
+.demo-guide-eyebrow {
+  margin: 0;
+  color: var(--warning);
+  font-size: .8rem;
+  font-weight: 850;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.demo-guide-purpose { margin: .2rem 0 1rem; }
+.demo-guide-dismiss { min-height: 44px; flex: 0 0 auto; }
+.demo-guide-steps {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  margin: 0;
+}
+.demo-guide-steps li {
+  min-width: 0;
+  padding: .7rem;
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.demo-guide-steps li::before {
+  background: var(--brand);
+  color: #fff;
+}
+.demo-guide-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: .7rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+.demo-guide-launcher { display: flex; justify-content: flex-end; }
+.demo-guide-launcher button { min-height: 44px; }
+.demo-guide-launcher button span {
+  width: 1.45rem;
+  height: 1.45rem;
+  display: inline-grid;
+  place-items: center;
+  border: 2px solid currentcolor;
+  border-radius: 50%;
+}
+
 @media (min-width: 1000px) {
   .app-header { grid-template-columns: auto 1fr auto; }
   #menu-button { display: none; }
@@ -222,6 +305,11 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
   .table-wrap { display: none; }
   .sample-cards { display: grid; gap: .6rem; }
   .device-phase-card { grid-template-columns: 1fr; }
+  .demo-guide-heading { align-items: center; }
+  .demo-guide-steps { grid-template-columns: 1fr; }
+  .demo-guide-nav { display: grid; grid-template-columns: 1fr; }
+  .pour-screen.with-demo-guide { grid-template-columns: 1fr; }
+  .pour-screen .demo-guide-steps { grid-template-columns: 1fr; }
   main { padding: .75rem; }
 }
 
@@ -230,6 +318,16 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
   .brand img { width: 36px; height: 36px; }
   main { padding: .6rem .8rem; }
   .pour-screen { min-height: 380px; }
+  .pour-screen.with-demo-guide { gap: .6rem; }
+  .pour-screen .demo-guide { padding: .65rem; }
+  .pour-screen .demo-guide-heading { gap: .5rem; }
+  .pour-screen .demo-guide-heading h2 { font-size: 1.15rem; margin-bottom: .2rem; }
+  .pour-screen .demo-guide-purpose { margin-bottom: .5rem; font-size: .88rem; }
+  .pour-screen .demo-guide-steps { gap: .35rem; }
+  .pour-screen .demo-guide-steps li { padding: .4rem; font-size: .82rem; grid-template-columns: 28px 1fr; gap: .35rem; }
+  .pour-screen .demo-guide-steps li::before { width: 26px; height: 26px; }
+  .pour-screen .demo-guide-nav { margin-top: .5rem; padding-top: .5rem; }
+  .pour-screen .demo-guide-nav .button { min-height: 44px; padding: .45rem .55rem; font-size: .85rem; }
   .pour-amount { font-size: clamp(3rem, 12vh, 5rem); margin: .5rem; }
   .card { padding: .8rem; }
   h1 { font-size: 1.75rem; }

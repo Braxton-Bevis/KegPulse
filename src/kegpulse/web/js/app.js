@@ -35,8 +35,275 @@ const state = {
   dismissedTerminalId: null,
   dialogInvoker: null,
   pending: new Set(),
+  dismissedDemoGuides: new Set(),
   renderedRoute: null,
 };
+
+const DEMO_GUIDE_STORAGE_PREFIX = "kegpulse.demo-guide.dismissed.";
+const DEMO_GUIDES = {
+  "/": {
+    eyebrow: "Demo tour · 1 of 6",
+    title: "Start from the dashboard",
+    purpose: "Use this page to confirm the simulator is ready, check inventory, and choose who owns the next pour.",
+    steps: [
+      "Check that Flow device says Idle; setup warnings explain anything still missing.",
+      "Select a participant, or Guest / Unattributed, before simulating flow.",
+      "When the live screen opens, visit Device & Settings to add pulses and finish the pour.",
+    ],
+    previous: ["/history", "Pour history"],
+    next: ["/keg", "Set up a keg"],
+  },
+  "/keg": {
+    eyebrow: "Demo tour · 2 of 6",
+    title: "Give the demo an inventory",
+    purpose: "Install a pretend keg so measured pours can be attached to a keg and deducted from its starting volume.",
+    steps: [
+      "Enter a recognizable label, starting volume in mL, and installation time.",
+      "Submit the form and confirm the current and remaining amounts appear on the left.",
+      "Use a signed adjustment only to model a known correction, and always record its reason.",
+    ],
+    previous: ["/", "Dashboard"],
+    next: ["/calibration", "Calibrate"],
+  },
+  "/calibration": {
+    eyebrow: "Demo tour · 3 of 6",
+    title: "Teach KegPulse the pulse-to-volume factor",
+    purpose: "A ten-pour scale run turns preserved raw pulses into volume without guessing or rewriting earlier evidence.",
+    steps: [
+      "Create a water run at 1.000 g/mL, then start its first sample.",
+      "On Device & Settings, add varied pulse batches and finish; back here, enter mass using the simulator's 5 pulses/mL factor (250 pulses = 50.00 g of water).",
+      "Repeat for ten samples, review every residual and inclusion choice, then activate with at least seven included samples.",
+      "After activation, try a weighed verification; it checks drift without changing the factor.",
+    ],
+    previous: ["/keg", "Keg inventory"],
+    next: ["/participants", "Add people"],
+  },
+  "/participants": {
+    eyebrow: "Demo tour · 4 of 6",
+    title: "Add people without changing history",
+    purpose: "Profiles make new pours easy to attribute while old records remain intact when a profile changes.",
+    steps: [
+      "Add a display name for someone who will appear on the dashboard.",
+      "Load all profiles to rename one or toggle whether it remains active on the home screen.",
+      "Return to the dashboard and select the new profile before starting a demo pour.",
+    ],
+    previous: ["/calibration", "Calibration"],
+    next: ["/settings", "Run the simulator"],
+  },
+  "/settings": {
+    eyebrow: "Demo tour · 5 of 6",
+    title: "Drive the virtual flow meter",
+    purpose: "The demo controls generate the same checked protocol events the host expects from the Nano, without touching hardware.",
+    steps: [
+      "Inspect the simulated device identity, boot ID, state, pulse counters, and timing source.",
+      "During an armed pour or calibration sample, use Add 25 pulses as often as needed, then choose Finish pour.",
+      "Try disconnect/reconnect or a next-frame fault to see recovery behavior; Reset device deliberately changes its boot identity.",
+      "Save display units or timing preferences, then inspect the resulting record in Pour history.",
+    ],
+    previous: ["/participants", "Participants"],
+    next: ["/history", "Review history"],
+  },
+  "/history": {
+    eyebrow: "Demo tour · 6 of 6",
+    title: "Audit what the demo recorded",
+    purpose: "This page shows the durable pour ledger, including its raw evidence and the context used for each measurement.",
+    steps: [
+      "Refresh history, then filter by participant or show only unattributed pours.",
+      "Open Measurement details to inspect pulses, keg, calibration, device, boot, event, and fault evidence.",
+      "Assign a guest pour with a reason, or export CSV/JSON to inspect the same records outside the kiosk.",
+    ],
+    previous: ["/settings", "Device & Settings"],
+    next: ["/", "Finish at dashboard"],
+  },
+  "/complete": {
+    eyebrow: "Completed-pour guide",
+    title: "Confirm what was saved",
+    purpose: "The completion screen summarizes the durable measurement before the kiosk returns home.",
+    steps: [
+      "Check the volume, participant attribution, raw pulse count, and quality message.",
+      "Choose Stay here, or interact with the page, to pause the automatic return timer.",
+      "Open Pour history next to inspect the full device, keg, and calibration evidence.",
+    ],
+    previous: ["/", "Dashboard"],
+    next: ["/history", "Pour history"],
+  },
+};
+
+function currentDemoSession() {
+  return state.snapshot?.session
+    || state.snapshot?.pending_capture
+    || state.snapshot?.terminal_notice
+    || null;
+}
+
+function liveDemoGuide() {
+  const session = currentDemoSession();
+  if (!session) {
+    return {
+      eyebrow: "Live-flow guide",
+      title: "No demo measurement is active",
+      purpose: "The simulator has no active pour or scale capture to show on this screen.",
+      steps: [
+        "Return to the dashboard to arm a person or Guest pour.",
+        "For a scale capture, start a sample or verification from Calibration instead.",
+        "Wait for the visible Armed state before adding simulator pulses.",
+      ],
+      previous: ["/history", "Pour history"],
+      next: ["/", "Start at dashboard"],
+    };
+  }
+  const purpose = session.purpose || "pour";
+  const terminal = ["complete", "timed_out", "interrupted_uncertain"].includes(session.status);
+  const status = terminal
+    ? session.status
+    : (state.snapshot?.device?.status?.state || session.status);
+  if (status === "timed_out") {
+    if (["calibration", "verification"].includes(purpose)) {
+      const label = purpose === "calibration" ? "Calibration sample" : "Verification";
+      return {
+        eyebrow: `${label} timeout guide`,
+        title: `${label} timed out`,
+        purpose: "No simulator pulse arrived before the arming deadline, so no scale measurement was created.",
+        steps: [
+          "Return to Calibration; there is no mass to enter for this attempt.",
+          "Start the sample again, then open Simulator controls before the countdown expires.",
+          "Add pulses before choosing Finish pour, then enter the tared scale mass.",
+        ],
+        previous: ["/settings", "Simulator controls"],
+        next: ["/calibration", "Return to Calibration"],
+      };
+    }
+    return {
+      eyebrow: "Arming-timeout guide",
+      title: "No simulated flow arrived",
+      purpose: "The arming window closed with zero pulses, so KegPulse did not create a pour or scale sample.",
+      steps: [
+        "Choose Return home; there is no measurement to recover or assign.",
+        "Arm again and open Device & Settings before the countdown expires.",
+        "Add pulses first, then choose Finish pour after the intended amount.",
+      ],
+      previous: ["/settings", "Simulator controls"],
+      next: ["/", "Try again"],
+    };
+  }
+  if (status === "interrupted_uncertain") {
+    if (["calibration", "verification"].includes(purpose)) {
+      const label = purpose === "calibration" ? "calibration sample" : "verification";
+      return {
+        eyebrow: "Scale-capture recovery guide",
+        title: `Review the interrupted ${label}`,
+        purpose: "The simulator became unavailable before this scale capture could finish, so KegPulse will not invent a sample.",
+        steps: [
+          "Reconnect the simulator and wait for its current boot identity and state.",
+          "Return to Calibration and confirm that no measured check was silently created.",
+          "Retry the capture from Calibration when the simulator is stable.",
+        ],
+        previous: ["/settings", "Reconnect simulator"],
+        next: ["/calibration", "Return to Calibration"],
+      };
+    }
+    return {
+      eyebrow: "Recovery guide",
+      title: "Review an interrupted measurement",
+      purpose: "The host cannot safely invent what happened after the simulated device became unavailable.",
+      steps: [
+        "Reconnect the simulator from Device & Settings and wait for a fresh identity and status.",
+        "Keep the interrupted evidence; do not replace it with a guessed volume.",
+        "Review Pour history and recent diagnostics after reconnecting.",
+      ],
+      previous: ["/settings", "Reconnect simulator"],
+      next: ["/history", "Review evidence"],
+    };
+  }
+  if (purpose === "calibration") {
+    return status === "complete"
+      ? {
+        eyebrow: "Calibration-capture guide",
+        title: "Enter the weighed sample",
+        purpose: "The simulator captured raw pulses, but calibration needs the scale mass before this sample is durable.",
+        steps: [
+          "Choose Enter scale mass to return to Calibration.",
+          "Enter the tared mass and confirm the displayed liquid density.",
+          "Save the sample, then repeat until all ten varied pours are captured.",
+        ],
+        previous: ["/settings", "Simulator controls"],
+        next: ["/calibration", "Open Calibration page"],
+      }
+      : {
+        eyebrow: "Calibration-capture guide",
+        title: "Simulate a weighed calibration pour",
+        purpose: "This capture stores raw pulses for one sample; it does not create a participant pour or reduce inventory.",
+        steps: [
+          "Watch for Armed, then open Device & Settings before the countdown expires.",
+          "Add a varied pulse batch and choose Finish pour when the sample is complete.",
+          "Return to Calibration and enter the tared scale mass for this sample.",
+        ],
+        previous: ["/calibration", "Calibration"],
+        next: ["/settings", "Simulator controls"],
+      };
+  }
+  if (purpose === "verification") {
+    return status === "complete"
+      ? {
+        eyebrow: "Verification guide",
+        title: "Enter the verification mass",
+        purpose: "The pulse capture is complete; the scale mass will compare actual and predicted volume without changing the factor.",
+        steps: [
+          "Choose Enter scale mass and confirm the density used for the liquid.",
+          "Save the weighed check and review its absolute and percentage error.",
+          "Investigate a warning rather than silently changing the active calibration.",
+        ],
+        previous: ["/settings", "Simulator controls"],
+        next: ["/calibration", "Open Calibration page"],
+      }
+      : {
+        eyebrow: "Verification guide",
+        title: "Simulate a weighed verification pour",
+        purpose: "This capture checks calibration drift; it will not create a participant pour or change inventory.",
+        steps: [
+          "Watch for Armed, then add a known pulse batch from Device & Settings.",
+          "Choose Finish pour after the intended test volume.",
+          "Return to Calibration and enter the tared scale mass to compare prediction and reality.",
+        ],
+        previous: ["/calibration", "Calibration"],
+        next: ["/settings", "Simulator controls"],
+      };
+  }
+  return {
+    eyebrow: "Live-flow guide",
+    title: "Watch an authoritative measurement",
+    purpose: "This screen follows the simulator's current state and pulse count for the selected person or Guest.",
+    steps: [
+      "Confirm the attribution and watch for Armed before the countdown expires.",
+      "Open Device & Settings, add one or more pulse batches, then choose Finish pour.",
+      "Cancelling after pulses arrive saves a reviewable partial measurement instead of discarding it.",
+    ],
+    previous: ["/", "Dashboard"],
+    next: ["/settings", "Simulator controls"],
+  };
+}
+
+function settingsDemoGuide() {
+  const session = currentDemoSession();
+  if (!session) return DEMO_GUIDES["/settings"];
+  const guide = liveDemoGuide();
+  const terminal = ["complete", "timed_out", "interrupted_uncertain"].includes(session.status);
+  if (terminal) return guide;
+  return {
+    ...guide,
+    next: ["/settings", "Use simulator controls"],
+    nextAction: "demo-guide-controls",
+  };
+}
+
+function demoGuideContext(path) {
+  if (path === "/pour") return { key: path, guide: liveDemoGuide() };
+  if (path === "/settings") return { key: path, guide: settingsDemoGuide() };
+  if (path === "/complete" && !(state.completionPour || state.snapshot?.last_pour)) {
+    return { key: "/", guide: DEMO_GUIDES["/"] };
+  }
+  return { key: path, guide: DEMO_GUIDES[path] };
+}
 
 dialog.addEventListener("cancel", () => { dialog.returnValue = "cancel"; });
 dialog.addEventListener("close", () => {
@@ -296,7 +563,9 @@ function updateChrome() {
 
 function syncHostControls() {
   const controls = [...main.querySelectorAll("button"), document.querySelector("#confirm-accept")]
-    .filter((control) => control && control.dataset.action !== "retry");
+    .filter((control) => control
+      && control.dataset.action !== "retry"
+      && control.dataset.hostIndependent !== "true");
   for (const control of controls) {
     if (state.hostAvailable === false && !control.disabled) {
       control.dataset.hostDisabled = "true";
@@ -362,6 +631,9 @@ function reconcileRoute(previous, next) {
 
 function applySnapshot(snapshot) {
   if (state.snapshot && Number(snapshot.revision) < Number(state.snapshot.revision)) return;
+  const previousGuideTitle = route() === "/settings" && state.snapshot?.mode === "demo"
+    ? demoGuideContext("/settings").guide?.title
+    : null;
   const previous = state.snapshot;
   state.snapshot = snapshot;
   reconcileRoute(previous, snapshot);
@@ -373,7 +645,21 @@ function applySnapshot(snapshot) {
     main.contains(document.activeElement)
     && document.activeElement.closest("form") !== null
   ) || (dialog.open && state.dialogInvoker && main.contains(state.dialogInvoker));
-  if (!editing || route() === "/pour") render();
+  const rendered = !editing || route() === "/pour";
+  if (rendered) render();
+  if (rendered && route() === "/settings" && snapshot.mode === "demo") {
+    const session = currentDemoSession();
+    const guide = demoGuideContext("/settings").guide;
+    const scaleHandoff = (
+      ["calibration", "verification"].includes(session?.purpose)
+      && ["complete", "timed_out", "interrupted_uncertain"].includes(session?.status)
+      && guide?.title !== previousGuideTitle
+    );
+    if (scaleHandoff) {
+      main.querySelector("#demo-guide")?.focus({ preventScroll: true });
+      announcer.textContent = `${guide.title}. ${guide.purpose} Next: ${guide.next[1]}.`;
+    }
+  }
 }
 
 async function refresh() {
@@ -464,6 +750,97 @@ function connectSocket() {
 
 function page(title, subtitle, content) {
   return `<section><h1 tabindex="-1">${escapeHtml(title)}</h1>${subtitle ? `<p class="lead">${escapeHtml(subtitle)}</p>` : ""}${content}</section>`;
+}
+
+function demoGuideStorageKey(path) {
+  return `${DEMO_GUIDE_STORAGE_PREFIX}${encodeURIComponent(path)}`;
+}
+
+function demoGuideIsDismissed(path) {
+  if (state.dismissedDemoGuides.has(path)) return true;
+  try {
+    return sessionStorage.getItem(demoGuideStorageKey(path)) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setDemoGuideDismissed(path, dismissed) {
+  if (dismissed) state.dismissedDemoGuides.add(path);
+  else state.dismissedDemoGuides.delete(path);
+  try {
+    if (dismissed) sessionStorage.setItem(demoGuideStorageKey(path), "true");
+    else sessionStorage.removeItem(demoGuideStorageKey(path));
+  } catch {
+    // The in-memory preference keeps the tutorial usable when storage is disabled.
+  }
+}
+
+function demoGuideMarkup(path) {
+  const { key, guide } = demoGuideContext(path);
+  if (state.snapshot?.mode !== "demo" || !guide) return "";
+  if (demoGuideIsDismissed(key)) {
+    return `<div class="demo-guide-launcher">
+      <button type="button" class="secondary" data-action="demo-guide-open" data-host-independent="true">
+        <span aria-hidden="true">?</span> Show demo guide
+      </button>
+    </div>`;
+  }
+  const steps = guide.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("");
+  const nextAction = guide.nextAction
+    ? ` data-action="${escapeHtml(guide.nextAction)}" data-host-independent="true"`
+    : "";
+  return `<aside id="demo-guide" class="card demo-guide" data-demo-guide role="region" aria-labelledby="demo-guide-title" tabindex="-1">
+    <div class="demo-guide-heading">
+      <div>
+        <p class="demo-guide-eyebrow">${escapeHtml(guide.eyebrow)}</p>
+        <h2 id="demo-guide-title">${escapeHtml(guide.title)}</h2>
+      </div>
+      <button type="button" class="ghost demo-guide-dismiss" data-action="demo-guide-dismiss" data-host-independent="true" aria-label="Hide the demo guide on this page">Hide tips</button>
+    </div>
+    <p class="demo-guide-purpose">${escapeHtml(guide.purpose)}</p>
+    <ol class="step-list demo-guide-steps">${steps}</ol>
+    <nav class="demo-guide-nav" aria-label="Demo tutorial navigation">
+      <a id="demo-guide-previous" class="button secondary" href="#${guide.previous[0]}"><span aria-hidden="true">←</span> ${escapeHtml(guide.previous[1])}</a>
+      <a id="demo-guide-next" class="button" href="#${guide.next[0]}"${nextAction}>${escapeHtml(guide.next[1])} <span aria-hidden="true">→</span></a>
+    </nav>
+  </aside>`;
+}
+
+function mountDemoGuide() {
+  const markup = demoGuideMarkup(route());
+  if (!markup) return;
+  const slot = `<div class="demo-guide-slot" data-demo-guide-slot>${markup}</div>`;
+  const pourScreen = main.querySelector(".pour-screen");
+  if (pourScreen) {
+    // At kiosk widths the guide sits beside the safety-sensitive live measurement,
+    // keeping both the authoritative state and just-in-time instructions visible.
+    pourScreen.classList.add("with-demo-guide");
+    pourScreen.insertAdjacentHTML("beforeend", slot);
+    return;
+  }
+  const heading = main.querySelector("h1");
+  if (!heading) return;
+  const insertionPoint = heading.nextElementSibling?.classList.contains("lead")
+    ? heading.nextElementSibling
+    : heading;
+  insertionPoint.insertAdjacentHTML(
+    "afterend",
+    slot,
+  );
+}
+
+function refreshDemoGuide(open) {
+  const path = route();
+  const { key } = demoGuideContext(path);
+  setDemoGuideDismissed(key, !open);
+  const slot = main.querySelector("[data-demo-guide-slot]");
+  if (!slot) return;
+  slot.innerHTML = demoGuideMarkup(path);
+  const focusTarget = open
+    ? slot.querySelector("[data-demo-guide]")
+    : slot.querySelector('[data-action="demo-guide-open"]');
+  focusTarget?.focus({ preventScroll: true });
 }
 
 function focusSelector(element) {
@@ -790,17 +1167,17 @@ function settingsView() {
     : "host reference only; actual firmware value is compile-time and not reported by KP1";
   return page("Device & settings", "Hardware state and recovery information stay visible. LAN mode is configured offline and requires a PIN.", `
     ${s.settings?.lan_mode ? '<aside class="banner warning" role="status"><strong>Trusted-LAN mode is active.</strong> Traffic is plain HTTP on the trusted network; an administrator PIN and exact allowlists are required.</aside>' : ""}
+    ${s.mode === "demo" ? demoPanel() : ""}
     <div class="grid two"><section class="card"><h2>Flow device</h2><dl class="status-list"><dt>Connection</dt><dd>${escapeHtml(s.connection.state)} — ${escapeHtml(s.connection.detail)}</dd><dt>Protocol</dt><dd>${escapeHtml(device.identity.proto || "—")}</dd><dt>Firmware</dt><dd>${escapeHtml(device.identity.fw || "—")}</dd><dt>Device ID</dt><dd>${escapeHtml(device.identity.device || "—")}</dd><dt>Boot ID</dt><dd>${escapeHtml(device.identity.boot || "—")}</dd><dt>State</dt><dd>${escapeHtml(device.status.state || "—")}</dd><dt>Lifetime pulses</dt><dd>${escapeHtml(device.status.lifetime || "0")}</dd><dt>Recovered pulses</dt><dd>${escapeHtml(device.counters?.recovery || "0")}</dd><dt>Device fault</dt><dd>${escapeHtml(device.counters?.fault || "none")}</dd><dt>Rejected noise edges</dt><dd>${escapeHtml(device.counters?.rejected || "0")}</dd><dt>Noise gate</dt><dd>${escapeHtml(device.counters?.noise_gate_us || "0")} µs</dd><dt>Host flow-gap default</dt><dd>${escapeHtml(s.settings.flow_gap_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Host settling default</dt><dd>${escapeHtml(s.settings.settling_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Queue overflows</dt><dd>${escapeHtml(s.connection.queue_overflows)}</dd></dl><div class="button-row"><button data-action="load-ports" class="secondary">Scan serial ports</button>${s.mode === "hardware" ? '<button data-action="serial-reconnect" class="secondary">Reconnect device</button>' : ""}</div><div id="port-results">${state.serialPorts === null ? "" : state.serialPorts.length ? `<ul>${state.serialPorts.map((p) => `<li>${escapeHtml(p.device)} — ${escapeHtml(p.description)}</li>`).join("")}</ul>` : '<p class="empty">No serial ports detected.</p>'}</div></section>
     <section class="card"><h2>Display & timing</h2><form id="settings-form" class="stack"><label>Units<select name="display_units"><option value="us_fl_oz" ${s.settings.display_units === "us_fl_oz" ? "selected" : ""}>US fl oz</option><option value="ml" ${s.settings.display_units === "ml" ? "selected" : ""}>mL</option><option value="l" ${s.settings.display_units === "l" ? "selected" : ""}>Liters</option></select></label><label>Completion display (seconds)<input name="completion_seconds" type="number" min="0" max="60" value="${escapeHtml(s.settings.completion_seconds)}"></label><label>Arming timeout (milliseconds)<input name="arm_timeout_ms" type="number" min="1000" max="120000" step="100" value="${escapeHtml(s.settings.arm_timeout_ms)}"></label><label>Verification warning (%)<input name="verification_warning_pct" type="number" min="0.1" max="100" step="0.1" value="${escapeHtml(s.settings.verification_warning_pct)}"></label>${s.mode === "hardware" ? `<label>Preferred serial port<input name="serial_port" list="serial-port-options" maxlength="260" value="${escapeHtml(s.settings.serial_port || "")}" placeholder="Auto-detect after handshake"><span class="field-help">Choose a scanned port or enter a COM or /dev path. Save, then reconnect.</span></label><datalist id="serial-port-options">${portOptions}</datalist>` : ""}<button>Save settings</button></form></section></div>
     <div class="grid two"><section class="card"><h2>Administrator PIN</h2><p>${state.security?.pin_configured ? "A PIN protects administrative actions." : "No PIN is configured. Anyone with physical access to this loopback kiosk can administer it."}</p><p id="admin-auth-status" class="${state.security?.authenticated ? "good-text" : "warning-text"}" role="status">${state.security?.authenticated ? "Administrator unlocked for this session." : "Administrator locked."}</p><form id="pin-form" class="stack"><label>${state.security?.pin_configured ? "New PIN" : "PIN"}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>${state.security?.pin_configured ? "Change PIN" : "Set PIN"}</button></form><div id="admin-login-slot">${state.security?.pin_configured && !state.security?.authenticated ? loginFormMarkup(true) : ""}</div></section>
     <section class="card"><h2>Data & privacy</h2><p>Database, rotating logs, backups, and exports remain on this device. Backups are not encrypted; store them securely.</p><button data-action="backup">Create atomic backup</button><a class="button secondary" href="/api-docs">Local API schema</a><p>Network mode: <strong>${s.settings?.lan_mode ? "trusted LAN" : "loopback only"}</strong>. No telemetry or cloud dependency.</p></section></div>
     <section class="card"><h2>Recent device diagnostics</h2><p>Bounded local recovery and protocol events; routine personal pour history is not logged here.</p>${diagnosticRows}</section>
-    ${s.mode === "demo" ? demoPanel() : ""}
   `);
 }
 
 function demoPanel() {
-  return `<section class="card" aria-labelledby="demo-title"><h2 id="demo-title">Demo simulator controls</h2><p class="warning-text">Demo mode is explicit. These controls do not exist in hardware mode.</p><div class="button-row"><button data-action="demo-pulse" data-count="25">Add 25 pulses</button><button data-action="demo-finish">Finish pour</button><button class="secondary" data-action="demo-disconnect">Disconnect</button><button class="secondary" data-action="demo-reconnect">Reconnect</button><button class="danger" data-action="demo-reset">Reset device</button></div><fieldset><legend>Next-frame fault</legend><div class="button-row"><button class="secondary" data-action="demo-fault" data-fault="corrupt_next">Corrupt</button><button class="secondary" data-action="demo-fault" data-fault="duplicate_next">Duplicate</button><button class="secondary" data-action="demo-fault" data-fault="delay_next">Delay</button><button class="secondary" data-action="demo-flush">Flush delayed</button></div></fieldset></section>`;
+  return `<section id="demo-simulator-controls" class="card" aria-labelledby="demo-title" tabindex="-1"><h2 id="demo-title">Demo simulator controls</h2><p class="warning-text">Demo mode is explicit. These controls do not exist in hardware mode.</p><div class="button-row"><button data-action="demo-pulse" data-count="25">Add 25 pulses</button><button data-action="demo-finish">Finish pour</button><button class="secondary" data-action="demo-disconnect">Disconnect</button><button class="secondary" data-action="demo-reconnect">Reconnect</button><button class="danger" data-action="demo-reset">Reset device</button></div><fieldset><legend>Next-frame fault</legend><div class="button-row"><button class="secondary" data-action="demo-fault" data-fault="corrupt_next">Corrupt</button><button class="secondary" data-action="demo-fault" data-fault="duplicate_next">Duplicate</button><button class="secondary" data-action="demo-fault" data-fault="delay_next">Delay</button><button class="secondary" data-action="demo-flush">Flush delayed</button></div></fieldset></section>`;
 }
 
 function loginView() {
@@ -845,6 +1222,7 @@ function render() {
     else if (current === "/settings") main.innerHTML = settingsView();
     else main.innerHTML = page("Not found", "That screen does not exist.", '<a class="button" href="#/">Return home</a>');
   }
+  mountDemoGuide();
   bindForms();
   if (shouldFocus) {
     main.querySelector("h1")?.focus({ preventScroll: true });
@@ -920,7 +1298,9 @@ async function startVerification() {
 }
 
 async function demo(action, values = {}) {
-  try { await mutation(`demo-${action}`, "/api/v1/demo/action", { action, ...values }); } catch (error) { showError(error); }
+  try {
+    await mutation(`demo-${action}`, "/api/v1/demo/action", { action, ...values });
+  } catch (error) { showError(error); }
 }
 
 function bindLoginForm() {
@@ -1004,6 +1384,15 @@ main.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-action]"); if (!button) return;
   const action = button.dataset.action;
   if (action === "retry") return window.location.reload();
+  if (action === "demo-guide-dismiss") { refreshDemoGuide(false); return; }
+  if (action === "demo-guide-open") { refreshDemoGuide(true); return; }
+  if (action === "demo-guide-controls") {
+    event.preventDefault();
+    const controls = main.querySelector("#demo-simulator-controls");
+    controls?.scrollIntoView({ behavior: "smooth", block: "start" });
+    controls?.focus({ preventScroll: true });
+    return;
+  }
   if (action === "dismiss-terminal") {
     state.dismissedTerminalId = state.snapshot?.terminal_notice?.session_id || "dismissed";
     return navigate("/");
