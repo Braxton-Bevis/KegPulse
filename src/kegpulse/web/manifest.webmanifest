@@ -1,0 +1,21 @@
+{
+  "name": "KegPulse",
+  "short_name": "KegPulse",
+  "description": "Local-first keg flow monitor",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#14231d",
+  "theme_color": "#14231d",
+  "icons": [
+    {
+      "src": "/static/icons/kegpulse.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
+

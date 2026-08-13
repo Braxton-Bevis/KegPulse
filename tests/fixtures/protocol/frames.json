@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "crc": "CRC-16/CCITT-FALSE",
+  "vectors": [
+    {
+      "name": "ping",
+      "kind": "Q",
+      "request_id": "12AB34CD",
+      "operation": "PING",
+      "fields": {"nonce": "42"},
+      "encoded": "KP1|Q|12AB34CD|PING|nonce=42*CBA4\n"
+    },
+    {
+      "name": "status",
+      "kind": "Q",
+      "request_id": "00000001",
+      "operation": "STATUS",
+      "fields": {},
+      "encoded": "KP1|Q|00000001|STATUS*9E3E\n"
+    },
+    {
+      "name": "arm",
+      "kind": "Q",
+      "request_id": "00000002",
+      "operation": "ARM",
+      "fields": {
+        "boot": "0000000000000001",
+        "seq": "1",
+        "sid": "12345678123456781234567812345678",
+        "ttl": "15000"
+      },
+      "encoded": "KP1|Q|00000002|ARM|boot=0000000000000001|seq=1|sid=12345678123456781234567812345678|ttl=15000*82D7\n"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#14231d">
+    <meta name="description" content="Local-first keg flow monitor">
+    <title>KegPulse</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/static/icons/kegpulse.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+    <header class="app-header">
+      <a class="brand" href="#/" aria-label="KegPulse home">
+        <img src="/static/icons/kegpulse.svg" alt="" width="42" height="42">
+        <span>KegPulse</span>
+      </a>
+      <div class="header-status" aria-live="polite" aria-atomic="true">
+        <span id="connection-badge" class="badge neutral">● Starting</span>
+        <span id="keg-summary">No keg configured</span>
+      </div>
+      <button id="menu-button" class="icon-button" type="button" aria-expanded="false" aria-controls="site-nav">
+        <span aria-hidden="true">☰</span><span class="sr-only">Open navigation</span>
+      </button>
+      <nav id="site-nav" aria-label="Primary">
+        <a href="#/">Home</a>
+        <a href="#/history">History</a>
+        <a href="#/keg">Keg</a>
+        <a href="#/calibration">Calibration</a>
+        <a href="#/participants">People</a>
+        <a href="#/settings">Device &amp; settings</a>
+      </nav>
+    </header>
+
+    <div id="degraded-banner" class="banner warning hidden" role="status"></div>
+    <main id="main" tabindex="-1">
+      <div class="loading-card" role="status">Connecting to the local KegPulse service…</div>
+    </main>
+
+    <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    <div id="toast" class="toast hidden" role="status"></div>
+    <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm action</h2>
+        <p id="confirm-message"></p>
+        <div class="button-row end">
+          <button value="cancel" class="secondary">Keep current state</button>
+          <button id="confirm-accept" value="confirm" class="danger">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>
+

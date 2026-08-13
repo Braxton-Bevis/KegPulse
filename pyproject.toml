@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools==75.8.2", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kegpulse"
+version = "1.0.0"
+description = "Local-first single-tap keg flow monitor"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "MIT"}
+authors = [{name = "KegPulse contributors"}]
+dependencies = [
+  "fastapi==0.116.1",
+  "platformdirs==4.3.8",
+  "pydantic==2.11.7",
+  "pyserial==3.5",
+  "uvicorn==0.34.3",
+  "websockets==15.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage==7.10.2",
+  "httpx==0.28.1",
+  "mypy==1.17.1",
+  "playwright==1.54.0",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.8",
+  "types-pyserial==3.5.0.20250326",
+  "platformio==6.1.18",
+]
+package = ["pyinstaller==6.15.0"]
+
+[project.scripts]
+kegpulse = "kegpulse.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kegpulse = ["web/**/*", "migrations/*.sql"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config --basetemp=.pytest-tmp"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "e2e: browser end-to-end test",
+  "integration: service/database/transport integration test",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["kegpulse"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "if __name__ == .__main__.:"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/kegpulse"]

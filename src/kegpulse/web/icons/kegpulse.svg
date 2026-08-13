@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">KegPulse</title>
+  <rect width="512" height="512" rx="96" fill="#176b4d"/>
+  <path fill="#f7fbf8" d="M124 112h264v66H124zM146 190h220v210a44 44 0 0 1-44 44H190a44 44 0 0 1-44-44z"/>
+  <path fill="#f1aa32" d="M174 220h164v154a28 28 0 0 1-28 28H202a28 28 0 0 1-28-28z"/>
+  <path fill="none" stroke="#176b4d" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" d="M192 315h44l20-50 28 99 20-49h30"/>
+  <circle cx="194" cy="259" r="12" fill="#fff" opacity=".75"/>
+  <circle cx="226" cy="236" r="8" fill="#fff" opacity=".7"/>
+</svg>
+

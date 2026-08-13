@@ -1,0 +1,17 @@
+[Unit]
+Description=KegPulse local flow monitor
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/KegPulse
+Environment=KEGPULSE_DATA_DIR=%h/.local/share/KegPulse
+ExecStart=%h/KegPulse/.venv/bin/python -m kegpulse --no-browser
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=default.target
+
