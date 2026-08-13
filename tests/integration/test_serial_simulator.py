@@ -7,8 +7,8 @@ from collections.abc import Callable
 import pytest
 
 from kegpulse.protocol import FrameParser, encode_frame
-from kegpulse.serialio import DeviceManager, SimulatorTransport
-from kegpulse.serialio.manager import ConnectionState
+from kegpulse.serialio import DeviceManager, SimulatorTransport, TransportUnavailable
+from kegpulse.serialio.manager import ConnectionState, DeviceCommandError
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 3) -> None:
@@ -51,6 +51,7 @@ def test_manager_handshake_attributed_pour_and_result_replay() -> None:
     try:
         wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
         status = manager.request("STATUS")
+        assert status.fields["arm_left"] == "0"
         sid = uuid.uuid4().hex
         manager.request(
             "ARM",
@@ -61,6 +62,8 @@ def test_manager_handshake_attributed_pour_and_result_replay() -> None:
                 "ttl": 15000,
             },
         )
+        armed = manager.request("STATUS")
+        assert armed.fields["arm_left"] == "15000"
         transport.inject_pulses(50)
         transport.finish_pour()
 
@@ -74,8 +77,83 @@ def test_manager_handshake_attributed_pour_and_result_replay() -> None:
         result = results[0].frame
         assert result and result.fields["sid"] == sid
         assert result.fields["pulses"] == "50"
-        manager.request("ACK", {"boot": result.fields["boot"], "seq": result.fields["seq"]})
+        manager.request(
+            "ACK",
+            {
+                "dev": result.fields["dev"],
+                "boot": result.fields["boot"],
+                "seq": result.fields["seq"],
+            },
+        )
         assert manager.request("STATUS").fields["retained"] == "0"
+    finally:
+        manager.stop()
+
+
+def test_simulator_accepts_legacy_kp1_ack_without_device_but_rejects_wrong_device() -> None:
+    transport = SimulatorTransport(seed=31)
+    transport.open()
+    try:
+        transport.inject_pulses(5)
+        transport.finish_pour()
+        result = next(iter(transport.device.results.values()))
+        parser = FrameParser()
+
+        transport.write(
+            encode_frame(
+                "Q",
+                "00000010",
+                "ACK",
+                {"dev": "FFFFFFFFFFFFFFFF", "boot": result.boot_id, "seq": result.event_seq},
+            )
+        )
+        frames, errors = parser.feed(transport.read(256, 0.1))
+        assert not errors and frames[-1].kind == "E"
+        assert frames[-1].fields["code"] == "STALE"
+        assert result.event_seq in transport.device.results
+
+        transport.write(
+            encode_frame(
+                "Q",
+                "00000011",
+                "ACK",
+                {"boot": result.boot_id, "seq": result.event_seq},
+            )
+        )
+        frames, errors = parser.feed(transport.read(256, 0.1))
+        assert not errors and frames[-1].operation == "ACK"
+        assert result.event_seq not in transport.device.results
+    finally:
+        transport.close()
+
+
+def test_simulator_preserves_busy_error_instead_of_misclassifying_it_as_range() -> None:
+    transport = SimulatorTransport(seed=8)
+    manager = DeviceManager(lambda: transport)
+    manager.start()
+    try:
+        wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
+        status = manager.request("STATUS")
+        manager.request(
+            "ARM",
+            {
+                "boot": status.fields["boot"],
+                "seq": status.fields["next"],
+                "sid": uuid.uuid4().hex,
+                "ttl": 15_000,
+            },
+        )
+        with pytest.raises(DeviceCommandError) as caught:
+            manager.request(
+                "ARM",
+                {
+                    "boot": status.fields["boot"],
+                    "seq": status.fields["next"],
+                    "sid": uuid.uuid4().hex,
+                    "ttl": 15_000,
+                },
+            )
+        assert caught.value.code == "BUSY"
     finally:
         manager.stop()
 
@@ -116,6 +194,126 @@ def test_unattributed_disconnect_reconnect_and_reset() -> None:
         manager.stop()
 
 
+def test_direct_status_request_after_in_place_reset_forces_rehandshake() -> None:
+    transport = SimulatorTransport(seed=19)
+    manager = DeviceManager(
+        lambda: transport,
+        status_interval=60,
+        counter_interval=60,
+        result_interval=60,
+    )
+    manager.start()
+    try:
+        wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
+        old_boot = manager.identity["boot"]
+        transport.reset_device()
+
+        with pytest.raises(TransportUnavailable, match="boot identity changed"):
+            manager.request("STATUS")
+        wait_until(
+            lambda: manager.connection_state == ConnectionState.CONNECTED
+            and manager.identity.get("boot") != old_boot,
+            timeout=5,
+        )
+    finally:
+        manager.stop()
+
+
+def test_in_place_reset_forces_fresh_hello_before_new_boot_result_is_accepted() -> None:
+    transport = SimulatorTransport(seed=19)
+    manager = DeviceManager(
+        lambda: transport,
+        status_interval=0.02,
+        counter_interval=0.05,
+        result_interval=0.05,
+    )
+    manager.start()
+    try:
+        wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
+        original_boot = manager.identity["boot"]
+        manager.drain_events(1000)
+
+        # A watchdog/reset-button reset need not make the USB endpoint disappear.
+        transport.reset_device()
+        reset_boot = transport.device.boot_id
+        transport.inject_pulses(9)
+        transport.finish_pour()
+
+        observed = []
+
+        def resynchronized_result() -> bool:
+            observed.extend(manager.drain_events(1000))
+            return (
+                manager.identity.get("boot") == reset_boot
+                and any(
+                    event.kind == "hello"
+                    and event.frame is not None
+                    and event.frame.fields.get("boot") == reset_boot
+                    for event in observed
+                )
+                and any(
+                    event.kind == "result"
+                    and event.frame is not None
+                    and event.frame.fields.get("boot") == reset_boot
+                    for event in observed
+                )
+            )
+
+        wait_until(resynchronized_result)
+        assert reset_boot != original_boot
+        result = next(
+            event.frame
+            for event in observed
+            if event.kind == "result"
+            and event.frame is not None
+            and event.frame.fields.get("boot") == reset_boot
+        )
+        manager.request(
+            "ACK",
+            {"dev": result.fields["dev"], "boot": reset_boot, "seq": result.fields["seq"]},
+        )
+        assert manager.request("STATUS").fields["retained"] == "0"
+    finally:
+        manager.stop()
+
+
+def test_changed_counters_emit_a_bounded_manager_event() -> None:
+    transport = SimulatorTransport(seed=23)
+    manager = DeviceManager(
+        lambda: transport, status_interval=10, counter_interval=0.02, result_interval=10
+    )
+    manager.start()
+    try:
+        wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
+        startup = manager.drain_events(1000)
+        assert any(event.kind == "counters" for event in startup)
+
+        transport.inject_pulses(6)
+        changed = []
+
+        def got_changed_counters() -> bool:
+            changed.extend(event for event in manager.drain_events() if event.kind == "counters")
+            return any(
+                event.frame is not None and event.frame.fields.get("accepted") == "6"
+                for event in changed
+            )
+
+        wait_until(got_changed_counters)
+        assert manager.counters["accepted"] == "6"
+    finally:
+        manager.stop()
+
+
+def test_simulator_boot_identity_wraps_at_exactly_sixteen_hex_digits() -> None:
+    transport = SimulatorTransport()
+    transport.device.boot_id = "FFFFFFFFFFFFFFFF"
+
+    transport.reset_device()
+
+    assert transport.device.boot_id == "0000000000000000"
+    assert len(transport.device.boot_id) == 16
+
+
 def test_simulator_corrupt_duplicate_delay_and_script_controls() -> None:
     transport = SimulatorTransport(seed=4)
     transport.open()
@@ -146,9 +344,9 @@ def test_simulator_corrupt_duplicate_delay_and_script_controls() -> None:
 
 def test_queue_overflow_automatically_replays_retained_measurement() -> None:
     transport = SimulatorTransport(seed=37)
-    # Startup fills these four slots (connecting, connected, hello, status). A terminal
+    # Startup fills these five slots (connecting, status, counters, connected, hello). A terminal
     # result therefore exercises the real overflow path rather than a private helper.
-    manager = DeviceManager(lambda: transport, event_capacity=4, status_interval=10)
+    manager = DeviceManager(lambda: transport, event_capacity=5, status_interval=10)
     manager.start()
     try:
         wait_until(lambda: manager.connection_state == ConnectionState.CONNECTED)
@@ -172,7 +370,12 @@ def test_queue_overflow_automatically_replays_retained_measurement() -> None:
         assert replayed[0].fields["pulses"] == "17"
         assert "resynchronized" in manager.connection_detail
         manager.request(
-            "ACK", {"boot": replayed[0].fields["boot"], "seq": replayed[0].fields["seq"]}
+            "ACK",
+            {
+                "dev": replayed[0].fields["dev"],
+                "boot": replayed[0].fields["boot"],
+                "seq": replayed[0].fields["seq"],
+            },
         )
         assert manager.request("STATUS").fields["retained"] == "0"
     finally:

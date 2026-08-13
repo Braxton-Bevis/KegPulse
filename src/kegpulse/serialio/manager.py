@@ -37,6 +37,12 @@ class ManagerEvent:
     kind: str
     frame: Frame | None = None
     detail: str = ""
+    device_id: str = ""
+    boot_id: str = ""
+    uptime_ms: int | None = None
+    keg_id: str | None = None
+    calibration_id: str | None = None
+    context_captured: bool = False
 
 
 @dataclass(slots=True)
@@ -60,13 +66,16 @@ class DeviceManager:
         event_capacity: int = 256,
         command_capacity: int = 32,
         status_interval: float = 0.25,
+        counter_interval: float = 2.0,
         result_interval: float = 2.0,
+        measurement_context_provider: Callable[[], tuple[str | None, str | None]] | None = None,
         seed: int = 1,
     ) -> None:
         self._provider = transport_provider
         self._events: queue.Queue[ManagerEvent] = queue.Queue(maxsize=event_capacity)
         self._commands: queue.Queue[_Command] = queue.Queue(maxsize=command_capacity)
         self._stop = threading.Event()
+        self._reconnect_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._transport: FlowTransport | None = None
         self._parser = FrameParser()
@@ -78,7 +87,9 @@ class DeviceManager:
         self._counters: dict[str, str] = {}
         self._request_counter = 1
         self._status_interval = status_interval
+        self._counter_interval = counter_interval
         self._result_interval = result_interval
+        self._measurement_context_provider = measurement_context_provider
         self._random = random.Random(seed)
         self._overflow_count = 0
         self._needs_resynchronization = False
@@ -124,6 +135,7 @@ class DeviceManager:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._reconnect_requested.clear()
         self._thread = threading.Thread(target=self._run, name="kegpulse-serial", daemon=False)
         self._thread.start()
 
@@ -136,6 +148,19 @@ class DeviceManager:
         if self._transport:
             self._transport.close()
         self._set_state(ConnectionState.STOPPED, "stopped")
+
+    def prefer_serial_port(self, port: str | None) -> None:
+        if port is not None and (not isinstance(port, str) or not 1 <= len(port) <= 260):
+            raise ValueError("serial port preference must be 1 to 260 characters or None")
+        callback = getattr(self._provider, "prefer", None)
+        if not callable(callback):
+            raise RuntimeError("transport provider does not support serial port preferences")
+        prefer = cast(Callable[[str | None], None], callback)
+        prefer(port)
+
+    def reconnect(self) -> None:
+        """Request a bounded worker-owned reconnect without closing serial from another thread."""
+        self._reconnect_requested.set()
 
     def request(
         self, operation: str, fields: dict[str, object] | None = None, *, timeout: float = 3
@@ -163,15 +188,17 @@ class DeviceManager:
                 break
         return output
 
-    def _queue_event(self, event: ManagerEvent) -> None:
+    def _queue_event(self, event: ManagerEvent) -> bool:
         try:
             self._events.put(event, timeout=0.05)
+            return True
         except queue.Full:
             with self._lock:
                 self._overflow_count += 1
                 self._needs_resynchronization = True
                 self._state = ConnectionState.DEGRADED
                 self._detail = "event queue overflow; result/status resynchronization required"
+            return False
 
     def _next_request_id(self) -> str:
         value = self._request_counter
@@ -188,6 +215,7 @@ class DeviceManager:
             )
             first = False
             try:
+                self._reconnect_requested.clear()
                 self._transport = self._provider()
                 self._transport.open()
                 self._parser = FrameParser()
@@ -200,7 +228,15 @@ class DeviceManager:
                 confirmed_port = self._confirm_transport()
                 self._set_state(ConnectionState.CONNECTED, f"connected via {self._transport.name}")
                 # Retained results are queued by _synchronize before reconciliation runs.
-                self._queue_event(ManagerEvent("hello", hello, detail=confirmed_port))
+                self._queue_event(
+                    ManagerEvent(
+                        "hello",
+                        hello,
+                        detail=confirmed_port,
+                        device_id=hello.fields.get("device", ""),
+                        boot_id=hello.fields.get("boot", ""),
+                    )
+                )
                 delay = 0.25
                 self._connected_loop()
             except (TransportError, TimeoutError, OSError, ValueError) as exc:
@@ -234,6 +270,9 @@ class DeviceManager:
         next_results = next_status + self._result_interval
         next_resynchronization = next_status
         while not self._stop.is_set():
+            if self._reconnect_requested.is_set():
+                self._reconnect_requested.clear()
+                raise TransportUnavailable("serial reconnect requested")
             try:
                 command = self._commands.get(timeout=0.02)
             except queue.Empty:
@@ -246,6 +285,10 @@ class DeviceManager:
                     command.response = self._roundtrip(
                         command.operation, command.fields, command.timeout
                     )
+                    if command.operation == "STATUS":
+                        self._record_status(command.response)
+                    elif command.operation == "COUNTERS":
+                        self._record_counters(command.response)
                 except BaseException as exc:
                     command.error = exc
                     if isinstance(exc, TransportError | OSError):
@@ -265,15 +308,14 @@ class DeviceManager:
                 next_status = now + self._status_interval
             if now >= next_counters:
                 counters = self._roundtrip("COUNTERS", {}, 2)
-                with self._lock:
-                    self._counters = dict(counters.fields)
-                next_counters = now + 2
+                self._record_counters(counters)
+                next_counters = now + self._counter_interval
             if now >= next_results:
                 self._roundtrip("RESULTS", {}, 2, terminal_operation="RESULTS_END")
                 next_results = now + self._result_interval
             for frame in self._read_available(0.01):
                 if frame.operation == "RESULT":
-                    self._queue_event(ManagerEvent("result", frame))
+                    self._queue_result(frame)
                 else:
                     self._queue_event(ManagerEvent("unexpected", frame))
 
@@ -295,16 +337,92 @@ class DeviceManager:
         status = self._roundtrip("STATUS", {}, 2)
         self._record_status(status)
         counters = self._roundtrip("COUNTERS", {}, 2)
-        with self._lock:
-            self._counters = dict(counters.fields)
+        self._record_counters(counters)
         self._roundtrip("RESULTS", {}, 2, terminal_operation="RESULTS_END")
 
     def _record_status(self, frame: Frame) -> None:
         with self._lock:
+            expected_boot = self._identity.get("boot")
+            expected_device = self._identity.get("device", "")
+            observed_boot = frame.fields.get("boot")
+            if expected_boot and observed_boot != expected_boot:
+                raise TransportUnavailable("device boot identity changed in place; re-handshaking")
             changed = self._status != frame.fields
-            self._status = dict(frame.fields)
         if changed:
-            self._queue_event(ManagerEvent("status", frame))
+            queued = self._queue_event(
+                ManagerEvent(
+                    "status",
+                    frame,
+                    device_id=expected_device,
+                    boot_id=expected_boot or "",
+                )
+            )
+            if queued:
+                # Advance the suppression cache only after durable handoff to the
+                # bounded consumer queue. Overflow resynchronization will otherwise
+                # see the frame as changed and retry it.
+                with self._lock:
+                    self._status = dict(frame.fields)
+
+    def _record_counters(self, frame: Frame) -> None:
+        with self._lock:
+            changed = self._counters != frame.fields
+            device_id = self._identity.get("device", "")
+            boot_id = self._identity.get("boot", "")
+            uptime_text = self._status.get("uptime", "")
+        if changed:
+            try:
+                uptime_ms = int(uptime_text)
+            except ValueError:
+                uptime_ms = None
+            keg_id, calibration_id = self._capture_measurement_context()
+            queued = self._queue_event(
+                ManagerEvent(
+                    "counters",
+                    frame,
+                    device_id=device_id,
+                    boot_id=boot_id,
+                    uptime_ms=uptime_ms,
+                    keg_id=keg_id,
+                    calibration_id=calibration_id,
+                    context_captured=self._measurement_context_provider is not None,
+                )
+            )
+            if queued:
+                with self._lock:
+                    self._counters = dict(frame.fields)
+
+    def _queue_result(self, frame: Frame) -> None:
+        with self._lock:
+            expected_device = self._identity.get("device")
+            expected_boot = self._identity.get("boot")
+        if not expected_device or not expected_boot:
+            raise TransportUnavailable("device result arrived before a confirmed handshake")
+        if frame.fields.get("dev") != expected_device or frame.fields.get("boot") != expected_boot:
+            raise TransportUnavailable("device result identity changed; re-handshaking")
+        keg_id, calibration_id = self._capture_measurement_context()
+        self._queue_event(
+            ManagerEvent(
+                "result",
+                frame,
+                device_id=expected_device,
+                boot_id=expected_boot,
+                keg_id=keg_id,
+                calibration_id=calibration_id,
+                context_captured=self._measurement_context_provider is not None,
+            )
+        )
+
+    def _capture_measurement_context(self) -> tuple[str | None, str | None]:
+        if self._measurement_context_provider is None:
+            return None, None
+        try:
+            return self._measurement_context_provider()
+        except Exception as exc:
+            # Measurement frames still enter the retry path, but with an
+            # explicitly captured unknown context rather than a later guess.
+            LOGGER.warning("measurement context could not be captured: %s", type(exc).__name__)
+            return None, None
 
     def _roundtrip(
         self,
@@ -321,10 +439,13 @@ class DeviceManager:
         deadline = time.monotonic() + timeout
         expected = terminal_operation or operation
         while not self._stop.is_set() and time.monotonic() < deadline:
+            if self._reconnect_requested.is_set():
+                self._reconnect_requested.clear()
+                raise TransportUnavailable("serial reconnect requested")
             frames = self._read_available(min(0.05, max(0, deadline - time.monotonic())))
             for frame in frames:
                 if frame.operation == "RESULT":
-                    self._queue_event(ManagerEvent("result", frame))
+                    self._queue_result(frame)
                 elif frame.request_id == request_id:
                     if frame.kind == "E":
                         raise DeviceCommandError(frame.fields.get("code", "INTERNAL"), operation)

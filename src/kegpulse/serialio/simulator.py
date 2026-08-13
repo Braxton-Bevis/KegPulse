@@ -217,7 +217,9 @@ class SimulatorTransport(FlowTransport):
                 output.append(self._response(request, "CANCEL", {"already": int(duplicate)}))
                 return output
             if request.operation == "ACK":
-                if fields.get("boot") != self.device.boot_id:
+                if ("dev" in fields and fields["dev"] != self.device.device_id) or fields.get(
+                    "boot"
+                ) != self.device.boot_id:
                     return [self._error(request, "STALE")]
                 already = self.device.acknowledge(int(fields["seq"]))
                 return [self._response(request, "ACK", {"already": int(already)})]
@@ -228,12 +230,12 @@ class SimulatorTransport(FlowTransport):
             return [self._error(request, "UNSUPPORTED")]
         except KeyError:
             return [self._error(request, "MALFORMED")]
-        except ValueError:
-            return [self._error(request, "RANGE")]
         except ConflictError as exc:
             message = str(exc)
             code = "STALE" if "stale" in message else "BUSY"
             return [self._error(request, code)]
+        except ValueError:
+            return [self._error(request, "RANGE")]
 
     def _status_frame(self, request: Frame) -> bytes:
         status = self.device.status(self.now_ms)
@@ -251,6 +253,7 @@ class SimulatorTransport(FlowTransport):
                 "uptime": status.uptime_ms,
                 "next": status.next_event_seq,
                 "retained": status.retained_results,
+                "arm_left": status.arm_remaining_ms,
             },
         )
 
@@ -318,7 +321,7 @@ class SimulatorTransport(FlowTransport):
 
     def reset_device(self) -> None:
         with self._condition:
-            number = int(self.device.boot_id, 16) + 1
+            number = (int(self.device.boot_id, 16) + 1) & 0xFFFFFFFFFFFFFFFF
             self.now_ms = 0
             self.device.reset(f"{number:016X}")
             self._incoming.clear()

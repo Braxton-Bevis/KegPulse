@@ -15,8 +15,9 @@ from kegpulse.paths import get_app_paths
 from kegpulse.persistence import Database, Repository
 from kegpulse.protocol import Frame
 from kegpulse.serialio import DeviceManager, PortCandidateProvider, SerialTransport
-from kegpulse.serialio.manager import ManagerEvent
+from kegpulse.serialio.manager import ConnectionState, ManagerEvent
 from kegpulse.serialio.simulator import SimulatorTransport
+from kegpulse.serialio.transport import TransportUnavailable
 
 
 def test_absent_boolean_cli_flags_preserve_true_config_file_values(tmp_path: Path) -> None:
@@ -153,11 +154,47 @@ def test_candidate_provider_retries_unconfirmed_ports_then_sticks_to_confirmed_r
     assert provider.confirm(simulator) is None
     assert provider.preferred_port == "COM7"
 
+    provider.prefer("COM3")
+    assert provider().name == "COM3"
+    provider.prefer(None)
+    assert provider().name == "COM3"
+
+
+def test_posix_permission_guidance_names_required_access_group_and_exact_action() -> None:
+    message = real_serial._serial_permission_guidance(
+        "/dev/ttyACM0",
+        platform_name="posix",
+        group_name="dialout",
+        user_name="kiosk",
+    )
+
+    assert message is not None
+    assert "read and write access to /dev/ttyACM0" in message
+    assert "owned by group dialout" in message
+    assert "sudo usermod -aG dialout kiosk" in message
+    assert "log out/in" in message
+    assert "did not change device permissions" in message
+
+
+def test_serial_open_permission_error_surfaces_posix_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def permission_denied(**_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied", "/dev/ttyACM0")
+
+    guidance = "read/write guidance for /dev/ttyACM0 and group dialout"
+    monkeypatch.setattr(real_serial.serial, "Serial", permission_denied)
+    monkeypatch.setattr(real_serial, "_serial_permission_guidance", lambda _port: guidance)
+
+    with pytest.raises(TransportUnavailable, match="read/write guidance"):
+        SerialTransport("/dev/ttyACM0").open()
+
 
 class _ConfirmingProvider:
     def __init__(self, transport: SimulatorTransport) -> None:
         self.transport = transport
         self.confirmed: list[SimulatorTransport] = []
+        self.preferences: list[str | None] = []
 
     def __call__(self) -> SimulatorTransport:
         return self.transport
@@ -165,6 +202,9 @@ class _ConfirmingProvider:
     def confirm(self, transport: SimulatorTransport) -> str:
         self.confirmed.append(transport)
         return "COM42"
+
+    def prefer(self, port: str | None) -> None:
+        self.preferences.append(port)
 
 
 def test_manager_announces_provider_confirmed_port_only_after_valid_handshake() -> None:
@@ -185,6 +225,32 @@ def test_manager_announces_provider_confirmed_port_only_after_valid_handshake() 
         assert hello is not None
         assert hello.detail == "COM42"
         assert provider.confirmed == [transport]
+    finally:
+        manager.stop()
+
+
+def test_manager_applies_provider_preference_then_reconnects_on_worker_thread() -> None:
+    transport = SimulatorTransport()
+    provider = _ConfirmingProvider(transport)
+    manager = DeviceManager(provider, status_interval=0.05)
+    manager.start()
+    try:
+        deadline = time.monotonic() + 3
+        while len(provider.confirmed) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(provider.confirmed) == 1
+
+        manager.prefer_serial_port("COM77")
+        manager.reconnect()
+
+        deadline = time.monotonic() + 3
+        while (
+            len(provider.confirmed) < 2 or manager.connection_state != ConnectionState.CONNECTED
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert provider.preferences == ["COM77"]
+        assert len(provider.confirmed) >= 2
+        assert manager.connection_state == ConnectionState.CONNECTED
     finally:
         manager.stop()
 

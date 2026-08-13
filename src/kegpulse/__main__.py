@@ -20,6 +20,7 @@ import uvicorn
 
 from kegpulse.app import create_app
 from kegpulse.config import load_config
+from kegpulse.instance_lock import InstanceAlreadyRunning, InstanceLock
 from kegpulse.logging_setup import configure_logging
 from kegpulse.paths import AppPaths, get_app_paths
 from kegpulse.persistence.database import Database
@@ -103,10 +104,9 @@ def _is_kegpulse_instance(url: str) -> bool:
 
 
 def _port_in_use(host: str, port: int) -> bool:
-    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    family = socket.AF_INET6 if ":" in probe_host else socket.AF_INET
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else host
     try:
-        with socket.socket(family, socket.SOCK_STREAM) as probe:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.settimeout(0.4)
             return probe.connect_ex((probe_host, port)) == 0
     except OSError:
@@ -194,14 +194,33 @@ def restore_database(paths: AppPaths, source: Path) -> Path:
         restored = Database(paths.database)
         restored.close()
         Database.validate_backup(paths.database)
-    except Exception:
+    except Exception as restore_error:
+        archive_error: Exception | None = None
         if replaced and paths.database.exists():
             failed = paths.backups / f"failed-restore-{token[:8]}.db"
-            os.replace(paths.database, failed)
-        if rollback.exists():
-            os.replace(rollback, paths.database)
-            reopened = Database(paths.database)
-            reopened.close()
+            try:
+                os.replace(paths.database, failed)
+            except Exception as exc:
+                archive_error = exc
+        try:
+            if rollback.exists():
+                # Restoring known-good data takes priority over archiving the
+                # failed candidate. os.replace also overwrites that candidate
+                # when its archival move was the failing secondary operation.
+                os.replace(rollback, paths.database)
+                reopened = Database(paths.database)
+                reopened.close()
+            elif replaced and paths.database.exists() and archive_error is not None:
+                paths.database.unlink()
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "restore failed and the prior database could not be restored"
+            ) from rollback_error
+        if archive_error is not None:
+            restore_error.add_note(
+                "The failed restore candidate could not be archived; the prior database "
+                "was restored instead."
+            )
         raise
     finally:
         if candidate.exists():
@@ -215,65 +234,96 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     paths = get_app_paths(arguments.data_dir)
     paths.ensure()
-    configure_logging(paths.logs, verbose=arguments.verbose)
-    if arguments.restore:
-        restored = restore_database(paths, arguments.restore)
-        print(f"Validated and restored KegPulse database to {restored}")
-        return 0
-
     try:
-        config = load_config(paths.config, **_config_overrides(arguments))
-    except Exception as exc:
-        print(f"KegPulse configuration error: {exc}", file=sys.stderr)
-        return 2
-
-    display_host = "127.0.0.1" if config.host == "0.0.0.0" else config.host
-    url = f"http://{display_host}:{config.port}"
-    if _is_kegpulse_instance(url):
-        print(f"KegPulse is already running at {url}; no duplicate browser was opened.")
-        return 0
-    if _port_in_use(config.host, config.port):
+        instance_lock = InstanceLock(paths.root / ".kegpulse.lock")
+        instance_lock.acquire()
+    except InstanceAlreadyRunning:
+        if arguments.restore is None:
+            try:
+                running_config = load_config(paths.config, **_config_overrides(arguments))
+                running_host = (
+                    "127.0.0.1" if running_config.host == "0.0.0.0" else running_config.host
+                )
+                running_url = f"http://{running_host}:{running_config.port}"
+                if _is_kegpulse_instance(running_url):
+                    print(
+                        f"KegPulse is already running at {running_url}; "
+                        "no duplicate browser was opened."
+                    )
+                    return 0
+            except Exception:
+                pass
         print(
-            f"Port {config.port} is occupied by a service that is not KegPulse. "
-            "Choose another --port.",
+            f"KegPulse data directory is already in use by another process: {paths.root}",
             file=sys.stderr,
         )
-        return 3
+        return 4
+    except OSError as exc:
+        print(f"KegPulse could not lock its data directory: {exc}", file=sys.stderr)
+        return 2
 
     try:
-        app = create_app(config, paths, serial_port_override=arguments.serial_port)
-    except Exception as exc:
-        print(f"KegPulse could not start: {exc}", file=sys.stderr)
-        return 2
-    uvicorn_config = uvicorn.Config(
-        app,
-        host=config.host,
-        port=config.port,
-        log_level="debug" if arguments.verbose else "info",
-        access_log=False,
-        proxy_headers=False,
-        server_header=False,
-        timeout_keep_alive=5,
-        timeout_graceful_shutdown=10,
-        limit_concurrency=64,
-        ws="websockets",
-        ws_max_size=16 * 1024,
-    )
-    server = uvicorn.Server(uvicorn_config)
-    app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
-    if not config.no_browser:
-        threading.Thread(
-            target=_open_when_ready,
-            args=(url,),
-            kwargs={"kiosk": arguments.kiosk},
-            name="kegpulse-browser-launch",
-            daemon=True,
-        ).start()
-    print(f"KegPulse data: {paths.root}", flush=True)
-    print(f"KegPulse URL: {url}", flush=True)
-    with suppress(KeyboardInterrupt):
-        server.run()
-    return 0
+        configure_logging(paths.logs, verbose=arguments.verbose)
+        if arguments.restore:
+            restored = restore_database(paths, arguments.restore)
+            print(f"Validated and restored KegPulse database to {restored}")
+            return 0
+
+        try:
+            config = load_config(paths.config, **_config_overrides(arguments))
+        except Exception as exc:
+            print(f"KegPulse configuration error: {exc}", file=sys.stderr)
+            return 2
+
+        display_host = "127.0.0.1" if config.host == "0.0.0.0" else config.host
+        url = f"http://{display_host}:{config.port}"
+        if _is_kegpulse_instance(url):
+            print(f"KegPulse is already running at {url}; no duplicate browser was opened.")
+            return 0
+        if _port_in_use(config.host, config.port):
+            print(
+                f"Port {config.port} is occupied by a service that is not KegPulse. "
+                "Choose another --port.",
+                file=sys.stderr,
+            )
+            return 3
+
+        try:
+            app = create_app(config, paths, serial_port_override=arguments.serial_port)
+        except Exception as exc:
+            print(f"KegPulse could not start: {exc}", file=sys.stderr)
+            return 2
+        uvicorn_config = uvicorn.Config(
+            app,
+            host=config.host,
+            port=config.port,
+            log_level="debug" if arguments.verbose else "info",
+            access_log=False,
+            proxy_headers=False,
+            server_header=False,
+            timeout_keep_alive=5,
+            timeout_graceful_shutdown=10,
+            limit_concurrency=64,
+            ws="websockets",
+            ws_max_size=16 * 1024,
+        )
+        server = uvicorn.Server(uvicorn_config)
+        app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+        if not config.no_browser:
+            threading.Thread(
+                target=_open_when_ready,
+                args=(url,),
+                kwargs={"kiosk": arguments.kiosk},
+                name="kegpulse-browser-launch",
+                daemon=True,
+            ).start()
+        print(f"KegPulse data: {paths.root}", flush=True)
+        print(f"KegPulse URL: {url}", flush=True)
+        with suppress(KeyboardInterrupt):
+            server.run()
+        return 0
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

@@ -78,18 +78,21 @@ class SecurityManager:
 
     def verify_pin(self, pin: str) -> bool:
         verifier = self.repository.get_setting("admin_pin_verifier")
-        if not isinstance(verifier, dict) or verifier.get("algorithm") != "scrypt":
+        if (
+            not isinstance(verifier, dict)
+            or verifier.get("version") != 1
+            or verifier.get("algorithm") != "scrypt"
+            or verifier.get("n") != SCRYPT_N
+            or verifier.get("r") != SCRYPT_R
+            or verifier.get("p") != SCRYPT_P
+        ):
             return False
         try:
             salt = base64.b64decode(verifier["salt"], validate=True)
             expected = base64.b64decode(verifier["digest"], validate=True)
-            actual = self._derive(
-                pin,
-                salt,
-                n=int(verifier["n"]),
-                r=int(verifier["r"]),
-                p=int(verifier["p"]),
-            )
+            if len(salt) != 16 or len(expected) != SCRYPT_LENGTH:
+                return False
+            actual = self._derive(pin, salt)
         except (KeyError, TypeError, ValueError):
             return False
         return hmac.compare_digest(actual, expected)

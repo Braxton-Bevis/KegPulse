@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -18,27 +24,48 @@ from .api.middleware import BodyLimitMiddleware, RequestPolicyMiddleware
 from .api.models import (
     AdjustmentRequest,
     ArmRequest,
+    BackupResponse,
     CalibrationCreate,
+    CalibrationDetailResponse,
+    CalibrationResponse,
     CalibrationSampleRequest,
+    CalibrationSampleResponse,
     CaptureArmRequest,
     CapturedMeasurementRequest,
     DemoAction,
+    DiagnosticResponse,
+    HealthResponse,
     InclusionRequest,
+    InventoryAdjustmentResponse,
     KegRequest,
+    KegResponse,
+    OkResponse,
     ParticipantCreate,
+    ParticipantResponse,
     ParticipantUpdate,
+    PinConfiguredResponse,
     PinRequest,
+    PourResponse,
     ReassignmentRequest,
+    SecurityContextResponse,
+    SerialActionResponse,
+    SerialPortResponse,
+    SerialPreferenceRequest,
+    SessionResponse,
+    SettingsResponse,
     SettingsUpdate,
+    ShutdownResponse,
+    StatusResponse,
     VerificationRequest,
+    VerificationResponse,
 )
 from .application import KegPulseCoordinator
 from .config import AppConfig
 from .domain.errors import AuthorizationError, ConflictError, DomainError, NotFoundError
 from .paths import AppPaths, get_app_paths
 from .persistence import Database, Repository
-from .persistence.export import rows_to_csv, rows_to_json
-from .security import SecurityManager, allowed_host, allowed_origin
+from .persistence.export import rows_to_csv_chunks, rows_to_json_chunks
+from .security import SESSION_COOKIE, SecurityManager, allowed_host, allowed_origin
 from .serialio import DeviceManager, PortCandidateProvider, SimulatorTransport, enumerate_ports
 from .serialio.transport import FlowTransport
 
@@ -80,6 +107,13 @@ def create_app(
     paths.ensure()
     database = Database(paths.database)
     repository = Repository(database)
+    persisted_arm_timeout = repository.get_setting("arm_timeout_ms")
+    if (
+        isinstance(persisted_arm_timeout, int)
+        and not isinstance(persisted_arm_timeout, bool)
+        and 1_000 <= persisted_arm_timeout <= 120_000
+    ):
+        config.arm_timeout_ms = persisted_arm_timeout
     preferred_serial_port = _preferred_serial_port(repository, config, serial_port_override)
     if config.demo:
         simulator = simulator or SimulatorTransport(
@@ -93,7 +127,7 @@ def create_app(
 
     else:
         provider = transport_provider or PortCandidateProvider(preferred_serial_port)
-    manager = DeviceManager(provider)
+    manager = DeviceManager(provider, measurement_context_provider=repository.measurement_context)
     coordinator = KegPulseCoordinator(repository, manager, config, simulator=simulator)
     security = SecurityManager(repository, config)
     if config.lan_mode and not security.pin_configured:
@@ -126,6 +160,8 @@ def create_app(
     app.state.security = security
     app.state.testing = testing
     app.state.preferred_serial_port = preferred_serial_port
+    websocket_admission_lock = asyncio.Lock()
+    websocket_subscribers = 0
     app.add_middleware(RequestPolicyMiddleware, config=config, testing=testing)
     app.add_middleware(BodyLimitMiddleware, maximum_bytes=65_536)
 
@@ -137,6 +173,11 @@ def create_app(
 
     def admin(request: Request) -> None:
         security.require_admin(request)
+
+    def admin_access(request: Request) -> None:
+        session = security.require_access(request)
+        if security.pin_configured and (session is None or not session.admin):
+            raise HTTPException(status_code=401, detail="administrator login required")
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_request: Request, exc: NotFoundError) -> Response:
@@ -154,7 +195,7 @@ def create_app(
     async def domain_handler(_request: Request, exc: DomainError) -> Response:
         return PlainTextResponse(str(exc), status_code=422)
 
-    @app.get("/api/v1/health")
+    @app.get("/api/v1/health", response_model=HealthResponse)
     async def health() -> dict[str, Any]:
         return {
             "status": "ok",
@@ -169,27 +210,27 @@ def create_app(
         access(request)
         return JSONResponse(app.openapi())
 
-    @app.get("/api/v1/status")
+    @app.get("/api/v1/status", response_model=StatusResponse)
     async def status(request: Request) -> dict[str, Any]:
         access(request)
         return coordinator.snapshot()
 
-    @app.get("/api/v1/security/context")
+    @app.get("/api/v1/security/context", response_model=SecurityContextResponse)
     async def security_context(request: Request, response: Response) -> dict[str, Any]:
         return security.context(request, response)
 
-    @app.post("/api/v1/security/login")
+    @app.post("/api/v1/security/login", response_model=SecurityContextResponse)
     async def login(request: Request, response: Response, payload: PinRequest) -> dict[str, Any]:
         security.require_csrf(request)
         return security.login(request, response, payload.pin)
 
-    @app.post("/api/v1/security/logout")
+    @app.post("/api/v1/security/logout", response_model=OkResponse)
     async def logout(request: Request, response: Response) -> dict[str, bool]:
         operational(request)
         security.logout(request, response)
         return {"ok": True}
 
-    @app.put("/api/v1/security/pin")
+    @app.put("/api/v1/security/pin", response_model=PinConfiguredResponse)
     async def set_pin(request: Request, payload: PinRequest) -> dict[str, bool]:
         if security.pin_configured:
             admin(request)
@@ -198,7 +239,7 @@ def create_app(
         security.set_pin(payload.pin)
         return {"configured": True}
 
-    @app.delete("/api/v1/security/pin")
+    @app.delete("/api/v1/security/pin", response_model=PinConfiguredResponse)
     async def remove_pin(request: Request) -> dict[str, bool]:
         admin(request)
         if config.lan_mode:
@@ -206,21 +247,21 @@ def create_app(
         security.remove_pin()
         return {"configured": False}
 
-    @app.get("/api/v1/participants")
+    @app.get("/api/v1/participants", response_model=list[ParticipantResponse])
     async def participants(
         request: Request, include_inactive: bool = False
     ) -> list[dict[str, Any]]:
         access(request)
         return repository.list_participants(active_only=not include_inactive)
 
-    @app.post("/api/v1/participants", status_code=201)
+    @app.post("/api/v1/participants", status_code=201, response_model=ParticipantResponse)
     async def create_participant(request: Request, payload: ParticipantCreate) -> dict[str, Any]:
         admin(request)
         result = repository.create_participant(payload.display_name)
         await coordinator.publish()
         return result
 
-    @app.patch("/api/v1/participants/{participant_id}")
+    @app.patch("/api/v1/participants/{participant_id}", response_model=ParticipantResponse)
     async def update_participant(
         participant_id: str, request: Request, payload: ParticipantUpdate
     ) -> dict[str, Any]:
@@ -231,39 +272,48 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.post("/api/v1/sessions/arm")
+    @app.post("/api/v1/sessions/arm", response_model=SessionResponse)
     async def arm_session(request: Request, payload: ArmRequest) -> dict[str, Any]:
         operational(request)
         return await coordinator.arm(payload.participant_id, payload.idempotency_key)
 
-    @app.post("/api/v1/sessions/cancel")
+    @app.post("/api/v1/sessions/cancel", response_model=SessionResponse)
     async def cancel_session(request: Request) -> dict[str, Any]:
         operational(request)
         return await coordinator.cancel()
 
-    @app.get("/api/v1/sessions/current")
+    @app.get("/api/v1/sessions/current", response_model=SessionResponse | None)
     async def current_session(request: Request) -> dict[str, Any] | None:
         access(request)
         return repository.active_provisional()
 
-    @app.get("/api/v1/sessions/{session_id}")
+    @app.get("/api/v1/sessions/{session_id}", response_model=SessionResponse)
     async def session_detail(session_id: str, request: Request) -> dict[str, Any]:
         access(request)
         return repository.get_session(session_id)
 
-    @app.get("/api/v1/kegs")
+    @app.get("/api/v1/kegs", response_model=list[KegResponse])
     async def kegs(request: Request) -> list[dict[str, Any]]:
         access(request)
         return repository.list_kegs()
 
-    @app.post("/api/v1/kegs/replace", status_code=201)
+    @app.post("/api/v1/kegs/replace", status_code=201, response_model=KegResponse)
     async def replace_keg(request: Request, payload: KegRequest) -> dict[str, Any]:
         admin(request)
-        result = repository.replace_keg(payload.label, payload.starting_volume_ml, payload.notes)
+        result = repository.replace_keg(
+            payload.label,
+            payload.starting_volume_ml,
+            payload.notes,
+            installed_at=payload.installed_at,
+        )
         await coordinator.publish()
         return result
 
-    @app.post("/api/v1/kegs/{keg_id}/adjustments", status_code=201)
+    @app.post(
+        "/api/v1/kegs/{keg_id}/adjustments",
+        status_code=201,
+        response_model=InventoryAdjustmentResponse,
+    )
     async def adjust_keg(
         keg_id: str, request: Request, payload: AdjustmentRequest
     ) -> dict[str, Any]:
@@ -272,12 +322,12 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.get("/api/v1/calibrations")
+    @app.get("/api/v1/calibrations", response_model=list[CalibrationResponse])
     async def calibrations(request: Request) -> list[dict[str, Any]]:
         access(request)
         return repository.list_calibrations()
 
-    @app.post("/api/v1/calibrations", status_code=201)
+    @app.post("/api/v1/calibrations", status_code=201, response_model=CalibrationResponse)
     async def create_calibration(request: Request, payload: CalibrationCreate) -> dict[str, Any]:
         admin(request)
         result = repository.create_calibration(
@@ -286,12 +336,16 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.get("/api/v1/calibrations/{calibration_id}")
+    @app.get("/api/v1/calibrations/{calibration_id}", response_model=CalibrationDetailResponse)
     async def calibration_detail(calibration_id: str, request: Request) -> dict[str, Any]:
         access(request)
         return repository.calibration_detail(calibration_id)
 
-    @app.post("/api/v1/calibrations/{calibration_id}/samples", status_code=201)
+    @app.post(
+        "/api/v1/calibrations/{calibration_id}/samples",
+        status_code=201,
+        response_model=CalibrationSampleResponse,
+    )
     async def add_calibration_sample(
         calibration_id: str, request: Request, payload: CalibrationSampleRequest
     ) -> dict[str, Any]:
@@ -307,7 +361,10 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.post("/api/v1/calibrations/{calibration_id}/capture/arm")
+    @app.post(
+        "/api/v1/calibrations/{calibration_id}/capture/arm",
+        response_model=SessionResponse,
+    )
     async def arm_calibration_capture(
         calibration_id: str, request: Request, payload: CaptureArmRequest
     ) -> dict[str, Any]:
@@ -322,7 +379,10 @@ def create_app(
             target_ordinal=payload.ordinal,
         )
 
-    @app.post("/api/v1/calibrations/{calibration_id}/capture/commit")
+    @app.post(
+        "/api/v1/calibrations/{calibration_id}/capture/commit",
+        response_model=CalibrationSampleResponse,
+    )
     async def commit_calibration_capture(
         calibration_id: str, request: Request, payload: CapturedMeasurementRequest
     ) -> dict[str, Any]:
@@ -339,7 +399,10 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.patch("/api/v1/calibrations/{calibration_id}/samples/{ordinal}")
+    @app.patch(
+        "/api/v1/calibrations/{calibration_id}/samples/{ordinal}",
+        response_model=CalibrationSampleResponse,
+    )
     async def include_calibration_sample(
         calibration_id: str, ordinal: int, request: Request, payload: InclusionRequest
     ) -> dict[str, Any]:
@@ -348,14 +411,17 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.post("/api/v1/calibrations/{calibration_id}/activate")
+    @app.post(
+        "/api/v1/calibrations/{calibration_id}/activate",
+        response_model=CalibrationResponse,
+    )
     async def activate_calibration(calibration_id: str, request: Request) -> dict[str, Any]:
         admin(request)
         result = repository.activate_calibration(calibration_id)
         await coordinator.publish()
         return result
 
-    @app.post("/api/v1/verifications", status_code=201)
+    @app.post("/api/v1/verifications", status_code=201, response_model=VerificationResponse)
     async def verification(request: Request, payload: VerificationRequest) -> dict[str, Any]:
         admin(request)
         threshold = repository.get_setting(
@@ -365,12 +431,12 @@ def create_app(
             payload.raw_pulses, payload.mass_g, payload.density_g_per_ml, threshold
         )
 
-    @app.get("/api/v1/verifications")
+    @app.get("/api/v1/verifications", response_model=list[VerificationResponse])
     async def verifications(request: Request) -> list[dict[str, Any]]:
         access(request)
         return repository.list_verifications()
 
-    @app.post("/api/v1/verifications/capture/arm")
+    @app.post("/api/v1/verifications/capture/arm", response_model=SessionResponse)
     async def arm_verification_capture(
         request: Request, payload: CaptureArmRequest
     ) -> dict[str, Any]:
@@ -385,7 +451,7 @@ def create_app(
             calibration_id=calibration["id"],
         )
 
-    @app.post("/api/v1/verifications/capture/commit")
+    @app.post("/api/v1/verifications/capture/commit", response_model=VerificationResponse)
     async def commit_verification_capture(
         request: Request, payload: CapturedMeasurementRequest
     ) -> dict[str, Any]:
@@ -402,7 +468,7 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.get("/api/v1/history")
+    @app.get("/api/v1/history", response_model=list[PourResponse])
     async def history(
         request: Request,
         limit: int = Query(default=100, ge=1, le=500),
@@ -414,7 +480,7 @@ def create_app(
             limit=limit, participant_id=participant_id, unattributed_only=unattributed_only
         )
 
-    @app.post("/api/v1/history/{pour_id}/reassign")
+    @app.post("/api/v1/history/{pour_id}/reassign", response_model=PourResponse)
     async def reassign(
         pour_id: str, request: Request, payload: ReassignmentRequest
     ) -> dict[str, Any]:
@@ -423,25 +489,35 @@ def create_app(
         await coordinator.publish()
         return result
 
-    @app.get("/api/v1/export.{format}")
+    @app.get(
+        "/api/v1/export.{format}",
+        response_class=StreamingResponse,
+        responses={
+            200: {
+                "content": {
+                    "application/json": {},
+                    "text/csv": {},
+                }
+            }
+        },
+    )
     async def export(format: str, request: Request) -> Response:
         access(request)
-        rows = repository.list_pours(limit=500)
         if format == "csv":
-            return Response(
-                rows_to_csv(rows),
+            return StreamingResponse(
+                rows_to_csv_chunks(repository.iter_pours()),
                 media_type="text/csv; charset=utf-8",
                 headers={"Content-Disposition": 'attachment; filename="kegpulse-pours.csv"'},
             )
         if format == "json":
-            return Response(
-                rows_to_json(rows),
+            return StreamingResponse(
+                rows_to_json_chunks(repository.iter_pours()),
                 media_type="application/json",
                 headers={"Content-Disposition": 'attachment; filename="kegpulse-pours.json"'},
             )
         raise HTTPException(status_code=404, detail="export format must be csv or json")
 
-    @app.post("/api/v1/backup")
+    @app.post("/api/v1/backup", response_model=BackupResponse)
     async def backup(request: Request) -> dict[str, Any]:
         admin(request)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -451,7 +527,11 @@ def create_app(
 
     if config.allow_test_shutdown:
 
-        @app.post("/api/v1/admin/shutdown", include_in_schema=False)
+        @app.post(
+            "/api/v1/admin/shutdown",
+            include_in_schema=False,
+            response_model=ShutdownResponse,
+        )
         async def shutdown(request: Request) -> dict[str, bool]:
             admin(request)
             callback = getattr(app.state, "request_shutdown", None)
@@ -470,7 +550,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="backup not found")
         return FileResponse(path, filename=filename, media_type="application/vnd.sqlite3")
 
-    @app.get("/api/v1/settings")
+    @app.get("/api/v1/settings", response_model=SettingsResponse)
     async def settings(request: Request) -> dict[str, Any]:
         access(request)
         snapshot = coordinator.snapshot()
@@ -482,23 +562,83 @@ def create_app(
             "pin_configured": security.pin_configured,
         }
 
-    @app.patch("/api/v1/settings")
+    @app.patch("/api/v1/settings", response_model=SettingsResponse)
     async def update_settings(request: Request, payload: SettingsUpdate) -> dict[str, Any]:
         admin(request)
         changes = payload.model_dump(exclude_none=True)
+        serial_requested = "serial_port" in payload.model_fields_set
+        if serial_requested:
+            changes["serial_port"] = payload.serial_port
         for key, value in changes.items():
             repository.set_setting(key, str(value) if key == "verification_warning_pct" else value)
+        if payload.arm_timeout_ms is not None:
+            config.arm_timeout_ms = payload.arm_timeout_ms
+        reconnect_required = False
+        if serial_requested and not config.demo:
+            await asyncio.to_thread(manager.prefer_serial_port, payload.serial_port)
+            app.state.preferred_serial_port = payload.serial_port
+            reconnect_required = True
         await coordinator.publish()
-        return (await settings(request)) | {"serial_restart_required": "serial_port" in changes}
+        return (await settings(request)) | {
+            "serial_restart_required": False,
+            "serial_reconnect_required": reconnect_required,
+        }
 
-    @app.get("/api/v1/serial/ports")
+    @app.get("/api/v1/serial/ports", response_model=list[SerialPortResponse])
     async def serial_ports(request: Request) -> list[dict[str, Any]]:
         access(request)
         return enumerate_ports()
 
+    @app.put("/api/v1/serial/preference", response_model=SerialActionResponse)
+    async def serial_preference(
+        request: Request, payload: SerialPreferenceRequest
+    ) -> dict[str, Any]:
+        admin(request)
+        if config.demo:
+            raise HTTPException(
+                status_code=409, detail="serial controls are unavailable in demo mode"
+            )
+        repository.set_setting("serial_port", payload.port)
+        await asyncio.to_thread(manager.prefer_serial_port, payload.port)
+        app.state.preferred_serial_port = payload.port
+        await coordinator.publish()
+        return {
+            "serial_port": payload.port,
+            "connection_state": manager.connection_state.value,
+            "reconnecting": False,
+            "message": (
+                "Automatic serial discovery enabled; reconnect to apply it now."
+                if payload.port is None
+                else "Serial preference saved; reconnect to apply it now."
+            ),
+        }
+
+    @app.post("/api/v1/serial/reconnect", response_model=SerialActionResponse)
+    async def reconnect_serial(request: Request) -> dict[str, Any]:
+        admin(request)
+        if config.demo:
+            raise HTTPException(
+                status_code=409, detail="serial controls are unavailable in demo mode"
+            )
+        await asyncio.to_thread(manager.reconnect)
+        await coordinator.publish()
+        return {
+            "serial_port": _preferred_serial_port(repository, config, serial_port_override),
+            "connection_state": manager.connection_state.value,
+            "reconnecting": True,
+            "message": "Serial reconnect requested.",
+        }
+
+    @app.get("/api/v1/diagnostics", response_model=list[DiagnosticResponse])
+    async def diagnostics(
+        request: Request, limit: int = Query(default=100, ge=1, le=500)
+    ) -> list[dict[str, Any]]:
+        admin_access(request)
+        return repository.list_diagnostics(limit=limit)
+
     if config.demo:
 
-        @app.post("/api/v1/demo/action")
+        @app.post("/api/v1/demo/action", response_model=StatusResponse)
         async def demo_action(request: Request, payload: DemoAction) -> dict[str, Any]:
             admin(request)
             await coordinator.demo_action(
@@ -517,6 +657,7 @@ def create_app(
 
     @app.websocket("/api/v1/ws")
     async def websocket_status(websocket: WebSocket) -> None:
+        nonlocal websocket_subscribers
         host = websocket.headers.get("host", "")
         origin = websocket.headers.get("origin")
         if (
@@ -526,13 +667,18 @@ def create_app(
         ):
             await websocket.close(code=1008)
             return
-        if len(coordinator._subscribers) >= 16:
-            await websocket.close(code=1013)
-            return
-        await websocket.accept()
-        subscriber = coordinator.subscribe()
-        receive_task = asyncio.create_task(websocket.receive())
+        async with websocket_admission_lock:
+            if websocket_subscribers >= 16:
+                await websocket.close(code=1013)
+                return
+            websocket_subscribers += 1
+        token = websocket.cookies.get(SESSION_COOKIE)
+        subscriber = None
+        receive_task: asyncio.Task[Any] | None = None
         try:
+            await websocket.accept()
+            subscriber = coordinator.subscribe()
+            receive_task = asyncio.create_task(websocket.receive())
             while True:
                 snapshot_task = asyncio.create_task(subscriber.get())
                 done, _pending = await asyncio.wait(
@@ -557,14 +703,23 @@ def create_app(
                     with suppress(asyncio.CancelledError):
                         await snapshot_task
                     snapshot = coordinator.snapshot()
+                if config.lan_mode:
+                    session = security.get_session(token, touch=False)
+                    if session is None or not session.admin:
+                        await websocket.close(code=1008)
+                        break
                 await websocket.send_json(snapshot)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
-            receive_task.cancel()
-            with suppress(asyncio.CancelledError, RuntimeError):
-                await receive_task
-            coordinator.unsubscribe(subscriber)
+            if receive_task is not None:
+                receive_task.cancel()
+                with suppress(asyncio.CancelledError, RuntimeError):
+                    await receive_task
+            if subscriber is not None:
+                coordinator.unsubscribe(subscriber)
+            async with websocket_admission_lock:
+                websocket_subscribers -= 1
 
     web_directory = Path(__file__).with_name("web")
     app.mount("/static", StaticFiles(directory=web_directory), name="static")

@@ -32,7 +32,7 @@ KP1|Q|12AB34CD|PING|nonce=42*CBA4\n
 | Operation | Required request fields | Successful response/result fields |
 |---|---|---|
 | `HELLO` | `min`, `max` | `proto`, `fw`, `device`, `boot`, `reset`, `caps` |
-| `STATUS` | none | `state`, `boot`, `seq`, `sid`, `attributed`, `pulses`, `lifetime`, `uptime`, `next`, `retained` |
+| `STATUS` | none | `state`, `boot`, `seq`, `sid`, `attributed`, `pulses`, `lifetime`, `uptime`, `next`, `retained`, `arm_left` |
 | `COUNTERS` | none | `accepted`, `rejected`, `noise_gate_us`, `recovery`, `fault` |
 | `ARM` | `boot`, `seq`, `sid`, `ttl` | `state`, `already` |
 | `CANCEL` | `boot`, `seq`, `sid` | `already` |
@@ -46,7 +46,17 @@ Terminal device events use request ID `00000000`, operation `RESULT`, and fields
 dev boot seq sid attr st pulses life start end fault
 ```
 
-An unattributed result uses `sid=none` and `attr=0`; an attributed result uses a 32-character lowercase hexadecimal `sid` and `attr=1`. `st` is `complete`, `timed_out`, or `interrupted`. `pulses` is capped at `2^63-1` so it is exactly representable in SQLite; `life` is an unsigned 64-bit lifetime counter. `start` and `end` are boot-relative unsigned 32-bit milliseconds and duration uses rollover-safe subtraction. A timeout result has zero pulses and never affects inventory. Firmware retains terminal results until a matching ACK when capacity permits.
+An unattributed result uses `sid=none` and `attr=0`; an attributed result uses a 32-character lowercase hexadecimal `sid` and `attr=1`. `st` is `complete`, `timed_out`, or `interrupted`. `pulses` is capped at `2^63-1` so it is exactly representable in SQLite; `life` is an unsigned 64-bit lifetime counter. `start` and `end` are boot-relative unsigned 32-bit milliseconds and duration uses rollover-safe subtraction. A timeout result has zero pulses and never affects inventory. Firmware retains terminal results until a matching ACK.
+
+`ACK.dev` is optional solely for compatibility with the original KP1 proto-1
+`boot`+`seq` form. The current host always supplies the device ID learned from its active `HELLO`
+handshake. Firmware validates any supplied `dev` as exactly 16 uppercase hexadecimal digits and
+requires it to match the configured controller; an invalid or mismatched present value is `STALE`.
+The `boot` and `seq` fields remain required for both forms.
+
+`STATUS.arm_left` is the authoritative unsigned milliseconds remaining before an armed session
+times out. It is rollover-safe and is `0` outside `ARMED` (and at the exact deadline). The compact
+name keeps the maximum STATUS response at 254 bytes including LF.
 
 ## Errors
 
@@ -73,7 +83,15 @@ An error frame has operation `ERROR`, required fields `code` and `op`, and an op
 - Timing gaps do not delimit frames. A corrupted device response is ignored by the host and recovered with `STATUS`/`RESULTS`.
 - Request IDs correlate a response. Repeating the last identical state-changing request returns its semantic result with `already=1`.
 - `ARM` requires the current boot and `seq == next`. Reusing `(boot, seq, sid)` is idempotent; changing the SID for an allocated sequence is `STALE`.
-- Duplicate `CANCEL` and `ACK` never affect a newer event.
+- Duplicate `CANCEL` and matching `ACK` requests never affect a newer event. Current-host ACKs are
+  gated by device, boot, and sequence; legacy proto-1 ACKs without `dev` are gated by boot and sequence.
+- The ISR retains the first and last timestamps of each bounded drained pulse batch. The first edge
+  is applied separately, so an edge captured at/before an arm or settle deadline cannot be moved
+  across that deadline merely because later edges arrived before the main loop drained the batch.
+- Immediately before a completed command changes machine state, and immediately before a timer
+  tick, firmware takes one bounded atomic snapshot of the pending ISR batch. Edges already captured
+  in that snapshot are applied first. Interrupts are then restored; later edges are deliberately
+  ordered after that command/tick and remain pending for the next boundary.
 
 ## Device state model
 
@@ -93,7 +111,7 @@ An error frame has operation `ERROR`, required fields `code` and `op`, and an op
 
 ## Reconnect and reset
 
-On reconnect the host performs `HELLO`, then `STATUS`, then `RESULTS`. It commits every unseen result before ACK. On the same boot, an unexplained lifetime increase is preserved as an unattributed recovered event marked `needs_review`. A new boot identity prevents cross-reset delta inference; any provisional host session is closed as interrupted/uncertain using only already confirmed pulses.
+On reconnect the host performs `HELLO`, then `STATUS`, then `RESULTS`. It commits every unseen result before sending an ACK with that result's exact device, boot, and sequence identity. If a periodic STATUS or RESULT reveals an in-place boot change, the host rejects that frame for the stale handshake and forces a new `HELLO` before accepting new-boot results. On the same boot, an unexplained lifetime increase is preserved as an unattributed recovered event marked `needs_review`. A new boot identity prevents cross-reset delta inference; any provisional host session is closed as interrupted/uncertain using only already confirmed pulses.
 
 Firmware keeps a fixed four-result store. If it fills, new attributed `ARM` requests return `BUSY`; accepted pulses still increment lifetime and are surfaced through the `COUNTERS.recovery` count. Device faults are also reported by `COUNTERS.fault`. Event sequence exhaustion is a fault and never wraps.
 

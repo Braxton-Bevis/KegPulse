@@ -13,6 +13,7 @@ from kegpulse.__main__ import restore_database
 from kegpulse.logging_setup import configure_logging
 from kegpulse.paths import get_app_paths
 from kegpulse.persistence import Database, Repository
+from kegpulse.protocol import Frame
 from kegpulse.serialio import DeviceManager, SimulatorTransport
 from kegpulse.serialio.manager import ConnectionState, ManagerEvent
 
@@ -66,6 +67,48 @@ def test_restore_rolls_back_live_database_after_post_install_validation_failure(
     real_validate(failed_restore[0])
     assert _participant_names(pre_restore[0]) == ["Original data"]
     assert _participant_names(failed_restore[0]) == ["Candidate data"]
+
+
+def test_restore_rollback_survives_failed_candidate_archival(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = get_app_paths(tmp_path / "live")
+    live = Database(paths.database)
+    Repository(live).create_participant("Original data")
+    live.close()
+    source = tmp_path / "candidate.db"
+    candidate = Database(source)
+    Repository(candidate).create_participant("Candidate data")
+    candidate.close()
+
+    real_validate = Database.validate_backup
+    validation_calls = 0
+
+    def fail_final_validation(path: Path) -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        real_validate(path)
+        if validation_calls == 3:
+            raise RuntimeError("injected final validation failure")
+
+    real_replace = os.replace
+
+    def fail_archive(source_path: Path, destination_path: Path) -> None:
+        if Path(destination_path).name.startswith("failed-restore-"):
+            raise PermissionError("injected archive failure")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(Database, "validate_backup", staticmethod(fail_final_validation))
+    monkeypatch.setattr(os, "replace", fail_archive)
+
+    with pytest.raises(RuntimeError, match="final validation failure") as caught:
+        restore_database(paths, source)
+
+    assert any("could not be archived" in note for note in caught.value.__notes__)
+    assert _participant_names(paths.database) == ["Original data"]
+    assert not list(paths.root.glob(".restore-*.db"))
+    assert not list(paths.root.glob(".rollback-*.db"))
+    assert not list(paths.backups.glob("failed-restore-*.db"))
 
 
 def test_logging_rotates_to_five_valid_json_backups_and_restores_global_handlers(
@@ -147,3 +190,28 @@ def test_device_manager_event_overflow_is_bounded_visible_and_recoverable() -> N
     assert manager.connection_state is ConnectionState.CONNECTED
     assert manager.overflow_count == 1
     assert manager.drain_events() == [ManagerEvent("connection", detail="resynchronized")]
+
+
+def test_dropped_counter_update_remains_changed_until_it_is_handed_off() -> None:
+    manager = DeviceManager(lambda: SimulatorTransport(), event_capacity=1)
+    manager._identity = {"device": "AAAAAAAAAAAAAAAA", "boot": "BBBBBBBBBBBBBBBB"}
+    manager._status = {"uptime": "1234"}
+    manager._queue_event(ManagerEvent("unexpected", detail="occupies queue"))
+    counters = Frame("R", "00000001", "COUNTERS", {"recovery": "25"})
+
+    manager._record_counters(counters)
+    assert manager.counters == {}
+    assert manager.connection_state is ConnectionState.DEGRADED
+    manager.drain_events()
+
+    manager._record_counters(counters)
+    assert manager.counters == {"recovery": "25"}
+    assert manager.drain_events() == [
+        ManagerEvent(
+            "counters",
+            counters,
+            device_id="AAAAAAAAAAAAAAAA",
+            boot_id="BBBBBBBBBBBBBBBB",
+            uptime_ms=1234,
+        )
+    ]

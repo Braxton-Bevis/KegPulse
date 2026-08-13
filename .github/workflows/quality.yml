@@ -21,26 +21,56 @@ jobs:
       - run: python -m pip install --upgrade pip==25.2
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
+      - name: Verify Linux shell entry points
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for script in scripts/*.sh; do
+            test "$(git ls-files --stage -- "$script" | cut -d' ' -f1)" = 100755
+            test -x "$script"
+            bash -n "$script"
+          done
       - run: ruff format --check src tests
       - run: ruff check src tests
+      - run: ruff format --check scripts/check_core_coverage.py scripts/render_systemd_units.py scripts/smoke-package.py scripts/wait_for_kegpulse.py
+      - run: ruff check scripts/check_core_coverage.py scripts/render_systemd_units.py scripts/smoke-package.py scripts/wait_for_kegpulse.py
       - run: mypy src/kegpulse
-      - run: pytest --ignore=tests/e2e --cov=kegpulse --cov-branch --cov-report=xml
+      - name: Assert PlatformIO is isolated from the host environment
+        run: python -c "import importlib.util; assert importlib.util.find_spec('platformio') is None"
+      - name: Render and verify systemd units
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          unit_dir="$RUNNER_TEMP/rendered KegPulse units"
+          data_dir="$RUNNER_TEMP/Keg Pulse ü & 100% \$cash"
+          python scripts/render_systemd_units.py --repo-root "$PWD" --data-dir "$data_dir" --port 9123 --output-dir "$unit_dir"
+          systemd-analyze --user verify "$unit_dir/kegpulse.service" "$unit_dir/kegpulse-kiosk.service"
+      - run: python -c "from pathlib import Path; Path('artifacts').mkdir(exist_ok=True)"
+      - run: pytest --ignore=tests/e2e --junitxml=artifacts/pytest-unit-integration.xml --cov=kegpulse --cov-branch --cov-report=xml --cov-report=json:coverage.json
+      - run: python scripts/check_core_coverage.py coverage.json --minimum 90
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-${{ matrix.os }}-${{ matrix.python }}
-          path: coverage.xml
+          path: |
+            coverage.xml
+            coverage.json
+            artifacts/pytest-unit-integration.xml
 
   firmware:
     runs-on: ubuntu-22.04
+    env:
+      PLATFORMIO_SETTING_ENABLE_TELEMETRY: "no"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install platformio==6.1.18
-      - run: platformio test -d firmware -e native
-      - run: platformio run -d firmware -e nanoatmega328
+      - run: python -m venv .pio-venv
+      - run: .pio-venv/bin/python -m pip install --upgrade pip==25.2
+      - run: .pio-venv/bin/python -m pip install --require-hashes -r requirements-firmware.lock
+      - run: .pio-venv/bin/platformio test -d firmware -e native
+      - run: .pio-venv/bin/platformio run -d firmware -e nanoatmega328
       - uses: actions/upload-artifact@v4
         with:
           name: nano-firmware
@@ -59,10 +89,55 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.lock
       - run: python -m pip install --no-deps -e .
       - run: python -m playwright install --with-deps chromium
-      - run: pytest tests/e2e
+      - run: python -c "from pathlib import Path; Path('artifacts').mkdir(exist_ok=True)"
+      - run: pytest tests/e2e --junitxml=artifacts/pytest-browser.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: browser-evidence-${{ matrix.os }}
-          path: artifacts/browser
+          path: |
+            artifacts/browser
+            artifacts/pytest-browser.xml
 
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Create locked Windows package environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip==25.2
+          .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
+          .\.venv\Scripts\python.exe -m pip install --no-deps -e .
+      - name: Create locked Linux package environment
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip==25.2
+          .venv/bin/python -m pip install --require-hashes -r requirements-dev.lock
+          .venv/bin/python -m pip install --no-deps -e .
+      - name: Build and smoke-test Windows x64 package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\package-windows.ps1
+      - name: Build and smoke-test Linux x86_64 package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ runner.os }}-x86_64
+          path: |
+            artifacts/KegPulse-*
+            artifacts/SHA256SUMS.txt

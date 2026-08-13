@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 APPLICATION_ID = 0x4B50554C
-CURRENT_SCHEMA = 1
+CURRENT_SCHEMA = 2
 REQUIRED_TABLES = {
     "participants",
     "kegs",
@@ -19,6 +19,7 @@ REQUIRED_TABLES = {
     "provisional_sessions",
     "pour_events",
     "device_results",
+    "device_recovery_checkpoints",
     "inventory_adjustments",
     "attribution_audit",
     "settings",
@@ -75,7 +76,12 @@ class Database:
                 self._connection.rollback()
                 raise
             else:
-                self._connection.commit()
+                try:
+                    self._connection.commit()
+                except Exception:
+                    if self._connection.in_transaction:
+                        self._connection.rollback()
+                    raise
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -129,8 +135,29 @@ class Database:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            if not REQUIRED_TABLES.issubset(tables):
+            required_tables = REQUIRED_TABLES
+            if version == 1:
+                required_tables = REQUIRED_TABLES - {"device_recovery_checkpoints"}
+            if not required_tables.issubset(tables):
                 raise ValueError("backup is missing required KegPulse tables")
+            if version >= 2:
+                provisional_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(provisional_sessions)"
+                    ).fetchall()
+                }
+                sample_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(calibration_samples)"
+                    ).fetchall()
+                }
+                if (
+                    "consumed_entity_id" not in provisional_columns
+                    or "superseded_at" not in sample_columns
+                ):
+                    raise ValueError("backup is missing required KegPulse schema columns")
         finally:
             connection.close()
 

@@ -8,7 +8,7 @@ Firmware owns accepted pulses and its boot-relative session state. A single asyn
 
 ## ADR-002: Durable identifiers and acknowledgement
 
-Host entities use UUIDv4. Attributed sessions use a host UUID. Firmware has a stable device ID, a boot ID, and a monotonically increasing event sequence. Device results are unique by `(device_id, boot_id, event_seq)` and sessions are also unique by host UUID. The host commits a result transactionally before sending `ACK`; duplicate results and duplicate API idempotency keys return the existing outcome.
+Host entities use UUIDv4. Attributed sessions use a host UUID. Firmware has a stable device ID, a boot ID, and a monotonically increasing event sequence. Device results are unique by `(device_id, boot_id, event_seq)` and sessions are also unique by host UUID. The host commits a result transactionally before sending `ACK`. The current host supplies the device ID from its active `HELLO`, and firmware validates device, boot, and event sequence. For compatibility with the original KP1 proto-1 wire contract, firmware also accepts a legacy ACK that omits `dev` but still requires matching boot and sequence; any present `dev` is validated strictly. Duplicate results and duplicate API idempotency keys return the existing outcome.
 
 ## ADR-003: Measurement and reset evidence
 
@@ -20,15 +20,15 @@ The input is D2/INT0, configured as `INPUT`; the external pull-up is required. `
 
 ## ADR-005: Timers and boundaries
 
-Default arm timeout is 15 seconds, flow-gap transition is 750 ms, and settling completion is 1,500 ms. Values are bounded below half the unsigned 32-bit timer range. At an exact deadline, an already captured pulse is processed before timeout/completion. Commands drain prior captured pulses before changing state.
+Default arm timeout is 15 seconds, flow-gap transition is 750 ms, and settling completion is 1,500 ms. Values are bounded below half the unsigned 32-bit timer range. At an exact deadline, an already captured pulse is processed before timeout/completion. The ISR retains the first and last timestamp of each pending batch and the machine applies the first edge separately, preventing later batched edges from moving it across an arm/settle deadline. Immediately before a command mutation or timer tick, firmware takes a bounded atomic snapshot: that batch is applied first, while edges arriving after the snapshot are ordered after the command/tick. STATUS exposes the rollover-safe authoritative remaining arm time as `arm_left`.
 
 ## ADR-006: Protocol
 
-Serial is 115200 8-N-1. KP1 frames are ASCII/LF, at most 256 bytes including LF, and protected by CRC-16/CCITT-FALSE. Request IDs correlate replies; semantic idempotency uses boot/event/session identity. Partial and concatenated frames are handled by newlines; an oversized frame is discarded through its newline and parsing then resumes. Full grammar is in `docs/PROTOCOL.md`.
+Serial is 115200 8-N-1. KP1 frames are ASCII/LF, at most 256 bytes including LF, and protected by CRC-16/CCITT-FALSE. Device and boot identities use exactly 16 uppercase hexadecimal digits. Request IDs correlate replies; semantic idempotency uses device/boot/event/session identity. Partial and concatenated frames are handled by newlines; an oversized frame is discarded through its newline and parsing then resumes. Full grammar is in `docs/PROTOCOL.md`.
 
 ## ADR-007: Bounded recovery
 
-Firmware holds four unacknowledged terminal results in a fixed array. When full it rejects attributed arms and retains later lifetime pulses in a recovery bucket exposed by `COUNTERS`. Host serial events use a bounded queue of 256. Overflow forces visible degraded state and a status/results resynchronization; it is never treated as proof that no pulse occurred. Reconnect backoff is bounded from 250 ms to 15 seconds with jitter.
+Firmware holds four unacknowledged terminal results in a fixed array. When full it rejects attributed arms and retains later lifetime pulses in a recovery bucket exposed by `COUNTERS`. Host serial events use a bounded queue of 256; changed COUNTERS snapshots are events through that same bound. Overflow forces visible degraded state and a status/results resynchronization; it is never treated as proof that no pulse occurred. A boot mismatch in STATUS or RESULT forces a fresh handshake before new-boot results are accepted. Reconnect backoff is bounded from 250 ms to 15 seconds with jitter.
 
 ## ADR-008: Calibration
 
@@ -73,3 +73,33 @@ Source support targets CPython 3.11 and 3.12 on Windows x64 and Ubuntu 22.04-com
 ## ADR-018: Physical assumptions still unverified
 
 The actual sensor voltage, polarity, pulse width/rate, K-factor, food-contact rating, barb diameter, fittings, external pull-up value, Nano bootloader/USB bridge behavior, line hydraulics, scale, Windows COM behavior, and Raspberry Pi/touchscreen behavior require physical checks. Simulator and compile evidence cannot close those items.
+
+## ADR-019: Durable overflow-counter consumption
+
+`COUNTERS.recovery` is a cumulative, boot-scoped count of accepted pulses that firmware could not
+place in its fixed result store. The host checkpoints it transactionally by `(device_id, boot_id)`.
+Each increase creates one deterministic, unattributed `estimated_recovered` delta pour and advances
+the checkpoint in the same transaction; equality is a replay and a decrease is rejected. Serial
+events capture device/boot identity plus the applicable keg/calibration context when admitted, so a
+delayed measurement is never relabeled with a newer device, keg, or calibration. Duplicate results
+retain the first captured context. Recovery counters stay ordered by cumulative boot-scoped value;
+an increase across a keg/calibration boundary is retained as a separate delta instead of being
+coalesced into the newer context. Coordinator event exceptions are isolated and retried through a
+bounded queue; result commit failures remain unacknowledged for firmware's periodic replay.
+
+## ADR-020: Arm binding and workflow consumption
+
+The host binds a provisional UUID to the exact device, boot, next event sequence, and confirmed
+lifetime before transmitting `ARM`. An explicit device rejection marks that binding failed; a
+transport failure or lost acknowledgement leaves it active for status/result reconciliation because
+the device may have armed. Calibration and verification capture consumption writes the measured
+entity and its durable `consumed_entity_id` pointer atomically, so retry returns the original entity
+instead of duplicating it.
+
+## ADR-021: Dependency and instance isolation
+
+The runtime pins patched FastAPI/Starlette releases in hashed host locks. PlatformIO is constrained
+by a different dependency graph, so firmware tooling uses its own hashed `requirements-firmware.lock`
+and `.pio-venv`, with telemetry disabled; it is absent from the host environment and frozen bundle.
+One kernel-held lock per resolved data directory covers normal startup and offline restore. A stale
+lock file is harmless because ownership is the OS lock, not file existence.

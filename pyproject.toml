@@ -11,10 +11,11 @@ requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
 authors = [{name = "KegPulse contributors"}]
 dependencies = [
-  "fastapi==0.116.1",
+  "fastapi==0.139.2",
   "platformdirs==4.3.8",
   "pydantic==2.11.7",
   "pyserial==3.5",
+  "starlette==1.5.1",
   "uvicorn==0.34.3",
   "websockets==15.0.1",
 ]
@@ -30,7 +31,6 @@ dev = [
   "pytest-cov==6.2.1",
   "ruff==0.12.8",
   "types-pyserial==3.5.0.20250326",
-  "platformio==6.1.18",
 ]
 package = ["pyinstaller==6.15.0"]
 

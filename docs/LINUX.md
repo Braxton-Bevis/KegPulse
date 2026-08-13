@@ -22,7 +22,9 @@ python -m playwright install --with-deps chromium
 ```
 
 Setup itself does not invoke `sudo`, alter serial permissions, or install a system service. It
-creates `.venv`, installs hash-locked dependencies, and installs the package editable.
+creates `.venv`, installs hash-locked dependencies, and installs the package editable. Developer
+setup also creates an isolated `.pio-venv` from `requirements-firmware.lock`; PlatformIO is not
+installed into the host environment.
 
 ## Demo and hardware mode
 
@@ -41,6 +43,9 @@ stop the service; use the printed `http://127.0.0.1:8765` URL.
 Data is in the current user's platform data directory, normally
 `~/.local/share/KegPulse/`. Override it with `--data-dir` or `KEGPULSE_DATA_DIR`. The install
 directory may be read-only because runtime data, logs, and backups are kept outside it.
+Only one process may use a data directory at a time, including restore operations. The
+`.kegpulse.lock` file may remain after shutdown, but its kernel lock is released automatically and
+the next launch can use it. Bind addresses are IPv4-only; IPv6 forms are rejected cleanly.
 
 ## Serial permissions
 
@@ -58,9 +63,13 @@ out/in or reboot:
 sudo usermod -aG dialout "$USER"
 ```
 
-`run-linux.sh` detects an explicitly supplied unreadable `/dev` path and prints the exact group
-action; it never changes permissions itself. A path may change after reconnect, so hardware mode
-continues handshake-based discovery unless a manual port is deliberately pinned.
+`run-linux.sh` detects an explicitly supplied `/dev` path that is not both readable and writable
+and prints the exact group
+action. The serial transport also turns an `EACCES`/`EPERM` open failure into read/write guidance
+that names the device, its owning group when discoverable, the current user, and the exact
+`usermod` plus log-out/in action. Neither path changes permissions itself. A device path may change
+after reconnect, so hardware mode continues handshake-based discovery unless a manual port is
+deliberately pinned.
 
 ## Target-native package
 
@@ -70,27 +79,36 @@ Build on Linux x86_64, never by cross-packaging from Windows:
 ./scripts/package-linux.sh
 ```
 
-This creates a PyInstaller one-folder bundle, runs the frozen demo health/calibration/pour/data
-path/shutdown smoke test, then writes `artifacts/KegPulse-linux-x86_64.tar.gz` and its SHA-256.
-It does not support Raspberry Pi ARM64; use [RASPBERRY_PI.md](RASPBERRY_PI.md) there.
+The script rejects non-x86_64 kernels and non-64-bit/non-x86_64 Python interpreters. It creates a
+PyInstaller one-folder bundle, runs the frozen demo health/calibration/pour/restart smoke against
+a Unicode-and-space data path, checks same-root second-instance and occupied-port rejection, then
+writes `artifacts/KegPulse-linux-x86_64.tar.gz` and its SHA-256. It does not support Raspberry Pi
+ARM64; use [RASPBERRY_PI.md](RASPBERRY_PI.md) there.
 
 ## Optional user service
 
-The provided `packaging/kegpulse.service` is a template. Copy and adjust its repository path,
-then install it as a user service only after an interactive hardware run succeeds:
+The files under `packaging/` contain renderer placeholders and must not be copied directly. After
+an interactive hardware run succeeds, render and install them for the current checkout:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp packaging/kegpulse.service ~/.config/systemd/user/
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$unit_dir"
+.venv/bin/python scripts/render_systemd_units.py \
+  --repo-root "$PWD" \
+  --data-dir "${XDG_DATA_HOME:-$HOME/.local/share}/KegPulse" \
+  --port 8765 \
+  --output-dir "$unit_dir"
 systemctl --user daemon-reload
 systemctl --user enable --now kegpulse.service
 ```
 
-Reverse it without deleting data:
+It safely quotes the actual checkout/data paths and gives the host and kiosk one shared port.
+Reverse both units without deleting data or running setup/dependency installation:
 
 ```bash
-systemctl --user disable --now kegpulse.service
-rm ~/.config/systemd/user/kegpulse.service
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+systemctl --user disable --now kegpulse-kiosk.service kegpulse.service
+rm -f "$unit_dir/kegpulse.service" "$unit_dir/kegpulse-kiosk.service"
 systemctl --user daemon-reload
 ```
 

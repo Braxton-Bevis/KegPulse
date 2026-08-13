@@ -24,7 +24,10 @@ class BodyLimitMiddleware:
         declared = headers.get("content-length")
         if declared:
             try:
-                if int(declared) > self.maximum_bytes:
+                declared_bytes = int(declared)
+                if declared_bytes < 0:
+                    raise ValueError
+                if declared_bytes > self.maximum_bytes:
                     await JSONResponse({"detail": "request body exceeds 64 KiB"}, status_code=413)(
                         scope, receive, send
                     )
@@ -37,11 +40,17 @@ class BodyLimitMiddleware:
         total = 0
         exceeded = False
         timed_out = False
+        loop = asyncio.get_running_loop()
+        body_deadline = loop.time() + 15
 
         async def limited_receive() -> Message:
             nonlocal total, exceeded, timed_out
+            remaining = body_deadline - loop.time()
+            if remaining <= 0:
+                timed_out = True
+                return {"type": "http.disconnect"}
             try:
-                message = await asyncio.wait_for(receive(), timeout=15)
+                message = await asyncio.wait_for(receive(), timeout=remaining)
             except TimeoutError:
                 timed_out = True
                 return {"type": "http.disconnect"}

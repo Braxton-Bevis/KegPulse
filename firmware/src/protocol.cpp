@@ -22,6 +22,21 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t length) {
   return crc;
 }
 
+bool ack_identity_matches(const char* supplied_device,
+                          const char* supplied_boot,
+                          const char* expected_device,
+                          const char* expected_boot) {
+  if (!valid_upper_hex_identity(supplied_boot) ||
+      !valid_upper_hex_identity(expected_device) ||
+      !valid_upper_hex_identity(expected_boot) ||
+      strcmp(supplied_boot, expected_boot) != 0) {
+    return false;
+  }
+  return supplied_device == nullptr ||
+         (valid_upper_hex_identity(supplied_device) &&
+          strcmp(supplied_device, expected_device) == 0);
+}
+
 static bool valid_identifier(const char* text, size_t minimum, size_t maximum,
                              bool uppercase) {
   if (text == nullptr) {

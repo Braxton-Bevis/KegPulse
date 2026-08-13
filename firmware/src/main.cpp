@@ -34,6 +34,8 @@ constexpr uint8_t kPulsePin = 2;  // Nano D2 / INT0.
 
 constexpr char kDeviceId[] = KEGPULSE_DEVICE_ID;
 static_assert(sizeof(kDeviceId) == 17, "KEGPULSE_DEVICE_ID must be 16 ASCII characters");
+static_assert(kegpulse::valid_upper_hex_identity(kDeviceId),
+              "KEGPULSE_DEVICE_ID must be exactly 16 uppercase hex digits");
 static_assert(sizeof(uint32_t) == 4, "KegPulse requires 32-bit uint32_t counters");
 static_assert(sizeof(uint64_t) == 8, "KegPulse requires 64-bit uint64_t counters");
 static_assert(kegpulse::kMaxFrameBytes == 256, "KP1 wire limit must remain 256 bytes");
@@ -48,6 +50,7 @@ struct BootRecord {
 };
 
 volatile uint32_t g_pending_pulses = 0;
+volatile uint32_t g_first_pulse_ms = 0;
 volatile uint32_t g_last_pulse_ms = 0;
 volatile uint32_t g_last_accepted_us = 0;
 volatile uint32_t g_rejected_pulses = 0;
@@ -58,6 +61,14 @@ kegpulse::FrameParser g_parser;
 uint32_t g_boot_counter = 1;
 uint8_t g_reset_cause = 0;
 uint32_t g_last_emitted_sequence = 0;
+
+struct PendingPulseBatch {
+  uint32_t count;
+  uint32_t first_captured_ms;
+  uint32_t last_captured_ms;
+  uint32_t boundary_ms;
+  bool saturated;
+};
 
 uint16_t boot_crc(const BootRecord& record) {
   return kegpulse::crc16_ccitt(
@@ -101,13 +112,17 @@ void pulse_isr() {
   }
 #endif
   g_last_accepted_us = now_us;
+  // Keep session timestamps in the millis() rollover domain used by tick().
+  const uint32_t captured_ms = millis();
   if (g_pending_pulses != UINT32_MAX) {
+    if (g_pending_pulses == 0) {
+      g_first_pulse_ms = captured_ms;
+    }
     ++g_pending_pulses;
   } else {
     g_pending_saturated = true;
   }
-  // Keep session timestamps in the same rollover domain used by tick().
-  g_last_pulse_ms = millis();
+  g_last_pulse_ms = captured_ms;
 }
 
 void u64_to_ascii(uint64_t value, char output[24]) {
@@ -156,7 +171,7 @@ bool parse_u32(const char* text, uint32_t* value) {
 bool boot_matches(const char* text) {
   char expected[17];
   hex64_to_ascii(g_boot_counter, expected);
-  return text != nullptr && strcmp(text, expected) == 0;
+  return kegpulse::valid_upper_hex_identity(text) && strcmp(text, expected) == 0;
 }
 
 void write_checked_byte(char value, uint16_t* crc) {
@@ -274,20 +289,26 @@ void emit_new_results() {
   }
 }
 
-void send_status(const char* request_id) {
-  const kegpulse::Snapshot status = g_machine.snapshot();
+void send_status(const char* request_id, uint32_t now_ms) {
+  bool produced = false;
+  g_machine.tick(now_ms, &produced);
+  if (produced) {
+    emit_new_results();
+  }
+  const kegpulse::Snapshot status = g_machine.snapshot(now_ms);
   // Recovery/fault diagnostics live in COUNTERS so a worst-case STATUS frame
   // (active 32-byte SID plus maximum-width counters) stays below 256 bytes.
-  kegpulse::Field fields[10]{};
+  kegpulse::Field fields[11]{};
   char boot[17], sequence[16], pulses[24], lifetime[24], uptime[16], next[16],
-      retained[8];
+      retained[8], arm_left[16];
   hex64_to_ascii(g_boot_counter, boot);
   u32_to_ascii(status.sequence, sequence);
   u64_to_ascii(status.session_pulses, pulses);
   u64_to_ascii(status.lifetime_pulses, lifetime);
-  u32_to_ascii(millis(), uptime);
+  u32_to_ascii(now_ms, uptime);
   u32_to_ascii(status.next_sequence, next);
   u32_to_ascii(status.retained_results, retained);
+  u32_to_ascii(status.arm_remaining_ms, arm_left);
   set_field(&fields[0], "state", kegpulse::state_name(status.state));
   set_field(&fields[1], "boot", boot);
   set_field(&fields[2], "seq", status.sequence == 0 ? "none" : sequence);
@@ -300,10 +321,11 @@ void send_status(const char* request_id) {
   set_field(&fields[7], "uptime", uptime);
   set_field(&fields[8], "next", next);
   set_field(&fields[9], "retained", retained);
-  send_fields('R', request_id, "STATUS", fields, 10);
+  set_field(&fields[10], "arm_left", arm_left);
+  send_fields('R', request_id, "STATUS", fields, 11);
 }
 
-void handle_request(const kegpulse::ParsedFrame& frame) {
+void handle_request(const kegpulse::ParsedFrame& frame, uint32_t boundary_ms) {
   if (frame.kind != 'Q') {
     send_error(frame.request_id, frame.operation, "MALFORMED");
     return;
@@ -344,13 +366,13 @@ void handle_request(const kegpulse::ParsedFrame& frame) {
     return;
   }
   if (strcmp(frame.operation, "STATUS") == 0) {
-    send_status(frame.request_id);
+    send_status(frame.request_id, boundary_ms);
     return;
   }
   if (strcmp(frame.operation, "COUNTERS") == 0) {
     uint32_t rejected = 0;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rejected = g_rejected_pulses; }
-    const kegpulse::Snapshot status = g_machine.snapshot();
+    const kegpulse::Snapshot status = g_machine.snapshot(boundary_ms);
     kegpulse::Field fields[5]{};
     char accepted[24], rejected_text[16], gate[16], recovery[24];
     u64_to_ascii(status.lifetime_pulses, accepted);
@@ -393,7 +415,7 @@ void handle_request(const kegpulse::ParsedFrame& frame) {
     }
     bool duplicate = false;
     const kegpulse::MachineError error =
-        g_machine.arm(sid, sequence, millis(), ttl, &duplicate);
+        g_machine.arm(sid, sequence, boundary_ms, ttl, &duplicate);
     if (error != kegpulse::MachineError::NONE) {
       send_error(frame.request_id, frame.operation, machine_error_code(error));
       return;
@@ -417,7 +439,7 @@ void handle_request(const kegpulse::ParsedFrame& frame) {
     }
     bool duplicate = false, produced = false;
     const kegpulse::MachineError error =
-        g_machine.cancel(sid, sequence, millis(), &duplicate, &produced);
+        g_machine.cancel(sid, sequence, boundary_ms, &duplicate, &produced);
     if (error != kegpulse::MachineError::NONE) {
       send_error(frame.request_id, frame.operation, machine_error_code(error));
       return;
@@ -430,7 +452,10 @@ void handle_request(const kegpulse::ParsedFrame& frame) {
   }
   if (strcmp(frame.operation, "ACK") == 0) {
     uint32_t sequence = 0;
-    if (!boot_matches(frame.get("boot"))) {
+    char expected_boot[17];
+    hex64_to_ascii(g_boot_counter, expected_boot);
+    if (!kegpulse::ack_identity_matches(frame.get("dev"), frame.get("boot"),
+                                        kDeviceId, expected_boot)) {
       send_error(frame.request_id, frame.operation, "STALE");
       return;
     }
@@ -448,23 +473,49 @@ void handle_request(const kegpulse::ParsedFrame& frame) {
   send_error(frame.request_id, frame.operation, "UNSUPPORTED");
 }
 
-void drain_pulses() {
-  uint32_t count = 0;
-  uint32_t captured_ms = 0;
-  bool saturated = false;
+PendingPulseBatch capture_pending_batch() {
+  PendingPulseBatch batch{};
+  // This bounded snapshot is the command/tick linearization point. ISR edges
+  // completed before it are in this batch; an edge arriving after interrupts
+  // are restored is intentionally ordered after the following command/tick.
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    count = g_pending_pulses;
-    captured_ms = g_last_pulse_ms;
-    saturated = g_pending_saturated;
+    batch.boundary_ms = millis();
+    batch.count = g_pending_pulses;
+    batch.first_captured_ms = g_first_pulse_ms;
+    batch.last_captured_ms = g_last_pulse_ms;
+    batch.saturated = g_pending_saturated;
     g_pending_pulses = 0;
     g_pending_saturated = false;
   }
-  if (count > 0) {
+  return batch;
+}
+
+void apply_pending_batch(const PendingPulseBatch& batch) {
+  if (batch.count > 0) {
     bool produced = false;
-    g_machine.add_pulses(count, captured_ms, &produced);
-    if (saturated) {
-      g_machine.mark_counter_saturated(captured_ms, &produced);
+    g_machine.add_pulse_batch(batch.count, batch.first_captured_ms,
+                              batch.last_captured_ms, &produced);
+    if (batch.saturated) {
+      g_machine.mark_counter_saturated(batch.last_captured_ms, &produced);
     }
+    emit_new_results();
+  }
+}
+
+void drain_pulses() { apply_pending_batch(capture_pending_batch()); }
+
+void handle_request_linearized(const kegpulse::ParsedFrame& frame) {
+  const PendingPulseBatch batch = capture_pending_batch();
+  apply_pending_batch(batch);
+  handle_request(frame, batch.boundary_ms);
+}
+
+void tick_linearized() {
+  const PendingPulseBatch batch = capture_pending_batch();
+  apply_pending_batch(batch);
+  bool produced = false;
+  g_machine.tick(batch.boundary_ms, &produced);
+  if (produced) {
     emit_new_results();
   }
 }
@@ -493,7 +544,7 @@ void loop() {
     kegpulse::ParseError error = kegpulse::ParseError::NONE;
     if (g_parser.push(static_cast<char>(Serial.read()), &frame, &error)) {
       if (error == kegpulse::ParseError::NONE) {
-        handle_request(frame);
+        handle_request_linearized(frame);
       } else {
         const char* code = error == kegpulse::ParseError::BAD_CRC
                                ? "BAD_CRC"
@@ -506,11 +557,7 @@ void loop() {
       }
     }
   }
-  bool produced = false;
-  g_machine.tick(millis(), &produced);
-  if (produced) {
-    emit_new_results();
-  }
+  tick_linearized();
 }
 
 #endif  // ARDUINO

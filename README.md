@@ -97,15 +97,15 @@ Build and upload only after checking the exact Nano-compatible board/bootloader,
 output type, polarity, pull-up, and D2 wiring:
 
 ```powershell
-.\.venv\Scripts\platformio.exe run -d firmware -e nanoatmega328
-.\.venv\Scripts\platformio.exe run -d firmware -e nanoatmega328 -t upload --upload-port COM5
+.\.pio-venv\Scripts\platformio.exe run -d firmware -e nanoatmega328
+.\.pio-venv\Scripts\platformio.exe run -d firmware -e nanoatmega328 -t upload --upload-port COM5
 .\scripts\run-windows.ps1 -SerialPort COM5
 ```
 
 Linux uses the same source:
 
 ```bash
-.venv/bin/platformio run -d firmware -e nanoatmega328 -t upload --upload-port /dev/ttyACM0
+.pio-venv/bin/platformio run -d firmware -e nanoatmega328 -t upload --upload-port /dev/ttyACM0
 ./scripts/run-linux.sh --serial-port /dev/ttyACM0
 ```
 
@@ -145,7 +145,10 @@ backup is retained, and a failed replacement restores the prior live database.
 
 ## Test and package
 
-Developer setup installs test/firmware/package tools:
+Developer setup creates a host `.venv` for test/package tools and a separate `.pio-venv` for
+PlatformIO. Keeping the firmware toolchain isolated prevents its web-dashboard dependencies from
+constraining the patched host-service dependency set. PlatformIO telemetry is disabled by the
+scripts and CI:
 
 ```powershell
 .\scripts\setup-windows.ps1 -Dev

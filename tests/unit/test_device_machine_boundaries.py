@@ -273,6 +273,7 @@ def test_tick_before_boundaries_is_non_mutating_and_status_can_advance_time() ->
     assert armed.event_seq == 1
     assert armed.session_id == "status-session"
     assert armed.attributed is True
+    assert armed.arm_remaining_ms == 1
 
     terminal = device.status(110)
     assert terminal.state == DeviceState.TIMED_OUT
@@ -280,6 +281,20 @@ def test_tick_before_boundaries_is_non_mutating_and_status_can_advance_time() ->
     assert terminal.session_id == "status-session"
     assert terminal.session_pulses == 0
     assert terminal.uptime_ms == 110
+    assert terminal.arm_remaining_ms == 0
+
+
+def test_arm_remaining_is_authoritative_and_zero_outside_armed() -> None:
+    device = machine()
+    assert device.status(0).arm_remaining_ms == 0
+
+    device.arm("countdown-session", 1, 10, ttl_ms=100)
+    assert device.status().arm_remaining_ms == 100
+    assert device.status(109).arm_remaining_ms == 1
+
+    device.pulse(1, 109)
+    assert device.status().state == DeviceState.POURING
+    assert device.status().arm_remaining_ms == 0
 
 
 def test_finalize_without_active_event_fails_closed() -> None:

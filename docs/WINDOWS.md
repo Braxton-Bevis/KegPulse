@@ -20,7 +20,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -Dev
 ```
 
 The script creates `.venv`, installs hash-locked dependencies, and installs KegPulse editable
-without writing user data into the repository.
+without writing user data into the repository. Developer setup also creates an isolated
+`.pio-venv` from `requirements-firmware.lock`; PlatformIO is never installed into the host
+environment because its optional web dependencies conflict with the patched host web stack.
 
 ## Demo and hardware mode
 
@@ -34,8 +36,9 @@ without writing user data into the repository.
 # Hardware auto-discovery
 .\scripts\run-windows.ps1
 
-# Explicit port, useful after confirming the KegPulse identity
+# Explicit serial port and HTTP port
 .\scripts\run-windows.ps1 -SerialPort COM5
+.\scripts\run-windows.ps1 -Port 8877
 
 # Fullscreen kiosk preference
 .\scripts\run-windows.ps1 -Kiosk
@@ -44,7 +47,9 @@ without writing user data into the repository.
 The terminal always prints the URL, normally `http://127.0.0.1:8765`. If no supported browser
 can be launched, the service stays running and prints the URL. If that port belongs to another
 service, KegPulse exits with a clear conflict instead of attaching to it. A second launch that
-finds a healthy KegPulse instance exits without opening a duplicate tab.
+finds a healthy KegPulse instance exits without opening a duplicate tab. Omitting `-Port` leaves
+the saved `config.json` port in control; the wrapper only supplies `--port` when `-Port` was
+explicitly bound. Bind addresses are IPv4-only; IPv6 forms are rejected as configuration errors.
 
 Data defaults to the per-user `platformdirs` location (normally under local AppData). Override
 it for diagnostics or removable test profiles:
@@ -53,9 +58,11 @@ it for diagnostics or removable test profiles:
 .\scripts\run-windows.ps1 -Demo -DataDir 'D:\KegPulse data'
 ```
 
-The directory contains `kegpulse.db`, `config.json` when saved, `logs\`, `backups\`, and
-`exports\`. Back it up as sensitive personal data. Stop with Ctrl+C; the host stops its serial
-thread, checkpoints SQLite, and closes resources.
+The directory contains `kegpulse.db`, `.kegpulse.lock`, `config.json` when saved, `logs\`,
+`backups\`, and `exports\`. The kernel-held lock permits only one process per data directory,
+including restore operations; a leftover lock file after a crash is harmless. Back the directory
+up as sensitive personal data. Stop with Ctrl+C; the host stops its serial thread, checkpoints
+SQLite, and closes resources.
 
 ## Tests, firmware, and package
 
@@ -69,7 +76,8 @@ Install Playwright Chromium once after developer setup:
 Connect the Nano and upload only after confirming the board/bootloader and port:
 
 ```powershell
-.\.venv\Scripts\platformio.exe run -d firmware -e nanoatmega328 -t upload --upload-port COM5
+$env:PLATFORMIO_SETTING_ENABLE_TELEMETRY = 'no'
+.\.pio-venv\Scripts\platformio.exe run -d firmware -e nanoatmega328 -t upload --upload-port COM5
 ```
 
 Build the target-native one-folder release and run its automated demo smoke test:
@@ -78,8 +86,10 @@ Build the target-native one-folder release and run its automated demo smoke test
 .\scripts\package-windows.ps1
 ```
 
-The zip and SHA-256 manifest are written under `artifacts\`. The smoke test uses a temporary
-external data directory and verifies that the frozen bundle is unchanged.
+The script refuses non-AMD64 or 32-bit Python builds. The zip and SHA-256 manifest are written
+under `artifacts\`. The smoke test uses a temporary external data directory containing Unicode
+and spaces, verifies same-root second-instance and occupied-port rejection, and confirms that the
+frozen bundle is unchanged.
 
 ## Backup and restore
 

@@ -1,7 +1,8 @@
 # KegPulse data model
 
-KegPulse v1 uses one SQLite database with schema version `1`. The authoritative schema is
-[`001_initial.sql`](../src/kegpulse/migrations/001_initial.sql); migration and connection behavior
+KegPulse v1 uses one SQLite database with current schema version `2`. The authoritative migrations
+are [`001_initial.sql`](../src/kegpulse/migrations/001_initial.sql) and
+[`002_initial.sql`](../src/kegpulse/migrations/002_initial.sql); migration and connection behavior
 are implemented in [`database.py`](../src/kegpulse/persistence/database.py), and application data
 rules are implemented in [`repository.py`](../src/kegpulse/persistence/repository.py).
 
@@ -43,6 +44,8 @@ calibrations ----< calibration_samples
       +----------< pour_events
 
 kegs ------------< inventory_adjustments
+
+device/boot ----- device_recovery_checkpoints ---- pour_events
 ```
 
 Lines represent logical foreign-key relationships. Several references are nullable so KegPulse can
@@ -65,7 +68,10 @@ and new participant columns in `attribution_audit`.
 Keg versions. `id` is the primary key. Each row stores a 1-to-120-character label, exact
 `starting_volume_ml`, `opened_at`, optional `closed_at`, and notes up to 1,000 characters. The
 partial unique index `one_open_keg` permits at most one row whose `closed_at` is null. Replacing a
-keg closes the current row and inserts a new one in one transaction.
+keg closes the current row and inserts a new one in one transaction. The API accepts an optional
+timezone-aware `installed_at`, canonicalizes it to UTC in `opened_at`, and defaults it to the current
+time. A replacement cannot precede the open keg's installation, and the prior keg's `closed_at`
+equals the replacement's `opened_at`.
 
 Referenced optionally by provisional sessions, pours, and verification checks, and mandatorily by
 inventory adjustments.
@@ -85,10 +91,13 @@ cannot be edited through the repository.
 
 The raw evidence for a calibration. `id` is the primary key and `calibration_id` is required. Each
 row contains an ordinal from 1 through 10, positive `raw_pulses`, mass, density, derived volume,
-included and suspected-outlier flags, and capture time. `(calibration_id, ordinal)` is unique.
+included and suspected-outlier flags, capture time, and optional supersession time. A partial unique
+index permits one current row (`superseded_at IS NULL`) per `(calibration_id, ordinal)`.
 
-While a calibration is a draft, writing an existing ordinal replaces that ordinal's measurements.
-Outlier status is computed but never silently changes the `included` flag.
+While a calibration is a draft, recapturing an ordinal marks the prior row superseded and inserts a
+new current row. The immutable prior row remains addressable by an already-consumed session, so a
+retry returns the original measurements after a legitimate recapture. Calibration detail and
+analysis use current rows only. Outlier status never silently changes the `included` flag.
 
 ### `verification_checks`
 
@@ -108,6 +117,9 @@ After device binding, the row records device ID, boot ID, event sequence, and th
 pulse total. `(device_id, boot_id, event_seq)` is unique when those values are non-null.
 `captured_raw_pulses` stores completed calibration/verification capture evidence. `status` and
 created/updated timestamps describe workflow progress.
+`consumed_entity_id` records the exact calibration sample or verification check produced when a
+completed capture is consumed. The entity insert, pointer, and `consumed` status commit in one
+transaction, so a retried commit returns the original durable row without replacing measurements.
 
 Unlike `purpose`, the `status` column has no database CHECK constraint. The current application uses
 values including `arming`, `armed`, `pouring`, `settling`, `finalizing`, `complete`, `timed_out`,
@@ -143,6 +155,20 @@ so replayed device results can be recognized. The coordinator commits this ledge
 pour or workflow update in one SQLite transaction before sending the device `ACK`. Duplicate serial
 results return the prior outcome instead of inserting another pour.
 
+An attributed result is accepted only when its session row is already durably bound to the exact
+device ID, boot ID, and event sequence carried by the result. A mismatched or unknown attributed
+session rolls back without writing either the result ledger or a pour, leaving a later valid replay
+able to commit normally.
+
+### `device_recovery_checkpoints`
+
+One row per `(device_id, boot_id)` checkpoints the firmware's cumulative recovery-pulse counter as
+an unsigned decimal string and links the most recently materialized pour. A strictly increasing
+counter is converted atomically into one unattributed `estimated_recovered` pour containing only
+the delta, using a deterministic session UUID derived from device, boot, old count, and new count.
+The checkpoint advances in the same transaction. An equal counter returns the prior outcome without
+another inventory effect; a same-boot decrease is rejected rather than interpreted as a wrap.
+
 ### `inventory_adjustments`
 
 Auditable signed changes to a keg. `id` is the primary key; `keg_id` is required. `amount_ml` is an
@@ -169,8 +195,9 @@ operation.
 
 A key/value store with `key` as primary key, JSON text, and update time. Repository writes limit keys
 to 80 characters and encoded values to 16,384 characters and reject non-finite JSON numbers. Current
-uses include display units, completion delay, verification warning percentage, serial-port
-preference, and `admin_pin_verifier`. The PIN verifier is salted scrypt material, not plaintext.
+uses include display units, completion delay, verification warning percentage, arm timeout,
+serial-port preference, and `admin_pin_verifier`. The PIN verifier is salted scrypt material, not
+plaintext.
 
 There is no foreign key or schema-level allowlist for setting names; API settings expose and modify
 only the explicitly selected public keys.
@@ -180,14 +207,17 @@ only the explicitly selected public keys.
 A bounded local diagnostic trail with an autoincrement integer primary key, creation time, level,
 code, and JSON context. Repository insertion truncates level to 16 characters, code to 80, and
 encoded context to 2,000 characters, then deletes all but the newest 500 rows. This retention bound
-is applied when diagnostics are inserted.
+is applied when diagnostics are inserted. Repository/API listing is newest-first and independently
+bounded to at most 500 rows; JSON context is decoded into an object before it is returned.
 
 ## Indexes and uniqueness
 
-In addition to primary-key and unique-constraint indexes, schema v1 defines:
+In addition to primary-key and unique-constraint indexes, the current schema defines:
 
 - `one_open_keg`, a partial unique index for the single open keg;
 - `one_active_calibration`, a partial unique index for the single active calibration;
+- `one_current_calibration_sample`, a partial unique index for one current sample per ordinal;
+- `calibration_sample_history` for ordered sample revisions;
 - `diagnostics_created` on diagnostic time descending;
 - `pours_ended` on pour end time descending;
 - `pours_participant` on participant and pour end time descending.
@@ -199,19 +229,24 @@ primary key.
 ## Transaction and finalization rules
 
 KegPulse uses one SQLite connection guarded by a reentrant lock. Reads and writes are serialized at
-the repository boundary. Writes use `BEGIN IMMEDIATE`, commit on success, and roll back on an
-exception. The connection enables foreign keys, WAL journaling, `synchronous=FULL`, a 5-second
+the repository boundary. Writes use `BEGIN IMMEDIATE`, commit on success, and roll back on either a
+body or commit exception. The connection enables foreign keys, WAL journaling,
+`synchronous=FULL`, a 5-second
 SQLite connection timeout, and `busy_timeout=5000`.
 
 Finalizing a device result performs these decisions in one transaction:
 
 1. Look up its composite device identity; if present, return the existing result.
-2. For a calibration or verification capture, write the result ledger and update the provisional
+2. For attributed results, require an exact match to the provisional session's durable device,
+   boot, and event-sequence binding.
+3. For a calibration or verification capture, write the result ledger and update the provisional
    row with captured pulses, without creating a pour or changing inventory.
-3. For a zero-pulse timeout, write the result ledger and mark the provisional session timed out,
+4. For a zero-pulse timeout, write the result ledger and mark the provisional session timed out,
    without creating a pour.
-4. Otherwise resolve the provisional or current keg and calibration, compute volume once when a
-   factor exists, insert the pour and result ledger, and mark a linked provisional session complete.
+5. Otherwise use the keg and calibration captured when the frame was admitted (or the binding on a
+   linked provisional session), compute volume once when a factor exists, insert the pour and result
+   ledger, and mark a linked provisional session complete. The direct repository fallback to the
+   current context exists only for legacy callers that do not supply captured context.
 
 The coordinator acknowledges the firmware only after this transaction returns successfully. If the
 ACK fails, firmware replay is safe because the composite key recognizes the already committed
@@ -220,10 +255,20 @@ result.
 ## Migration policy
 
 SQLite `PRAGMA user_version` is the schema version and `PRAGMA application_id` is `0x4B50554C`.
-`CURRENT_SCHEMA` is currently `1`. A fresh version-zero database applies packaged migration
-`001_initial.sql` inside an explicit immediate transaction and sets `user_version=1`. Opening a
-database newer than the running code fails rather than attempting a downgrade. There is currently
-one committed schema and therefore no older committed KegPulse fixture beyond an empty database.
+`CURRENT_SCHEMA` is currently `2`. A fresh version-zero database applies packaged migrations 001
+and 002 in separate explicit immediate transactions. Migration 002 adds durable capture-consumption
+links, immutable calibration sample revisions, and recovery-counter checkpoints. Opening a database
+newer than the running code fails rather than attempting a downgrade. Automated fixture coverage
+opens released schema-v1 databases with existing data, validates them, and upgrades them to v2
+without losing prior rows. For already-consumed v1 captures, migration 002 backfills an entity link
+only for a one-to-one match: calibration ID, ordinal, raw pulses, and capture time for samples; or
+calibration ID, keg ID, raw pulses, and creation time for verification checks. The entity timestamp
+must fall inside a consumed provisional session's lifetime. For a v1 crash between the entity insert
+and status update, any still-complete session beside a plausible later entity is marked consumed with
+a null link. Even a one-to-one match fails closed because v1 also allowed direct sample/check entry,
+so fields and timestamps cannot prove provenance. This avoids either claiming unrelated evidence or
+writing another durable entity. A complete session with no plausible entity remains complete and can
+be consumed normally.
 
 Future changes must be additive numbered migrations, must retain raw/history evidence, and must be
 tested both from a fresh database and from every prior committed schema. Existing migrations must
@@ -240,7 +285,8 @@ manifest.
 
 `Database.validate_backup()` requires a regular file of at least 100 bytes, opens it read-only, and
 checks its KegPulse application ID, supported schema range, SQLite integrity result, foreign keys,
-and the complete required-table set. It does not validate every table's column definition.
+and the required-table set for that version. For v2 it also verifies the two migration-critical
+columns. It does not validate every table's complete column definition.
 
 Command-line restore is performed before the HTTP service starts. The source is capped at 256 MiB.
 Symlink sources and the live database itself are rejected. If a live database exists, a unique
@@ -261,10 +307,11 @@ current-log files to `0600`. Windows uses the current user's inherited filesyste
 
 ## Export and retention
 
-The export API returns the newest 500 pours as JSON or CSV, including participant and keg labels
-from left joins. Raw pulses, original calibration/keg IDs, quality, timestamps, and computed volume
-remain in each row. CSV string cells with spreadsheet-control prefixes are neutralized with a
-leading apostrophe; JSON preserves the original strings.
+The export API streams every pour as JSON or CSV from stable, bounded newest-first database pages,
+including participant and keg labels from left joins. Raw pulses, original calibration/keg IDs,
+quality, timestamps, and computed volume remain in each row. CSV string cells with
+spreadsheet-control prefixes are neutralized with a leading apostrophe; JSON preserves the original
+strings. The interactive history endpoint remains independently capped at 500 rows.
 
 KegPulse v1 has no automatic deletion or age-based retention for participants, kegs, calibrations,
 samples, verifications, sessions, pours, results, adjustments, audits, or settings. Only diagnostic

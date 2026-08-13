@@ -1,10 +1,14 @@
 .venv/
+.pio-venv/
 .pytest_cache/
 .pytest-tmp/
+.pytest-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
 coverage.xml
+coverage.json
+coverage-current.json
 htmlcov/
 artifacts/
 !artifacts/

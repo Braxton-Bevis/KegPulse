@@ -7,6 +7,8 @@ $Python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $PyInstaller = Join-Path $RepoRoot '.venv\Scripts\pyinstaller.exe'
 $Artifacts = Join-Path $RepoRoot 'artifacts'
 $Dist = Join-Path $RepoRoot 'dist'
+& $Python -c "import platform, struct, sys; machine = platform.machine().lower(); sys.exit(0 if struct.calcsize('P') == 8 and machine in {'amd64', 'x86_64'} else 1)"
+if ($LASTEXITCODE -ne 0) { throw 'Windows packages must be built with 64-bit x86_64/AMD64 CPython.' }
 New-Item -ItemType Directory -Force -Path $Artifacts | Out-Null
 & $PyInstaller --noconfirm --clean --distpath $Dist --workpath (Join-Path $RepoRoot 'build\pyinstaller') (Join-Path $RepoRoot 'packaging\KegPulse.spec')
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }

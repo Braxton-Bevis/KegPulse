@@ -12,14 +12,16 @@ the unprivileged kiosk user:
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-venv chromium curl
+sudo apt install python3 python3-venv chromium
 git clone <your-kegpulse-repository-url> ~/KegPulse
 cd ~/KegPulse
 ./scripts/install-raspberry-pi.sh
 ```
 
 The script creates the local `.venv` and durable
-`~/.local/share/KegPulse/backups` directory. It does not use sudo or alter serial permissions.
+`~/.local/share/KegPulse/backups` directory. It rejects unknown/conflicting arguments, does not use
+sudo, does not alter serial permissions, and refuses non-`aarch64` machines rather than implying
+that this Pi deployment was tested on another architecture.
 
 Test interactively first:
 
@@ -47,7 +49,8 @@ sudo usermod -aG dialout "$USER"
 ```
 
 Do not run KegPulse as root, add global read/write rules, or assume every USB bridge uses the
-same path. Handshake discovery handles `/dev` path changes when no explicit port is pinned.
+same path. Both read and write access are required. Handshake discovery handles `/dev` path
+changes when no explicit port is pinned.
 
 ## Reversible user autostart
 
@@ -55,12 +58,16 @@ After interactive validation:
 
 ```bash
 cd ~/KegPulse
-./scripts/install-raspberry-pi.sh --install-service
+./scripts/install-raspberry-pi.sh --install-service --port 8765
 systemctl --user enable --now kegpulse-kiosk.service
 ```
 
-`kegpulse.service` starts the host; `kegpulse-kiosk.service` waits for health and launches local
-Chromium. To let user services start without an interactive login, an administrator may choose:
+The installer renders both user units with safely quoted checkout/data paths, including spaces,
+Unicode, `%`, `$`, and shell metacharacters. The selected port is shared by the host and kiosk.
+`kegpulse.service` starts the host; `kegpulse-kiosk.service` requires a bounded JSON health
+response identifying KegPulse before it launches Chromium. No shell command interprets the
+rendered paths. To let user services start without an interactive login, an administrator may
+choose:
 
 ```bash
 sudo loginctl enable-linger "$USER"
@@ -73,7 +80,9 @@ services while preserving all data:
 ./scripts/install-raspberry-pi.sh --remove-service
 ```
 
-Disable linger separately if it was enabled: `sudo loginctl disable-linger "$USER"`.
+Removal is available before setup and without dependency/network access, removes both rendered
+units, preserves data, and tolerates an unavailable user service manager. Disable linger
+separately if it was enabled: `sudo loginctl disable-linger "$USER"`.
 
 ## Display and kiosk behavior
 
@@ -82,7 +91,8 @@ Test the actual panel resolution (especially 800×480 or 1024×600), touch targe
 on-screen keyboard, rotation, blanking/power policy, and recovery after Chromium or Pi restart.
 KegPulse assumes no display battery and stores no authoritative state in the browser.
 
-The service binds to loopback, so a separate LAN is unnecessary for the attached display.
+The service binds to IPv4 loopback, so a separate LAN is unnecessary for the attached display.
+IPv6 bind forms are currently rejected rather than formatted or probed ambiguously.
 Trusted-LAN mode is optional and requires a configured PIN and exact allowlists; see
 [SECURITY.md](SECURITY.md). Keep loopback mode for the simplest and safest kiosk.
 

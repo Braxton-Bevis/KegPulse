@@ -1,0 +1,3 @@
+# Kept in an isolated virtual environment because PlatformIO's optional web UI
+# currently constrains Starlette below KegPulse's security-patched host version.
+platformio==6.1.19

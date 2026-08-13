@@ -252,6 +252,18 @@ def test_calibration_capture_does_not_change_inventory(client: TestClient) -> No
     )
     assert sample.status_code == 200, sample.text
     assert sample.json()["raw_pulses"] == 500
+    retried = client.post(
+        f"/api/v1/calibrations/{calibration['id']}/capture/commit",
+        headers=csrf,
+        json={
+            "session_id": capture["session_id"],
+            "mass_g": "999",
+            "density_g_per_ml": "1.2",
+            "included": False,
+        },
+    )
+    assert retried.status_code == 200
+    assert retried.json() == sample.json()
     assert client.get("/api/v1/history").json() == []
     snapshot = client.get("/api/v1/status").json()
     assert snapshot["keg"]["id"] == keg["id"]

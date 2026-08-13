@@ -4,9 +4,9 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/KegPulse
-Environment=KEGPULSE_DATA_DIR=%h/.local/share/KegPulse
-ExecStart=%h/KegPulse/.venv/bin/python -m kegpulse --no-browser
+WorkingDirectory=@REPO_ROOT@
+Environment=@DATA_ENV@
+ExecStart=@PYTHON@ -m kegpulse --no-browser --port @PORT@
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
@@ -14,4 +14,3 @@ UMask=0077
 
 [Install]
 WantedBy=default.target
-

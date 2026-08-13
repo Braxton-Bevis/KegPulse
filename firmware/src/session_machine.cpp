@@ -207,6 +207,32 @@ MachineError SessionMachine::add_pulses(uint32_t count, uint32_t captured_ms,
   return MachineError::NONE;
 }
 
+MachineError SessionMachine::add_pulse_batch(uint32_t count,
+                                             uint32_t first_captured_ms,
+                                             uint32_t last_captured_ms,
+                                             bool* produced_result) {
+  *produced_result = false;
+  if (count == 0) {
+    return MachineError::RANGE;
+  }
+
+  // The first edge decides an arm/settle deadline. The bounded second call
+  // applies the rest of the ISR batch at the last captured timestamp without
+  // moving an edge that arrived at/before the deadline into a newer event.
+  bool first_produced = false;
+  const MachineError first = add_pulses(1, first_captured_ms, &first_produced);
+  *produced_result = first_produced;
+  if (count == 1) {
+    return first;
+  }
+
+  bool remainder_produced = false;
+  const MachineError remainder =
+      add_pulses(count - 1U, last_captured_ms, &remainder_produced);
+  *produced_result = *produced_result || remainder_produced;
+  return first != MachineError::NONE ? first : remainder;
+}
+
 MachineError SessionMachine::tick(uint32_t now_ms, bool* produced_result) {
   *produced_result = false;
   if (!active_present_) {
@@ -296,10 +322,14 @@ MachineError SessionMachine::acknowledge(uint32_t sequence, bool* already) {
   return MachineError::NONE;
 }
 
-Snapshot SessionMachine::snapshot() const {
+Snapshot SessionMachine::snapshot(uint32_t now_ms) const {
   Snapshot output{};
   output.state = state_;
   output.lifetime_pulses = lifetime_pulses_;
+  if (active_present_ && active_.state == DeviceState::ARMED &&
+      !due(now_ms, active_.arm_deadline_ms)) {
+    output.arm_remaining_ms = active_.arm_deadline_ms - now_ms;
+  }
   output.next_sequence = next_sequence_;
   output.retained_results = result_count_;
   output.recovery_pulses = recovery_pulses_;

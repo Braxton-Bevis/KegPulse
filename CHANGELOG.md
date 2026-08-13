@@ -16,6 +16,23 @@
   deployment, target-native PyInstaller configurations, package smoke tests, and CI workflows.
 - Added Python unit/integration/browser suites, shared protocol vectors, native firmware tests,
   Nano compilation, traceability documentation, and manual hardware commissioning checks.
+- Hardened final-review boundaries: durable firmware overflow-counter consumption, pre-command ARM
+  binding, retry-safe calibration/verification commits, captured boot identity, aggregate body
+  deadlines, live WebSocket authorization revocation, patched web dependencies, network-first PWA
+  updates, complete paged exports, per-data-root process locks, and target-architecture guards.
+- Added authoritative arming countdown and timeout/uncertainty screens, inline pour reassignment,
+  measurement details, editable install time and serial settings, diagnostics, focus preservation,
+  and dark-theme contrast regressions.
+- Added the additive schema-v2 upgrade with a released-v1 data fixture, immutable calibration sample
+  revisions, commit-failure rollback recovery, and identity-bound device acknowledgements.
+- Preserved admission-time keg/calibration context across delayed results and ordered recovery
+  counter retries, including context changes during transient database failures.
+- Backfilled unambiguous already-consumed schema-v1 capture receipts and made every unverifiable
+  pre-v2 crash candidate fail closed without claiming unrelated evidence or creating duplicates.
+- Made host outages visibly invalidate stale kiosk state, recovered expired security context,
+  preserved failed-form input, exposed unattributed device flow, and completed calibration evidence.
+- Synchronized PIN lock/unlock controls without discarding unrelated form edits and made active or
+  superseded calibration evidence explicitly read-only.
 
 Hardware-dependent characteristics—sensor electrical behavior, plumbing/food-contact suitability,
 physical pulse accuracy, Windows COM and Raspberry Pi deployment—remain explicitly unverified

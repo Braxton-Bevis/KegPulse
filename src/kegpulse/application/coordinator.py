@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -13,7 +14,12 @@ from kegpulse.domain.errors import ConflictError
 from kegpulse.domain.models import DeviceResult, DeviceState
 from kegpulse.domain.reconciliation import ReconciliationAction, reconcile_provisional
 from kegpulse.persistence.repository import Repository
-from kegpulse.serialio.manager import ConnectionState, DeviceManager, ManagerEvent
+from kegpulse.serialio.manager import (
+    ConnectionState,
+    DeviceCommandError,
+    DeviceManager,
+    ManagerEvent,
+)
 from kegpulse.serialio.simulator import SimulatorTransport
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +46,7 @@ class KegPulseCoordinator:
         self._stop = asyncio.Event()
         self._event_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._event_retries: deque[tuple[float, int, ManagerEvent]] = deque()
 
     def _diagnostic(self, level: str, code: str, context: dict[str, Any]) -> None:
         """Diagnostics are best effort and must never stop measurement replay."""
@@ -62,53 +69,352 @@ class KegPulseCoordinator:
 
     async def _event_loop(self) -> None:
         while not self._stop.is_set():
-            events = self.manager.drain_events()
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            events: list[tuple[ManagerEvent, int]] = []
+            pending_retries: deque[tuple[float, int, ManagerEvent]] = deque()
+            while self._event_retries:
+                deadline, attempt, event = self._event_retries.popleft()
+                if deadline <= now:
+                    events.append((event, attempt))
+                else:
+                    pending_retries.append((deadline, attempt, event))
+            self._event_retries = pending_retries
+            events.extend((event, 0) for event in self.manager.drain_events())
             if events:
                 async with self._lock:
-                    for event in events:
-                        await self._process_event(event)
+                    for event, attempt in events:
+                        if self._defer_behind_pending_measurement(event, attempt):
+                            continue
+                        try:
+                            await self._process_event(event)
+                        except Exception as exc:
+                            LOGGER.exception("coordinator event could not be processed")
+                            self._diagnostic(
+                                "error",
+                                "coordinator_event_failed",
+                                {
+                                    "kind": event.kind[:40],
+                                    "type": type(exc).__name__,
+                                    "attempt": attempt + 1,
+                                },
+                            )
+                            self._schedule_event_retry(event, attempt + 1)
                     self._revision += 1
-                    await self._broadcast_unlocked()
+                    try:
+                        await self._broadcast_unlocked()
+                    except Exception as exc:
+                        # A database read or serialization failure must not terminate
+                        # retained-result processing. A later event/poll gets a fresh snapshot.
+                        LOGGER.exception("coordinator snapshot broadcast failed")
+                        self._diagnostic(
+                            "error", "snapshot_broadcast_failed", {"type": type(exc).__name__}
+                        )
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=0.05)
+
+    def _schedule_event_retry(self, event: ManagerEvent, attempt: int) -> None:
+        measurement_event = event.kind in {"result", "counters"}
+        if attempt > 12 and not measurement_event:
+            self._diagnostic(
+                "error",
+                "coordinator_event_abandoned",
+                {"kind": event.kind[:40], "attempts": attempt},
+            )
+            return
+        if event.kind == "counters":
+            self._schedule_counter_retry(event, attempt)
+            return
+
+        identity = self._retry_identity(event)
+        for index, (_, queued_attempt, queued_event) in enumerate(self._event_retries):
+            if self._retry_identity(queued_event) == identity:
+                queued_deadline, _, _ = self._event_retries[index]
+                deadline = (
+                    queued_deadline
+                    if event.kind == "result"
+                    else asyncio.get_running_loop().time() + self._retry_delay(attempt)
+                )
+                self._event_retries[index] = (
+                    deadline,
+                    max(attempt, queued_attempt),
+                    # A retained RESULT replay can be observed after the operator
+                    # changes keg or calibration. Its first captured context owns
+                    # the measurement; a later identical replay must not relabel it.
+                    queued_event if event.kind == "result" else event,
+                )
+                return
+        if len(self._event_retries) >= 128:
+            replaceable = next(
+                (
+                    index
+                    for index, (_, _, queued_event) in enumerate(self._event_retries)
+                    if queued_event.kind not in {"result", "counters"}
+                ),
+                None,
+            )
+            if replaceable is None:
+                # This is an explicit, locally diagnosed loss boundary after 128
+                # distinct failing measurement identities. Firmware RESULT replay and
+                # cumulative COUNTERS normally coalesce long before reaching it.
+                self._diagnostic("error", "coordinator_retry_queue_full", {"kind": event.kind[:40]})
+                return
+            del self._event_retries[replaceable]
+        deadline = asyncio.get_running_loop().time() + self._retry_delay(attempt)
+        self._event_retries.append((deadline, attempt, event))
+
+    @staticmethod
+    def _retry_identity(event: ManagerEvent) -> tuple[str, str, str, str]:
+        semantic_id = (
+            event.frame.fields.get("seq", "")
+            if event.kind == "result" and event.frame is not None
+            else ""
+        )
+        return (event.kind, event.device_id, event.boot_id, semantic_id)
+
+    @staticmethod
+    def _counter_stream(event: ManagerEvent) -> tuple[str, str] | None:
+        if event.kind != "counters":
+            return None
+        return event.device_id, event.boot_id
+
+    @staticmethod
+    def _counter_value(event: ManagerEvent) -> int | None:
+        if event.kind != "counters" or event.frame is None:
+            return None
+        try:
+            return int(event.frame.fields["recovery"])
+        except (KeyError, ValueError):
+            return None
+
+    @staticmethod
+    def _measurement_context(event: ManagerEvent) -> tuple[bool, str | None, str | None]:
+        return event.context_captured, event.keg_id, event.calibration_id
+
+    def _defer_behind_pending_measurement(self, event: ManagerEvent, attempt: int) -> bool:
+        if event.kind == "result":
+            # A due retry is the earliest observation. Fresh periodic firmware
+            # replay of that same RESULT waits behind it and is folded into it.
+            if attempt == 0 and any(
+                queued.kind == "result"
+                and self._retry_identity(queued) == self._retry_identity(event)
+                for _, _, queued in self._event_retries
+            ):
+                self._schedule_event_retry(event, attempt)
+                return True
+            return False
+        if event.kind != "counters":
+            return False
+
+        stream = self._counter_stream(event)
+        value = self._counter_value(event)
+        for _, _, queued in self._event_retries:
+            if self._counter_stream(queued) != stream:
+                continue
+            queued_value = self._counter_value(queued)
+            # Cumulative snapshots are semantic boundaries. A lower pending
+            # value must commit first; an equal fresh observation belongs to the
+            # already-queued (earlier) context. A due retry of that equal value
+            # remains eligible so it cannot deadlock behind its own replay.
+            if (
+                value is None
+                or queued_value is None
+                or queued_value < value
+                or (queued_value == value and attempt == 0)
+            ):
+                self._schedule_event_retry(event, attempt)
+                return True
+        return False
+
+    def _schedule_counter_retry(self, event: ManagerEvent, attempt: int) -> None:
+        """Queue cumulative counter boundaries in value/context order per boot."""
+        now = asyncio.get_running_loop().time()
+        candidate = (now + self._retry_delay(attempt), attempt, event)
+        stream = self._counter_stream(event)
+        original = list(self._event_retries)
+        unrelated: list[tuple[float, int, ManagerEvent]] = []
+        boundaries: list[tuple[float, int, ManagerEvent]] = []
+        for item in original:
+            if self._counter_stream(item[2]) == stream:
+                boundaries.append(item)
+            else:
+                unrelated.append(item)
+        boundaries.append(candidate)
+
+        # Python's stable sort preserves first-observation context for an equal
+        # cumulative snapshot. Invalid snapshots remain ordered after valid ones
+        # and will take the normal diagnosed retry path.
+        boundaries.sort(
+            key=lambda item: (
+                self._counter_value(item[2]) is None,
+                self._counter_value(item[2]) or 0,
+            )
+        )
+        normalized: list[tuple[float, int, ManagerEvent]] = []
+        for deadline, queued_attempt, queued_event in boundaries:
+            value = self._counter_value(queued_event)
+            if normalized:
+                prior_deadline, prior_attempt, prior_event = normalized[-1]
+                prior_value = self._counter_value(prior_event)
+                if value is not None and value == prior_value:
+                    normalized[-1] = (
+                        prior_deadline,
+                        max(prior_attempt, queued_attempt),
+                        prior_event,
+                    )
+                    continue
+                if (
+                    value is not None
+                    and prior_value is not None
+                    and self._measurement_context(queued_event)
+                    == self._measurement_context(prior_event)
+                ):
+                    # No context boundary exists between these cumulative values,
+                    # so the higher snapshot safely subsumes the lower one while
+                    # retaining the lower retry's backoff/priority.
+                    normalized[-1] = (
+                        prior_deadline,
+                        max(prior_attempt, queued_attempt),
+                        queued_event,
+                    )
+                    continue
+                deadline = max(deadline, prior_deadline)
+            normalized.append((deadline, queued_attempt, queued_event))
+
+        combined = unrelated + normalized
+        if len(combined) > 128:
+            replaceable = next(
+                (
+                    index
+                    for index, (_, _, queued_event) in enumerate(unrelated)
+                    if queued_event.kind not in {"result", "counters"}
+                ),
+                None,
+            )
+            if replaceable is None:
+                self._diagnostic("error", "coordinator_retry_queue_full", {"kind": "counters"})
+                return
+            del unrelated[replaceable]
+            combined = unrelated + normalized
+        self._event_retries = deque(combined)
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        # Cap the exponent as well as the resulting delay so measurement retries
+        # remain safe during an arbitrarily long storage outage.
+        multiplier = 1 << min(max(attempt - 1, 0), 6)
+        return min(0.1 * multiplier, 5.0)
 
     async def _process_event(self, event: ManagerEvent) -> None:
         if event.kind == "result" and event.frame:
             try:
                 result = self._device_result(event.frame.fields)
-                identity = self.manager.identity
-                if identity and (
-                    result.device_id != identity.get("device")
-                    or result.boot_id != identity.get("boot")
-                ):
-                    raise ValueError("device result identity does not match the active handshake")
-                self.repository.finalize_device_result(result)
+                captured_device = event.device_id or result.device_id
+                captured_boot = event.boot_id or result.boot_id
+                if result.device_id != captured_device or result.boot_id != captured_boot:
+                    raise ValueError("device result identity does not match its captured handshake")
+                self.repository.finalize_device_result(
+                    result,
+                    keg_id=event.keg_id,
+                    calibration_id=event.calibration_id,
+                    context_captured=event.context_captured,
+                )
             except Exception as exc:
                 LOGGER.exception("device result could not be committed")
                 self._diagnostic("error", "result_commit_failed", {"type": type(exc).__name__})
+                # The captured event may belong to a device/boot that is already
+                # gone and therefore cannot be replayed by current firmware.
+                # Propagate to the bounded, identity-coalescing retry queue.
+                raise
+            current_identity = self.manager.identity
+            if (
+                current_identity.get("device") != result.device_id
+                or current_identity.get("boot") != result.boot_id
+            ):
+                # The fact is durable, but ACK is a mutation on the currently
+                # attached controller. Wait for replay from the captured device
+                # instead of risking a coincident boot/sequence on a replacement.
+                self._diagnostic(
+                    "warning",
+                    "ack_deferred_identity_changed",
+                    {
+                        "device": result.device_id,
+                        "boot": result.boot_id,
+                        "event_seq": result.event_seq,
+                    },
+                )
                 return
             try:
                 await asyncio.to_thread(
                     self.manager.request,
                     "ACK",
-                    {"boot": result.boot_id, "seq": result.event_seq},
+                    {
+                        "dev": result.device_id,
+                        "boot": result.boot_id,
+                        "seq": result.event_seq,
+                    },
                 )
             except Exception as exc:
                 # The retained result will replay; database uniqueness makes that safe.
                 LOGGER.warning("device result committed but ACK is pending: %s", type(exc).__name__)
                 self._diagnostic("warning", "ack_pending", {"event_seq": result.event_seq})
         elif event.kind == "status" and event.frame:
-            await self._mirror_session_state(event.frame.fields)
+            current_identity = self.manager.identity
+            if event.frame.fields.get("boot") == current_identity.get("boot"):
+                await self._mirror_session_state(event.frame.fields)
+        elif event.kind == "counters" and event.frame:
+            self._checkpoint_recovery_counter(event)
         elif event.kind == "protocol_error":
             self._diagnostic("warning", "protocol_error", {"code": event.detail})
         elif event.kind == "hello":
             self._remember_confirmed_hardware(event)
             await self._reconcile_after_connect()
 
+    def _checkpoint_recovery_counter(self, event: ManagerEvent) -> None:
+        if event.frame is None:
+            return
+        if (
+            DEVICE_ID.fullmatch(event.device_id) is None
+            or DEVICE_ID.fullmatch(event.boot_id) is None
+            or event.uptime_ms is None
+        ):
+            raise ValueError("recovery counter is missing its captured device identity")
+        try:
+            recovery_pulses = int(event.frame.fields["recovery"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("recovery counter is malformed") from exc
+        recovered, duplicate = self.repository.checkpoint_recovery_pulses(
+            device_id=event.device_id,
+            boot_id=event.boot_id,
+            recovery_pulses=recovery_pulses,
+            device_uptime_ms=event.uptime_ms,
+            keg_id=event.keg_id,
+            calibration_id=event.calibration_id,
+            context_captured=event.context_captured,
+        )
+        if recovered is not None and not duplicate:
+            self._diagnostic(
+                "warning",
+                "device_recovery_pulses_materialized",
+                {
+                    "pulses": recovered["raw_pulses"],
+                    "pour_id": recovered["id"],
+                    "boot": event.boot_id,
+                },
+            )
+
     def _remember_confirmed_hardware(self, event: ManagerEvent) -> None:
         if self.config.demo or event.frame is None or not event.detail:
             return
         device_id = event.frame.fields.get("device", "")
+        boot_id = event.frame.fields.get("boot", "")
+        if (event.device_id and event.device_id != device_id) or (
+            event.boot_id and event.boot_id != boot_id
+        ):
+            return
+        current = self.manager.identity
+        if current and (device_id != current.get("device") or boot_id != current.get("boot")):
+            return
         if not 1 <= len(device_id) <= 64 or len(event.detail) > 260:
             return
         confirmed = {"device_id": device_id, "serial_port": event.detail}
@@ -301,16 +607,6 @@ class KegPulseCoordinator:
             try:
                 status = await asyncio.to_thread(self.manager.request, "STATUS")
                 identity = self.manager.identity
-                response = await asyncio.to_thread(
-                    self.manager.request,
-                    "ARM",
-                    {
-                        "boot": status.fields["boot"],
-                        "seq": status.fields["next"],
-                        "sid": provisional["session_id"].replace("-", ""),
-                        "ttl": self.config.arm_timeout_ms,
-                    },
-                )
                 bound = self.repository.bind_provisional(
                     provisional["session_id"],
                     identity["device"],
@@ -321,11 +617,41 @@ class KegPulseCoordinator:
             except Exception:
                 self.repository.update_provisional_status(provisional["session_id"], "failed")
                 raise
+            try:
+                response = await asyncio.to_thread(
+                    self.manager.request,
+                    "ARM",
+                    {
+                        "boot": status.fields["boot"],
+                        "seq": status.fields["next"],
+                        "sid": provisional["session_id"].replace("-", ""),
+                        "ttl": self._arm_timeout_ms(),
+                    },
+                )
+            except DeviceCommandError:
+                # A protocol error response proves ARM was rejected. Other failures
+                # may mean ARM succeeded but its response was lost, so retain the
+                # durable binding for reconnect reconciliation and RESULT replay.
+                self.repository.update_provisional_status(provisional["session_id"], "failed")
+                raise
+            except Exception as exc:
+                self._diagnostic(
+                    "warning",
+                    "arm_acknowledgement_uncertain",
+                    {"session": provisional["session_id"][:8], "type": type(exc).__name__},
+                )
+                raise
             if response.operation != "ARM":
                 raise ConflictError("device did not acknowledge arming")
             self._revision += 1
             await self._broadcast_unlocked()
             return bound
+
+    def _arm_timeout_ms(self) -> int:
+        value = self.repository.get_setting("arm_timeout_ms", self.config.arm_timeout_ms)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1_000 <= value <= 120_000:
+            return self.config.arm_timeout_ms
+        return int(value)
 
     async def cancel(self) -> dict[str, Any]:
         async with self._lock:
@@ -366,6 +692,7 @@ class KegPulseCoordinator:
         inventory = self.repository.inventory()
         pours = self.repository.list_pours(limit=1)
         provisional = self.repository.active_provisional()
+        terminal_notice = self.repository.recent_terminal_provisional()
         calibration = self.repository.active_calibration()
         verifications = self.repository.list_verifications(limit=1)
         device_status = self.manager.status
@@ -391,6 +718,7 @@ class KegPulseCoordinator:
                 "counters": self.manager.counters,
             },
             "session": provisional,
+            "terminal_notice": terminal_notice,
             "pending_capture": self.repository.latest_pending_capture(),
             "live_volume_ml": live_volume,
             "participants": participants,
@@ -426,7 +754,10 @@ class KegPulseCoordinator:
                 "verification_warning_pct": self.repository.get_setting(
                     "verification_warning_pct", self.config.verification_warning_pct
                 ),
-                "arm_timeout_ms": self.config.arm_timeout_ms,
+                "arm_timeout_ms": self._arm_timeout_ms(),
+                "flow_gap_ms": self.config.flow_gap_ms,
+                "settling_ms": self.config.settling_ms,
+                "serial_port": self.repository.get_setting("serial_port", self.config.serial_port),
                 "lan_mode": self.config.lan_mode,
             },
         }

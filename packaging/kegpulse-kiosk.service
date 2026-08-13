@@ -5,10 +5,9 @@ Wants=kegpulse.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'until curl -fsS http://127.0.0.1:8765/api/v1/health >/dev/null; do sleep 1; done; exec chromium --kiosk --no-first-run --disable-session-crashed-bubble http://127.0.0.1:8765/'
+ExecStart=@PYTHON@ @WAIT_HELPER@ --health-url @HEALTH_URL@ --page-url @PAGE_URL@ --browser chromium
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target
-

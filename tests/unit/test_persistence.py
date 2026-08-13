@@ -120,11 +120,13 @@ def test_unattributed_interrupted_and_timeout_paths(repository: Repository) -> N
     )
     pour, _ = repository.finalize_device_result(unattributed)
     assert pour and pour["quality"] == "unattributed" and pour["volume_ml"] == "50"
+    timeout_session, _ = repository.create_provisional(None, "timeout-arm")
+    repository.bind_provisional(timeout_session["session_id"], "device", "boot", 2, 250)
     timeout = DeviceResult(
         device_id="device",
         boot_id="boot",
         event_seq=2,
-        session_id=uuid.uuid4().hex,
+        session_id=uuid.UUID(timeout_session["session_id"]).hex,
         attributed=True,
         status=DeviceState.TIMED_OUT,
         raw_pulses=0,

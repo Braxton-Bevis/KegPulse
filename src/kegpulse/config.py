@@ -26,6 +26,15 @@ class AppConfig(BaseModel):
     allowed_hosts: list[str] = Field(default_factory=list, max_length=16)
     allowed_origins: list[str] = Field(default_factory=list, max_length=16)
 
+    @field_validator("host")
+    @classmethod
+    def reject_ipv6_host(cls, value: str) -> str:
+        if ":" in value:
+            raise ValueError(
+                "IPv6 bind addresses are not supported; use 127.0.0.1 or an IPv4 LAN address"
+            )
+        return value
+
     @field_validator("display_units")
     @classmethod
     def valid_units(cls, value: str) -> str:

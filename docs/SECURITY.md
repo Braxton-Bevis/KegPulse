@@ -47,9 +47,10 @@ records; the security-context GET may create an in-memory session and set its co
 
 `Content-Type: application/json` is used by the client for mutations, and Pydantic rejects unknown
 model fields, non-finite numbers, and values outside each route's declared bounds. HTTP bodies are
-limited to 65,536 bytes using both declared `Content-Length` and streamed-byte accounting. There is
-no application-level body-read deadline or general HTTP request-rate limiter; the runner's
-keep-alive timeout is five seconds.
+limited to 65,536 bytes using both declared `Content-Length` and streamed-byte accounting. One
+absolute 15-second deadline covers the complete streamed request body, so many small chunks cannot
+reset the timer. There is no general HTTP request-rate limiter; the runner's keep-alive timeout is
+five seconds.
 
 ### Loopback authorization
 
@@ -131,7 +132,10 @@ administrator cookie. The socket is server-to-client only; any client data messa
 policy violation. The normal runner caps incoming WebSocket messages at 16 KiB. The app allows at
 most 16 subscribers, gives each a queue of two full snapshots, drops an older queued snapshot when
 necessary, and sends a current full snapshot after a 20-second quiet interval. These bounds prevent
-a slow browser from creating an unbounded event queue.
+a slow browser from creating an unbounded event queue. Admission is serialized so simultaneous
+connections cannot exceed the cap. In LAN mode the server revalidates the administrator session
+before every snapshot or heartbeat; logout, PIN change, idle expiry, or absolute expiry closes an
+already accepted socket.
 
 Responses include these browser-facing headers:
 
@@ -144,9 +148,11 @@ Responses include these browser-facing headers:
 - a Permissions Policy disabling camera, microphone, geolocation, and payment.
 
 API responses receive `Cache-Control: no-store`. The service worker caches only an exact list of
-same-origin shell resources under the versioned `kegpulse-shell-v1` cache. It bypasses every
-`/api/` request and every non-GET request, uses a cached `/` only as the offline navigation fallback,
-and deletes only obsolete caches whose names begin with `kegpulse-shell-`. Plain-HTTP LAN origins
+same-origin shell resources under the versioned `kegpulse-shell-v1-network-first` cache. It bypasses
+every `/api/` request and every non-GET request, uses a cached `/` only as the offline navigation
+fallback, and deletes only obsolete caches whose names begin with `kegpulse-shell-`. Shell requests
+are network-first, and install/activation immediately replaces an old worker so a cached shell
+cannot remain pinned to an incompatible API. Plain-HTTP LAN origins
 normally do not qualify as browser secure contexts, so service-worker/PWA behavior is only expected
 on localhost or an HTTPS deployment.
 
@@ -172,10 +178,10 @@ bounded to the latest 500 rows; context JSON is truncated to 2,000 characters.
 
 CSV export prefixes an apostrophe when a string begins with tab or carriage return, or when the
 first non-whitespace character is `=`, `+`, `-`, or `@`. This mitigates spreadsheet formula
-execution; CSV quoting alone would not. JSON export does not transform text. The API exports at most
-the 500 newest pours and includes joined participant and keg labels, so both formats are sensitive
-personal records. In LAN mode an administrator session is required. In loopback mode the local OS
-boundary is the only read-access control.
+execution; CSV quoting alone would not. JSON export does not transform text. The API streams the
+complete pour ledger in bounded database pages and includes joined participant and keg labels, so
+both formats are sensitive personal records. In LAN mode an administrator session is required. In
+loopback mode the local OS boundary is the only read-access control.
 
 ## Backups and restore
 
@@ -199,9 +205,11 @@ KegPulse first creates a unique timestamped online backup in the backup director
 the source to a unique private candidate, validates that copy, moves the prior database to a private
 rollback path, atomically installs the candidate, opens/checkpoints/revalidates it, and exits.
 
-If installation or reopen validation fails, the failed candidate is preserved in `backups/` for
-diagnosis and the prior database is automatically restored and reopened. Validation checks required
-tables but not every column definition. Restore authorization remains the ability to run the local
+If installation or reopen validation fails, KegPulse first attempts to preserve the failed candidate
+in `backups/`, then restores and reopens the prior database even if that diagnostic archival move
+fails. If the rollback itself fails, the command reports that distinct terminal error and retains
+the private rollback path for manual recovery. Validation checks version-specific required tables
+and migration-critical v2 columns, but not every column definition. Restore authorization remains the ability to run the local
 process and write its data directory, not the web administrator PIN.
 
 Stop the service before restore, keep the reported pre-restore backup, and start the service once to
@@ -214,10 +222,15 @@ through a temporary file. Host/origin allowlists contain at most 16 entries each
 does not contain the PIN verifier or session secrets; the verifier is in SQLite and sessions are
 memory-only.
 
-Runtime dependencies and their transitive hashes are pinned in `requirements.lock`. Normal runtime
-dependencies are FastAPI, Uvicorn, Pydantic, pyserial, platformdirs, and websockets; browser assets
-are repository-owned. Run KegPulse as an unprivileged OS user, keep the data directory private, do
-not expose port 8765 through a router, and protect offline backups separately.
+Runtime dependencies and their transitive hashes are pinned in `requirements.lock`. The host pins
+FastAPI 0.139.2 and Starlette 1.5.1, including absolute-path rejection, efficient range merging,
+inverted-range rejection, and the 100-range FileResponse cap; local regression tests exercise these
+boundaries.
+PlatformIO has a separate hashed lock and `.pio-venv`, is never included in the host environment or
+frozen runtime, and has telemetry disabled by setup/test scripts and CI. Normal runtime dependencies
+are FastAPI, Uvicorn, Pydantic, pyserial, platformdirs, and websockets; browser assets are
+repository-owned. Run KegPulse as an unprivileged OS user, keep the data directory private, do not
+expose port 8765 through a router, and protect offline backups separately.
 
 On POSIX systems KegPulse applies mode `0700` to its data/log/backup/export directories and `0600`
 to database, backup, config, and current log files. On Windows, confidentiality relies on the

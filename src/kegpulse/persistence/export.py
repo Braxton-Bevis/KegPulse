@@ -30,3 +30,32 @@ def rows_to_csv(rows: Iterable[Mapping[str, Any]]) -> str:
 
 def rows_to_json(rows: Iterable[Mapping[str, Any]]) -> str:
     return json.dumps(list(rows), indent=2, ensure_ascii=False, allow_nan=False)
+
+
+def rows_to_csv_chunks(rows: Iterable[Mapping[str, Any]]) -> Iterable[str]:
+    """Encode CSV incrementally without retaining the complete export in memory."""
+    writer: csv.DictWriter[str] | None = None
+    output = StringIO(newline="")
+    for row in rows:
+        if writer is None:
+            writer = csv.DictWriter(
+                output, fieldnames=list(row.keys()), extrasaction="ignore", lineterminator="\r\n"
+            )
+            writer.writeheader()
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+        writer.writerow({key: safe_spreadsheet_cell(value) for key, value in row.items()})
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+
+
+def rows_to_json_chunks(rows: Iterable[Mapping[str, Any]]) -> Iterable[str]:
+    """Encode a JSON array incrementally without retaining the complete export in memory."""
+    yield "["
+    separator = ""
+    for row in rows:
+        yield separator + json.dumps(row, ensure_ascii=False, allow_nan=False)
+        separator = ","
+    yield "]"

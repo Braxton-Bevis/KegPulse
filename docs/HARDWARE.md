@@ -34,7 +34,8 @@ Firmware build switches are defined in [platformio.ini](../firmware/platformio.i
 - `KEGPULSE_FLOW_GAP_MS=750` and `KEGPULSE_SETTLING_MS=1500` control pause detection and resume
   grace. Change them in the build environment—not firmware source—only with recorded flow tests.
 - `KEGPULSE_DEVICE_ID` defaults to the development ID `4B454750554C5345`. Assign and record a
-  distinct 16-character ASCII ID for each physical controller through its build environment.
+  distinct ID of exactly 16 uppercase hexadecimal digits (`0-9`, `A-F`) for each physical
+  controller through its build environment. Other values fail the firmware build.
 
 Changing any of these values requires a new firmware build and a recorded hardware test.
 

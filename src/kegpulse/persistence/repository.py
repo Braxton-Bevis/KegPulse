@@ -111,6 +111,8 @@ class Repository:
         label: str,
         starting_volume_ml: Decimal | str | int | float,
         notes: str = "",
+        *,
+        installed_at: datetime | str | None = None,
     ) -> dict[str, Any]:
         clean_label = label.strip()
         clean_notes = notes.strip()
@@ -118,6 +120,7 @@ class Repository:
         if not 1 <= len(clean_label) <= 120 or len(clean_notes) > 1000 or volume <= 0:
             raise ValueError("invalid keg label, notes, or starting volume")
         keg_id, now = _id(), utc_now()
+        opened_at = self._utc_timestamp(installed_at, "installed_at") if installed_at else now
         with self.db.transaction() as connection:
             active = connection.execute(
                 "SELECT 1 FROM provisional_sessions WHERE status IN "
@@ -125,14 +128,33 @@ class Repository:
             ).fetchone()
             if active:
                 raise ConflictError("cannot replace a keg during an active pour")
-            connection.execute("UPDATE kegs SET closed_at=? WHERE closed_at IS NULL", (now,))
+            previous = connection.execute(
+                "SELECT opened_at FROM kegs WHERE closed_at IS NULL"
+            ).fetchone()
+            if previous and opened_at < previous["opened_at"]:
+                raise ConflictError("installed_at cannot precede the current keg installation")
+            connection.execute("UPDATE kegs SET closed_at=? WHERE closed_at IS NULL", (opened_at,))
             connection.execute(
                 "INSERT INTO kegs(id, label, starting_volume_ml, opened_at, notes) "
                 "VALUES(?, ?, ?, ?, ?)",
-                (keg_id, clean_label, str(volume), now, clean_notes),
+                (keg_id, clean_label, str(volume), opened_at, clean_notes),
             )
             row = connection.execute("SELECT * FROM kegs WHERE id=?", (keg_id,)).fetchone()
         return dict(row)
+
+    @staticmethod
+    def _utc_timestamp(value: datetime | str, field: str) -> str:
+        try:
+            parsed = (
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if isinstance(value, str)
+                else value
+            )
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO 8601 timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field} must include a timezone")
+        return parsed.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
     def adjust_inventory(
         self, keg_id: str, amount_ml: Decimal | str | int | float, reason: str
@@ -223,14 +245,14 @@ class Repository:
             if calibration["status"] != "draft":
                 raise ConflictError("active or historical calibration samples are immutable")
             connection.execute(
+                "UPDATE calibration_samples SET superseded_at=? WHERE calibration_id=? "
+                "AND ordinal=? AND superseded_at IS NULL",
+                (now, calibration_id, ordinal),
+            )
+            connection.execute(
                 "INSERT INTO calibration_samples(id, calibration_id, ordinal, raw_pulses, "
                 "mass_g, density_g_per_ml, derived_volume_ml, included, captured_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(calibration_id, ordinal) DO UPDATE SET "
-                "raw_pulses=excluded.raw_pulses, "
-                "mass_g=excluded.mass_g, density_g_per_ml=excluded.density_g_per_ml, "
-                "derived_volume_ml=excluded.derived_volume_ml, included=excluded.included, "
-                "captured_at=excluded.captured_at",
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sample_id,
                     calibration_id,
@@ -244,13 +266,14 @@ class Repository:
                 ),
             )
             rows = connection.execute(
-                "SELECT * FROM calibration_samples WHERE calibration_id=? ORDER BY ordinal",
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
                 (calibration_id,),
             ).fetchall()
             self._update_outlier_flags(connection, rows)
             row = connection.execute(
-                "SELECT * FROM calibration_samples WHERE calibration_id=? AND ordinal=?",
-                (calibration_id, ordinal),
+                "SELECT * FROM calibration_samples WHERE id=?",
+                (sample_id,),
             ).fetchone()
         return dict(row)
 
@@ -290,18 +313,21 @@ class Repository:
             if calibration["status"] != "draft":
                 raise ConflictError("active or historical calibration samples are immutable")
             changed = connection.execute(
-                "UPDATE calibration_samples SET included=? WHERE calibration_id=? AND ordinal=?",
+                "UPDATE calibration_samples SET included=? WHERE calibration_id=? AND ordinal=? "
+                "AND superseded_at IS NULL",
                 (int(included), calibration_id, ordinal),
             )
             if changed.rowcount != 1:
                 raise NotFoundError("calibration sample not found")
             rows = connection.execute(
-                "SELECT * FROM calibration_samples WHERE calibration_id=? ORDER BY ordinal",
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
                 (calibration_id,),
             ).fetchall()
             self._update_outlier_flags(connection, rows)
             row = connection.execute(
-                "SELECT * FROM calibration_samples WHERE calibration_id=? AND ordinal=?",
+                "SELECT * FROM calibration_samples WHERE calibration_id=? AND ordinal=? "
+                "AND superseded_at IS NULL",
                 (calibration_id, ordinal),
             ).fetchone()
         return dict(row)
@@ -314,7 +340,8 @@ class Repository:
             if calibration is None:
                 raise NotFoundError("calibration not found")
             samples = connection.execute(
-                "SELECT * FROM calibration_samples WHERE calibration_id=? ORDER BY ordinal",
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
                 (calibration_id,),
             ).fetchall()
         output = dict(calibration)
@@ -356,14 +383,36 @@ class Repository:
                 connection.execute("SELECT * FROM calibrations WHERE status='active'").fetchone()
             )
 
+    def measurement_context(self) -> tuple[str | None, str | None]:
+        """Capture the current inventory/calibration identities under one DB lock."""
+        with self.db.read() as connection:
+            keg = connection.execute("SELECT id FROM kegs WHERE closed_at IS NULL").fetchone()
+            calibration = connection.execute(
+                "SELECT id FROM calibrations WHERE status='active'"
+            ).fetchone()
+        return (
+            str(keg["id"]) if keg else None,
+            str(calibration["id"]) if calibration else None,
+        )
+
     def activate_calibration(self, calibration_id: str) -> dict[str, Any]:
-        detail = self.calibration_detail(calibration_id)
-        if detail["status"] != "draft":
-            raise ConflictError("only a draft calibration can be activated")
-        if detail["analysis"] is None:
-            raise ConflictError("calibration needs ten samples and at least seven included")
         now = utc_now()
         with self.db.transaction() as connection:
+            calibration = connection.execute(
+                "SELECT status FROM calibrations WHERE id=?", (calibration_id,)
+            ).fetchone()
+            if calibration is None:
+                raise NotFoundError("calibration not found")
+            if calibration["status"] != "draft":
+                raise ConflictError("only a draft calibration can be activated")
+            samples = connection.execute(
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
+                (calibration_id,),
+            ).fetchall()
+            if len(samples) != 10 or sum(bool(row["included"]) for row in samples) < 7:
+                raise ConflictError("calibration needs ten samples and at least seven included")
+            analysis = analyze_calibration(self._samples_from_rows(samples))
             active = connection.execute(
                 "SELECT 1 FROM provisional_sessions WHERE status IN "
                 "('arming', 'armed', 'pouring', 'settling', 'finalizing') LIMIT 1"
@@ -374,7 +423,7 @@ class Repository:
             connection.execute(
                 "UPDATE calibrations SET status='active', pulses_per_ml=?, activated_at=? "
                 "WHERE id=? AND status='draft'",
-                (detail["analysis"]["pulses_per_ml"], now, calibration_id),
+                (str(analysis.pulses_per_ml), now, calibration_id),
             )
             row = connection.execute(
                 "SELECT * FROM calibrations WHERE id=?", (calibration_id,)
@@ -504,7 +553,7 @@ class Repository:
                     idempotency_key,
                     purpose,
                     participant_id,
-                    keg["id"] if keg and purpose == "pour" else None,
+                    keg["id"] if keg and purpose in {"pour", "verification"} else None,
                     calibration_id
                     or (
                         active_calibration["id"]
@@ -665,6 +714,24 @@ class Repository:
                 ).fetchone()
             )
 
+    def recent_terminal_provisional(self, *, within_seconds: int = 300) -> dict[str, Any] | None:
+        bounded = max(1, min(within_seconds, 3600))
+        cutoff = (
+            (datetime.now(UTC) - timedelta(seconds=bounded))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        with self.db.read() as connection:
+            return _dict(
+                connection.execute(
+                    "SELECT * FROM provisional_sessions WHERE status IN "
+                    "('timed_out', 'interrupted_uncertain') AND updated_at>=? "
+                    "AND updated_at > COALESCE((SELECT MAX(ended_at) FROM pour_events), '') "
+                    "ORDER BY updated_at DESC, session_id DESC LIMIT 1",
+                    (cutoff,),
+                ).fetchone()
+            )
+
     def consume_calibration_capture(
         self,
         session_id: str,
@@ -673,24 +740,75 @@ class Repository:
         *,
         included: bool,
     ) -> dict[str, Any]:
-        session = self.get_session(session_id)
-        if session["purpose"] != "calibration" or session["status"] not in {
-            "complete",
-            "consumed",
-        }:
-            raise ConflictError("calibration capture is not complete")
-        if session["captured_raw_pulses"] is None:
-            raise ConflictError("calibration capture has no measured pulses")
-        sample = self.add_calibration_sample(
-            session["calibration_id"],
-            int(session["target_ordinal"]),
-            int(session["captured_raw_pulses"]),
-            mass_g,
-            density_g_per_ml,
-            included=included,
-        )
-        self.update_provisional_status(session_id, "consumed")
-        return sample
+        with self.db.transaction() as connection:
+            session = connection.execute(
+                "SELECT * FROM provisional_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session not found")
+            if session["purpose"] != "calibration" or session["status"] not in {
+                "complete",
+                "consumed",
+            }:
+                raise ConflictError("calibration capture is not complete")
+            if session["status"] == "consumed":
+                entity_id = session["consumed_entity_id"]
+                row = connection.execute(
+                    "SELECT * FROM calibration_samples WHERE id=?", (entity_id,)
+                ).fetchone()
+                if row is None:
+                    raise ConflictError("consumed calibration capture is missing its sample")
+                return dict(row)
+            if session["captured_raw_pulses"] is None:
+                raise ConflictError("calibration capture has no measured pulses")
+            calibration = connection.execute(
+                "SELECT status FROM calibrations WHERE id=?", (session["calibration_id"],)
+            ).fetchone()
+            if calibration is None:
+                raise NotFoundError("calibration not found")
+            if calibration["status"] != "draft":
+                raise ConflictError("active or historical calibration samples are immutable")
+            ordinal = int(session["target_ordinal"])
+            sample = make_sample(
+                int(session["captured_raw_pulses"]), mass_g, density_g_per_ml, included=included
+            )
+            sample_id, now = _id(), utc_now()
+            connection.execute(
+                "UPDATE calibration_samples SET superseded_at=? WHERE calibration_id=? "
+                "AND ordinal=? AND superseded_at IS NULL",
+                (now, session["calibration_id"], ordinal),
+            )
+            connection.execute(
+                "INSERT INTO calibration_samples(id, calibration_id, ordinal, raw_pulses, "
+                "mass_g, density_g_per_ml, derived_volume_ml, included, captured_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sample_id,
+                    session["calibration_id"],
+                    ordinal,
+                    sample.raw_pulses,
+                    str(sample.mass_g),
+                    str(sample.density_g_per_ml),
+                    str(sample.volume_ml),
+                    int(sample.included),
+                    now,
+                ),
+            )
+            rows = connection.execute(
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
+                (session["calibration_id"],),
+            ).fetchall()
+            self._update_outlier_flags(connection, rows)
+            connection.execute(
+                "UPDATE provisional_sessions SET status='consumed', consumed_entity_id=?, "
+                "updated_at=? WHERE session_id=?",
+                (sample_id, now, session_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM calibration_samples WHERE id=?", (sample_id,)
+            ).fetchone()
+        return dict(row)
 
     def consume_verification_capture(
         self,
@@ -699,24 +817,78 @@ class Repository:
         density_g_per_ml: Decimal | str | int | float,
         warning_threshold_pct: Decimal | str | int | float,
     ) -> dict[str, Any]:
-        session = self.get_session(session_id)
-        if session["purpose"] != "verification" or session["status"] not in {
-            "complete",
-            "consumed",
-        }:
-            raise ConflictError("verification capture is not complete")
-        if session["captured_raw_pulses"] is None:
-            raise ConflictError("verification capture has no measured pulses")
-        check = self.add_verification(
-            int(session["captured_raw_pulses"]),
-            mass_g,
-            density_g_per_ml,
-            warning_threshold_pct,
-        )
-        self.update_provisional_status(session_id, "consumed")
-        return check
+        with self.db.transaction() as connection:
+            session = connection.execute(
+                "SELECT * FROM provisional_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session not found")
+            if session["purpose"] != "verification" or session["status"] not in {
+                "complete",
+                "consumed",
+            }:
+                raise ConflictError("verification capture is not complete")
+            if session["status"] == "consumed":
+                entity_id = session["consumed_entity_id"]
+                row = connection.execute(
+                    "SELECT * FROM verification_checks WHERE id=?", (entity_id,)
+                ).fetchone()
+                if row is None:
+                    raise ConflictError("consumed verification capture is missing its check")
+                return dict(row)
+            if session["captured_raw_pulses"] is None:
+                raise ConflictError("verification capture has no measured pulses")
+            calibration = connection.execute(
+                "SELECT * FROM calibrations WHERE id=?", (session["calibration_id"],)
+            ).fetchone()
+            if calibration is None or calibration["pulses_per_ml"] is None:
+                raise ConflictError("the captured calibration is required")
+            predicted, actual, absolute, percentage = verification_error(
+                int(session["captured_raw_pulses"]),
+                mass_g,
+                density_g_per_ml,
+                calibration["pulses_per_ml"],
+            )
+            threshold = finite_decimal(warning_threshold_pct, "warning_threshold_pct")
+            verification_id, now = _id(), utc_now()
+            connection.execute(
+                "INSERT INTO verification_checks(id, calibration_id, keg_id, raw_pulses, "
+                "mass_g, density_g_per_ml, predicted_volume_ml, actual_volume_ml, "
+                "absolute_error_ml, percentage_error, warning, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    verification_id,
+                    calibration["id"],
+                    session["keg_id"],
+                    int(session["captured_raw_pulses"]),
+                    str(finite_decimal(mass_g, "mass_g")),
+                    str(finite_decimal(density_g_per_ml, "density_g_per_ml")),
+                    str(predicted),
+                    str(actual),
+                    str(absolute),
+                    str(percentage),
+                    int(percentage > threshold),
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE provisional_sessions SET status='consumed', consumed_entity_id=?, "
+                "updated_at=? WHERE session_id=?",
+                (verification_id, now, session_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM verification_checks WHERE id=?", (verification_id,)
+            ).fetchone()
+        return dict(row)
 
-    def finalize_device_result(self, result: DeviceResult) -> tuple[dict[str, Any] | None, bool]:
+    def finalize_device_result(
+        self,
+        result: DeviceResult,
+        *,
+        keg_id: str | None = None,
+        calibration_id: str | None = None,
+        context_captured: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
         now = datetime.now(UTC)
         ended_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
         # Device milliseconds are uint32 and may wrap during a valid event.
@@ -737,6 +909,22 @@ class Repository:
             )
         )
         with self.db.transaction() as connection:
+            provisional = (
+                connection.execute(
+                    "SELECT * FROM provisional_sessions WHERE session_id=?", (session_id,)
+                ).fetchone()
+                if result.session_id
+                else None
+            )
+            if result.attributed and (
+                provisional is None
+                or provisional["device_id"] != result.device_id
+                or provisional["boot_id"] != result.boot_id
+                or provisional["event_seq"] != result.event_seq
+            ):
+                raise ConflictError(
+                    "attributed device result does not match its durable session binding"
+                )
             duplicate = connection.execute(
                 "SELECT pour_id FROM device_results "
                 "WHERE device_id=? AND boot_id=? AND event_seq=?",
@@ -750,13 +938,6 @@ class Repository:
                 ).fetchone()
                 return dict(row), True
 
-            provisional = (
-                connection.execute(
-                    "SELECT * FROM provisional_sessions WHERE session_id=?", (session_id,)
-                ).fetchone()
-                if result.session_id
-                else None
-            )
             if provisional and provisional["purpose"] != "pour":
                 connection.execute(
                     "INSERT INTO device_results(device_id, boot_id, event_seq, session_id, status, "
@@ -801,13 +982,14 @@ class Repository:
                     )
                 return None, False
 
-            keg_id = provisional["keg_id"] if provisional else None
-            calibration_id = provisional["calibration_id"] if provisional else None
+            if provisional:
+                keg_id = provisional["keg_id"]
+                calibration_id = provisional["calibration_id"]
             participant_id = provisional["participant_id"] if provisional else None
-            if keg_id is None:
+            if provisional is None and not context_captured and keg_id is None:
                 keg = connection.execute("SELECT id FROM kegs WHERE closed_at IS NULL").fetchone()
                 keg_id = keg["id"] if keg else None
-            if calibration_id is None:
+            if provisional is None and not context_captured and calibration_id is None:
                 calibration = connection.execute(
                     "SELECT id FROM calibrations WHERE status='active'"
                 ).fetchone()
@@ -877,6 +1059,102 @@ class Repository:
             row = connection.execute("SELECT * FROM pour_events WHERE id=?", (pour_id,)).fetchone()
         return dict(row), False
 
+    def checkpoint_recovery_pulses(
+        self,
+        *,
+        device_id: str,
+        boot_id: str,
+        recovery_pulses: int,
+        device_uptime_ms: int,
+        keg_id: str | None = None,
+        calibration_id: str | None = None,
+        context_captured: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Atomically materialize only the new portion of a cumulative recovery counter."""
+        if not 1 <= len(device_id) <= 64 or not 1 <= len(boot_id) <= 64:
+            raise ValueError("device and boot identities are required")
+        if isinstance(recovery_pulses, bool) or not 0 <= recovery_pulses <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("recovery_pulses is out of range")
+        if isinstance(device_uptime_ms, bool) or not 0 <= device_uptime_ms <= 0xFFFFFFFF:
+            raise ValueError("device_uptime_ms is out of range")
+        now = utc_now()
+        with self.db.transaction() as connection:
+            checkpoint = connection.execute(
+                "SELECT * FROM device_recovery_checkpoints WHERE device_id=? AND boot_id=?",
+                (device_id, boot_id),
+            ).fetchone()
+            previous = int(checkpoint["recovery_pulses"]) if checkpoint else 0
+            if recovery_pulses < previous:
+                raise ConflictError("same-boot recovery counter cannot decrease")
+            if recovery_pulses == previous:
+                prior = (
+                    connection.execute(
+                        "SELECT * FROM pour_events WHERE id=?", (checkpoint["last_pour_id"],)
+                    ).fetchone()
+                    if checkpoint and checkpoint["last_pour_id"]
+                    else None
+                )
+                return (_dict(prior), True)
+
+            delta = recovery_pulses - previous
+            session_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "kegpulse://recovery-counter/"
+                    f"{device_id}/{boot_id}/{previous}/{recovery_pulses}",
+                )
+            )
+            keg = None
+            calibration = None
+            if context_captured:
+                if keg_id is not None:
+                    keg = connection.execute("SELECT id FROM kegs WHERE id=?", (keg_id,)).fetchone()
+                if calibration_id is not None:
+                    calibration = connection.execute(
+                        "SELECT id, pulses_per_ml FROM calibrations WHERE id=?",
+                        (calibration_id,),
+                    ).fetchone()
+            else:
+                keg = connection.execute("SELECT id FROM kegs WHERE closed_at IS NULL").fetchone()
+                calibration = connection.execute(
+                    "SELECT id, pulses_per_ml FROM calibrations WHERE status='active'"
+                ).fetchone()
+            factor = calibration["pulses_per_ml"] if calibration else None
+            volume = pulses_to_ml(delta, factor) if factor else None
+            pour_id = _id()
+            connection.execute(
+                "INSERT INTO pour_events(id, session_id, participant_id, keg_id, calibration_id, "
+                "device_id, boot_id, event_seq, raw_pulses, volume_ml, attributed, quality, "
+                "started_at, ended_at, device_started_ms, device_ended_ms, fault, created_at) "
+                "VALUES(?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, 0, 'estimated_recovered', "
+                "?, ?, ?, ?, 'device_recovery_counter', ?)",
+                (
+                    pour_id,
+                    session_id,
+                    keg["id"] if keg else None,
+                    calibration["id"] if calibration else None,
+                    device_id,
+                    boot_id,
+                    delta,
+                    str(volume) if volume is not None else None,
+                    now,
+                    now,
+                    device_uptime_ms,
+                    device_uptime_ms,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO device_recovery_checkpoints(device_id, boot_id, recovery_pulses, "
+                "last_pour_id, updated_at) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id, boot_id) DO UPDATE SET "
+                "recovery_pulses=excluded.recovery_pulses, "
+                "last_pour_id=excluded.last_pour_id, updated_at=excluded.updated_at",
+                (device_id, boot_id, str(recovery_pulses), pour_id, now),
+            )
+            row = connection.execute("SELECT * FROM pour_events WHERE id=?", (pour_id,)).fetchone()
+        return dict(row), False
+
     def list_pours(
         self,
         *,
@@ -903,6 +1181,35 @@ class Repository:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def iter_pours(self, *, page_size: int = 200) -> Iterable[dict[str, Any]]:
+        """Yield a stable, complete newest-first export in bounded database pages."""
+        bounded = max(1, min(page_size, 500))
+        last_ended: str | None = None
+        last_id: str | None = None
+        while True:
+            where = ""
+            parameters: list[object] = []
+            if last_ended is not None and last_id is not None:
+                where = " WHERE (p.ended_at < ? OR (p.ended_at = ? AND p.id < ?))"
+                parameters.extend((last_ended, last_ended, last_id))
+            parameters.append(bounded)
+            with self.db.read() as connection:
+                rows = connection.execute(
+                    "SELECT p.*, participants.display_name AS participant_name, "
+                    "kegs.label AS keg_label FROM pour_events p "
+                    "LEFT JOIN participants ON participants.id=p.participant_id "
+                    "LEFT JOIN kegs ON kegs.id=p.keg_id"
+                    + where
+                    + " ORDER BY p.ended_at DESC, p.id DESC LIMIT ?",
+                    parameters,
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield dict(row)
+            last_ended = str(rows[-1]["ended_at"])
+            last_id = str(rows[-1]["id"])
 
     def reassign_pour(self, pour_id: str, participant_id: str, reason: str) -> dict[str, Any]:
         clean_reason = reason.strip()
@@ -964,3 +1271,22 @@ class Repository:
                 "DELETE FROM device_diagnostics WHERE id NOT IN "
                 "(SELECT id FROM device_diagnostics ORDER BY id DESC LIMIT 500)"
             )
+
+    def list_diagnostics(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(limit, 500))
+        with self.db.read() as connection:
+            rows = connection.execute(
+                "SELECT id, created_at, level, code, context_json "
+                "FROM device_diagnostics ORDER BY id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                context = json.loads(str(item.pop("context_json")))
+            except (TypeError, ValueError):
+                context = {"unavailable": True}
+            item["context"] = context if isinstance(context, dict) else {"value": context}
+            output.append(item)
+        return output

@@ -8,6 +8,25 @@ namespace kegpulse {
 constexpr size_t kMaxFrameBytes = 256;
 constexpr uint8_t kMaxFields = 12;
 
+constexpr bool upper_hex_digit(char value) {
+  return (value >= '0' && value <= '9') ||
+         (value >= 'A' && value <= 'F');
+}
+
+// Device and boot identities have one canonical wire representation. Keeping
+// this constexpr lets board builds reject an invalid configured device ID.
+constexpr bool valid_upper_hex_identity_at(const char* value, uint8_t index) {
+  return index == 16
+             ? value[index] == '\0'
+             : upper_hex_digit(value[index]) &&
+                   valid_upper_hex_identity_at(value,
+                                               static_cast<uint8_t>(index + 1U));
+}
+
+constexpr bool valid_upper_hex_identity(const char* value) {
+  return value != nullptr && valid_upper_hex_identity_at(value, 0);
+}
+
 enum class ParseError : uint8_t {
   NONE,
   MALFORMED,
@@ -32,6 +51,13 @@ struct ParsedFrame {
 };
 
 uint16_t crc16_ccitt(const uint8_t* data, size_t length);
+// KP1 proto 1 originally identified ACKs by boot and sequence. Device is
+// optional only for that legacy wire form; whenever present it is a strict
+// additional identity gate.
+bool ack_identity_matches(const char* supplied_device,
+                          const char* supplied_boot,
+                          const char* expected_device,
+                          const char* expected_boot);
 bool encode_frame(char* destination, size_t capacity, char kind,
                   const char* request_id, const char* operation,
                   const Field* fields, uint8_t field_count,

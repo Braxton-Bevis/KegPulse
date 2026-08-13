@@ -11,6 +11,9 @@ const dialog = document.querySelector("#confirm-dialog");
 const state = {
   snapshot: null,
   security: null,
+  securityRequest: null,
+  hostAvailable: null,
+  hostError: null,
   socket: null,
   pollTimer: null,
   reconnectTimer: null,
@@ -25,9 +28,21 @@ const state = {
   historyFilter: "all",
   participantDetails: null,
   serialPorts: null,
+  diagnostics: null,
+  reassignPourId: null,
+  lastAnnouncedPulses: null,
+  lastMeasurementAnnouncement: 0,
+  dismissedTerminalId: null,
+  dialogInvoker: null,
   pending: new Set(),
   renderedRoute: null,
 };
+
+dialog.addEventListener("cancel", () => { dialog.returnValue = "cancel"; });
+dialog.addEventListener("close", () => {
+  if (state.dialogInvoker?.isConnected) state.dialogInvoker.focus({ preventScroll: true });
+  state.dialogInvoker = null;
+});
 
 const escapeHtml = (value) => String(value ?? "")
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -50,7 +65,21 @@ const formatTime = (value) => value ? new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium", timeStyle: "short"
 }).format(new Date(value)) : "—";
 
+const localDateTimeInput = (value = new Date()) => {
+  const date = value instanceof Date ? value : new Date(value);
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 23);
+};
+
 const uuidKey = () => crypto.randomUUID();
+
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 function showToast(message, isError = false) {
   toast.textContent = message;
@@ -75,16 +104,21 @@ async function api(path, options = {}) {
   }
   const response = await fetch(path, { cache: "no-store", credentials: "same-origin", ...options, method, headers });
   if (!response.ok) {
-    let message;
-    try {
-      const body = await response.json();
-      message = Array.isArray(body.detail)
-        ? body.detail.map((item) => item.msg).join("; ")
-        : body.detail;
-    } catch {
+    const contentType = response.headers.get("content-type") || "";
+    let message = "";
+    if (contentType.includes("json")) {
+      try {
+        const body = await response.json();
+        message = Array.isArray(body.detail)
+          ? body.detail.map((item) => item.msg).join("; ")
+          : body.detail;
+      } catch {
+        message = "The service returned an unreadable error response.";
+      }
+    } else {
       message = await response.text();
     }
-    throw new Error(message || `${response.status} ${response.statusText}`);
+    throw new ApiError(message || `${response.status} ${response.statusText}`, response.status);
   }
   if (response.status === 204) return null;
   const contentType = response.headers.get("content-type") || "";
@@ -92,22 +126,114 @@ async function api(path, options = {}) {
 }
 
 async function mutation(key, path, body = {}, method = "POST") {
+  if (state.hostAvailable === false) {
+    throw new Error("The KegPulse host is unavailable. Wait for status recovery before trying again.");
+  }
   if (state.pending.has(key)) return null;
   state.pending.add(key);
-  render();
+  const unlock = lockActiveMutationSurface();
+  let securityRefreshed = false;
   try {
-    const result = await api(path, { method, body: JSON.stringify(body) });
+    let result;
+    try {
+      result = await api(path, { method, body: JSON.stringify(body) });
+    } catch (error) {
+      const previousToken = state.security?.csrf_token;
+      if (!(error instanceof ApiError) || ![401, 403].includes(error.status)) throw error;
+      const context = await refreshSecurityContext();
+      securityRefreshed = true;
+      if (context.lan_mode && !context.authenticated) {
+        enterLoginMode();
+        throw new ApiError("Administrator login required", 401);
+      }
+      if (!context.csrf_token || context.csrf_token === previousToken) throw error;
+      result = await api(path, { method, body: JSON.stringify(body) });
+    }
     await refresh();
-    return result;
-  } finally {
     state.pending.delete(key);
+    unlock();
+    render();
+    return result;
+  } catch (error) {
+    state.pending.delete(key);
+    unlock();
+    if (securityRefreshed) syncSecurityUi();
+    syncHostControls();
+    throw error;
+  }
+}
+
+function lockActiveMutationSurface() {
+  const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const form = active?.closest("form");
+  const controls = form
+    ? [...form.querySelectorAll('button:not([type="button"]), button[type="submit"]')]
+    : active instanceof HTMLButtonElement ? [active] : [];
+  const disabled = controls.map((control) => control.disabled);
+  form?.setAttribute("aria-busy", "true");
+  controls.forEach((control) => { control.disabled = true; });
+  return () => {
+    form?.removeAttribute("aria-busy");
+    controls.forEach((control, index) => {
+      if (control.isConnected) control.disabled = disabled[index];
+    });
+  };
+}
+
+async function refreshSecurityContext() {
+  if (state.securityRequest) return state.securityRequest;
+  state.securityRequest = api("/api/v1/security/context")
+    .then((context) => {
+      state.security = context;
+      return context;
+    })
+    .finally(() => { state.securityRequest = null; });
+  return state.securityRequest;
+}
+
+function enterLoginMode() {
+  window.clearTimeout(state.reconnectTimer);
+  stopPolling();
+  const socket = state.socket;
+  state.socket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+  state.hostAvailable = true;
+  state.hostError = null;
+  updateChrome();
+  render();
+}
+
+function loginFormMarkup(embedded = false) {
+  const label = embedded ? "Unlock with PIN" : "Admin PIN";
+  const button = embedded ? "Unlock administrator" : "Unlock KegPulse";
+  return `<form id="login-form" class="stack"><label>${label}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="current-password" required></label><button>${button}</button></form>`;
+}
+
+function syncSecurityUi() {
+  updateChrome();
+  const status = document.querySelector("#admin-auth-status");
+  const loginSlot = document.querySelector("#admin-login-slot");
+  if (status && loginSlot) {
+    const authenticated = Boolean(state.security?.authenticated);
+    status.className = authenticated ? "good-text" : "warning-text";
+    status.textContent = authenticated
+      ? "Administrator unlocked for this session."
+      : "Administrator locked.";
+    loginSlot.innerHTML = state.security?.pin_configured && !authenticated
+      ? loginFormMarkup(true)
+      : "";
+    bindLoginForm();
+    syncHostControls();
+  } else if (state.renderedRoute === "__login__" && state.security?.authenticated) {
     render();
   }
 }
 
 function confirmAction(message, label = "Confirm") {
+  state.dialogInvoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   document.querySelector("#confirm-message").textContent = message;
   document.querySelector("#confirm-accept").textContent = label;
+  dialog.returnValue = "cancel";
   dialog.showModal();
   return new Promise((resolve) => {
     dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
@@ -123,6 +249,10 @@ function navigate(path) {
 }
 
 function connectionText() {
+  if (state.hostAvailable === false) return ["bad", "■ Host unavailable"];
+  if (state.security?.lan_mode && !state.security?.authenticated) {
+    return ["warning", "▲ Admin login required"];
+  }
   const connection = state.snapshot?.connection;
   if (!connection) return ["neutral", "● Starting"];
   if (connection.state === "connected") return ["good", "● Device connected"];
@@ -140,26 +270,71 @@ function updateChrome() {
   kegSummary.textContent = keg
     ? `${keg.label}: ${formatVolume(inventory?.remaining_ml)}`
     : "No keg configured";
+  const loginRequired = state.security?.lan_mode && !state.security?.authenticated;
   const degraded = state.socketFailures > 0 || state.snapshot?.connection?.state !== "connected";
-  if (degraded) {
-    banner.classList.remove("hidden");
+  if (state.hostAvailable === false) {
+    banner.className = "banner danger";
+    banner.textContent = "KegPulse host unavailable — displayed information may be stale. Pour and administrative controls are disabled until a fresh status snapshot arrives.";
+  } else if (loginRequired) {
+    banner.className = "banner warning";
+    banner.textContent = "Administrator login required before live status and controls can resume.";
+  } else if (degraded) {
+    banner.className = "banner warning";
     banner.textContent = state.socketFailures > 0
       ? "Live updates delayed — using status polling. State-changing controls remain guarded by the server."
       : `Flow device ${state.snapshot?.connection?.state || "unavailable"}: ${state.snapshot?.connection?.detail || "waiting"}`;
   } else {
-    banner.classList.add("hidden");
+    banner.className = "banner warning hidden";
   }
   for (const link of nav.querySelectorAll("a")) {
     const target = link.getAttribute("href").slice(1);
-    link.toggleAttribute("aria-current", target === route());
+    if (target === route()) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  syncHostControls();
+}
+
+function syncHostControls() {
+  const controls = [...main.querySelectorAll("button"), document.querySelector("#confirm-accept")]
+    .filter((control) => control && control.dataset.action !== "retry");
+  for (const control of controls) {
+    if (state.hostAvailable === false && !control.disabled) {
+      control.dataset.hostDisabled = "true";
+      control.disabled = true;
+    } else if (state.hostAvailable !== false && control.dataset.hostDisabled === "true") {
+      control.disabled = false;
+      delete control.dataset.hostDisabled;
+    }
+  }
+}
+
+function setHostAvailability(available, error = null) {
+  const previous = state.hostAvailable;
+  const changed = previous !== available;
+  state.hostAvailable = available;
+  state.hostError = available ? null : error;
+  updateChrome();
+  if (!state.snapshot && changed) render();
+  if (changed && (available === false || previous === false)) {
+    announcer.textContent = available
+      ? "KegPulse host connection restored. Fresh status received."
+      : "KegPulse host unavailable. Displayed information may be stale and controls are disabled.";
   }
 }
 
 function reconcileRoute(previous, next) {
   const session = next?.session;
+  const terminal = next?.terminal_notice;
   const deviceState = next?.device?.status?.state;
   if (session && ["arming", "armed", "pouring", "settling", "finalizing"].includes(session.status)) {
+    state.dismissedTerminalId = null;
     if (route() === "/" || route() === "/complete") navigate("/pour");
+  } else if (
+    ["timed_out", "interrupted_uncertain"].includes(terminal?.status)
+    && terminal.session_id !== state.dismissedTerminalId
+    && ["/", "/pour"].includes(route())
+  ) {
+    if (route() !== "/pour") navigate("/pour");
   } else if (previous?.session && !session && next?.last_pour?.id !== previous?.last_pour?.id) {
     state.completionPour = next.last_pour;
     navigate("/complete");
@@ -172,6 +347,17 @@ function reconcileRoute(previous, next) {
     }
     state.lastDevicePhase = deviceState;
   }
+  const pulses = next?.device?.status?.pulses;
+  if (
+    deviceState === "pouring"
+    && pulses !== undefined
+    && pulses !== state.lastAnnouncedPulses
+    && performance.now() - state.lastMeasurementAnnouncement >= 5000
+  ) {
+    announcer.textContent = `Measured ${formatVolume(next.live_volume_ml)} from ${pulses} pulses.`;
+    state.lastAnnouncedPulses = pulses;
+    state.lastMeasurementAnnouncement = performance.now();
+  }
 }
 
 function applySnapshot(snapshot) {
@@ -180,16 +366,50 @@ function applySnapshot(snapshot) {
   state.snapshot = snapshot;
   reconcileRoute(previous, snapshot);
   updateChrome();
-  const editing = main.contains(document.activeElement)
-    && document.activeElement.matches("input, select, textarea");
+  // A snapshot may arrive between a user's final field edit and the form's
+  // submit click. Keep the whole focused form intact so its values and click
+  // target cannot be replaced mid-interaction.
+  const editing = (
+    main.contains(document.activeElement)
+    && document.activeElement.closest("form") !== null
+  ) || (dialog.open && state.dialogInvoker && main.contains(state.dialogInvoker));
   if (!editing || route() === "/pour") render();
 }
 
 async function refresh() {
+  const recovering = state.hostAvailable === false || !state.security;
   try {
-    applySnapshot(await api("/api/v1/status"));
+    if (recovering) {
+      const context = await refreshSecurityContext();
+      if (context.lan_mode && !context.authenticated) {
+        enterLoginMode();
+        return false;
+      }
+    }
+    let snapshot;
+    try {
+      snapshot = await api("/api/v1/status");
+    } catch (error) {
+      if (!(error instanceof ApiError) || ![401, 403].includes(error.status)) throw error;
+      const context = await refreshSecurityContext();
+      if (context.lan_mode && !context.authenticated) {
+        enterLoginMode();
+        return false;
+      }
+      snapshot = await api("/api/v1/status");
+    }
+    setHostAvailability(true);
+    applySnapshot(snapshot);
+    if (state.pollTimer && (!state.socket || state.socket.readyState === WebSocket.CLOSED)) {
+      connectSocket();
+    }
+    return true;
   } catch (error) {
-    showError(error);
+    const newlyUnavailable = state.hostAvailable !== false;
+    setHostAvailability(false, error);
+    startPolling();
+    if (newlyUnavailable) showError(error);
+    return false;
   }
 }
 
@@ -204,7 +424,10 @@ function stopPolling() {
 }
 
 function connectSocket() {
-  if (state.socket) state.socket.close();
+  window.clearTimeout(state.reconnectTimer);
+  if (state.security?.lan_mode && !state.security?.authenticated) return;
+  if (!navigator.onLine) return;
+  if (state.socket && state.socket.readyState < WebSocket.CLOSING) state.socket.close();
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${location.host}/api/v1/ws`);
   state.socket = socket;
@@ -215,7 +438,18 @@ function connectSocket() {
     updateChrome();
   });
   socket.addEventListener("message", (event) => {
-    try { applySnapshot(JSON.parse(event.data)); } catch { startPolling(); }
+    try {
+      const snapshot = JSON.parse(event.data);
+      if (state.hostAvailable === false || !state.security) {
+        applySnapshot(snapshot);
+        void refresh();
+      } else {
+        setHostAvailability(true);
+        applySnapshot(snapshot);
+      }
+    } catch {
+      socket.close(1003, "invalid snapshot");
+    }
   });
   socket.addEventListener("close", () => {
     if (state.socket !== socket) return;
@@ -223,13 +457,47 @@ function connectSocket() {
     startPolling();
     updateChrome();
     const delay = Math.min(15000, 500 * (2 ** Math.min(state.socketFailures, 5)));
-    state.reconnectTimer = window.setTimeout(connectSocket, delay);
+    if (navigator.onLine) state.reconnectTimer = window.setTimeout(connectSocket, delay);
   });
   socket.addEventListener("error", () => socket.close());
 }
 
 function page(title, subtitle, content) {
   return `<section><h1 tabindex="-1">${escapeHtml(title)}</h1>${subtitle ? `<p class="lead">${escapeHtml(subtitle)}</p>` : ""}${content}</section>`;
+}
+
+function focusSelector(element) {
+  if (!(element instanceof HTMLElement) || !main.contains(element)) return null;
+  if (element.id) return `#${CSS.escape(element.id)}`;
+  const owner = element.closest("form[id], form[data-id], form[data-pour]");
+  let ownerSelector = "";
+  if (owner?.id) ownerSelector = `#${CSS.escape(owner.id)}`;
+  else if (owner?.dataset.id) ownerSelector = `form[data-id="${CSS.escape(owner.dataset.id)}"]`;
+  else if (owner?.dataset.pour) ownerSelector = `form[data-pour="${CSS.escape(owner.dataset.pour)}"]`;
+  if (element.getAttribute("name")) return `${ownerSelector ? `${ownerSelector} ` : ""}[name="${CSS.escape(element.getAttribute("name"))}"]`;
+  if (ownerSelector && element.matches("button")) return `${ownerSelector} button:not([type="button"])`;
+  if (element.dataset.action) {
+    let selector = `[data-action="${CSS.escape(element.dataset.action)}"]`;
+    for (const key of ["participant", "pour", "calibration", "ordinal", "purpose"]) {
+      if (element.dataset[key] !== undefined) {
+        selector += `[data-${key}="${CSS.escape(element.dataset[key])}"]`;
+      }
+    }
+    return selector;
+  }
+  return null;
+}
+
+function currentDevicePhase() {
+  return String(state.snapshot?.device?.status?.state || "unknown").toLowerCase();
+}
+
+function armIsAvailable() {
+  return state.hostAvailable !== false
+    && state.snapshot?.connection?.state === "connected"
+    && currentDevicePhase() === "idle"
+    && !state.snapshot?.session
+    && !state.snapshot?.pending_capture;
 }
 
 function homeView() {
@@ -243,12 +511,37 @@ function homeView() {
   if (inventory?.has_unknown_pours) warnings.push("<li>One or more raw-pulse events have unknown volume and need review.</li>");
   if (decimal(inventory?.remaining_ml) < 0) warnings.push(`<li class="danger-text">Inventory overrun: ${formatVolume(Math.abs(decimal(inventory.remaining_ml)))} beyond the configured keg volume.</li>`);
   const participants = s.participants || [];
+  const devicePhase = currentDevicePhase();
+  const unattributedFlow = !s.session && ["pouring", "settling"].includes(devicePhase);
+  const readyToArm = armIsAvailable();
+  const phaseLabel = devicePhase === "unknown"
+    ? "Unknown"
+    : `${devicePhase.charAt(0).toUpperCase()}${devicePhase.slice(1).replaceAll("_", " ")}`;
+  const deviceDetail = state.hostAvailable === false
+    ? "The host cannot confirm current hardware state. This is the last received phase."
+    : s.connection?.state !== "connected"
+      ? `The flow device is ${s.connection?.state || "offline"}; new pours cannot be armed.`
+      : unattributedFlow
+        ? "Unattributed flow is being counted from raw device pulses. New participant selection is blocked until this event finishes."
+        : devicePhase === "idle"
+          ? "Connected and ready to arm a participant or Guest pour."
+          : `The device is ${devicePhase.replaceAll("_", " ")}; new participant selection is blocked.`;
+  const title = unattributedFlow ? "Unattributed flow in progress" : readyToArm ? "Ready for a pour?" : "KegPulse is not ready to arm";
+  const subtitle = unattributedFlow
+    ? "The tap opened without a selected participant. KegPulse is preserving the measurement."
+    : readyToArm ? "Select a person before opening the tap, or choose Guest." : "Review the visible device state before opening the tap.";
+  const armDisabled = state.pending.has("arm") || !readyToArm;
   const buttons = participants.map((participant) => `
-    <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" ${state.pending.has("arm") ? "disabled" : ""}>
+    <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>
       ${escapeHtml(participant.display_name)}
     </button>`).join("");
-  return page("Ready for a pour?", "Select a person before opening the tap, or choose Guest.", `
+  return page(title, subtitle, `
     ${warnings.length ? `<aside class="card setup-callout" aria-labelledby="setup-title"><h2 id="setup-title">Setup and review</h2><ul>${warnings.join("")}</ul></aside>` : ""}
+    <section class="card device-phase-card ${unattributedFlow ? "active" : ""}" aria-labelledby="home-device-title">
+      <h2 id="home-device-title">Flow device</h2>
+      <div class="device-phase">${escapeHtml(phaseLabel)}</div>
+      <p id="home-device-detail">${escapeHtml(deviceDetail)}</p>
+    </section>
     <div class="grid two">
       <section class="card" aria-labelledby="keg-title">
         <h2 id="keg-title">${escapeHtml(s.keg?.label || "No current keg")}</h2>
@@ -265,7 +558,7 @@ function homeView() {
       <h2 id="people-title">Who is pouring?</h2>
       <div class="participant-grid">
         ${buttons}
-        <button class="participant-button guest" data-action="arm" data-participant="" ${state.pending.has("arm") ? "disabled" : ""}>${participants.length === 0 ? "Start pour" : "Guest / Unattributed"}</button>
+        <button class="participant-button guest" data-action="arm" data-participant="" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>${participants.length === 0 ? "Start pour" : "Guest / Unattributed"}</button>
       </div>
       ${participants.length === 0 ? '<p class="muted">No profiles yet. “Start pour” records an unattributed event; you can assign it later.</p>' : ""}
     </section>
@@ -274,32 +567,40 @@ function homeView() {
 
 function pourView() {
   const s = state.snapshot;
-  const session = s.session || s.pending_capture;
+  const session = s.session || s.pending_capture || s.terminal_notice;
   if (!session) return page("No active pour", "The device has no active session.", '<a class="button" href="#/">Return home</a>');
   const participant = s.participants.find((item) => item.id === session.participant_id);
   const purpose = session.purpose || "pour";
-  const status = session.status === "complete"
-    ? "complete"
-    : (s.device?.status?.state || session.status);
+  const terminalStatus = ["complete", "timed_out", "interrupted_uncertain"].includes(session.status);
+  const status = terminalStatus ? session.status : (s.device?.status?.state || session.status);
   const volume = s.live_volume_ml;
   const pulses = s.device?.status?.pulses ?? session.captured_raw_pulses ?? 0;
   const afterFlow = decimal(pulses) > 0 || ["pouring", "settling", "finalizing", "complete"].includes(status);
   const title = purpose === "calibration"
     ? `Calibration sample ${session.target_ordinal}`
-    : purpose === "verification" ? "Verification pour" : (participant?.display_name || "Guest / Unattributed");
+    : purpose === "verification" ? "Verification pour"
+      : status === "timed_out" ? "Arming timed out"
+        : status === "interrupted_uncertain" ? "Connection interrupted"
+        : (participant?.display_name || "Guest / Unattributed");
   const cancelLabel = afterFlow ? "End and save partial pour" : "Cancel arming";
+  const armLeft = Math.max(0, decimal(s.device?.status?.arm_left));
+  const countdown = status === "armed"
+    ? `${Math.ceil(armLeft / 1000)} seconds left to open the tap`
+    : `${pulses} raw pulses`;
   const note = status === "armed" ? "Open the tap before the arming window expires." :
     status === "pouring" ? "Flow detected. Raw pulses are being counted on the device." :
     status === "settling" ? "Flow paused. You may briefly resume before completion." :
     status === "complete" ? "Measurement captured. Enter the scale mass to continue." :
+    status === "timed_out" ? "No pulse arrived before the deadline, so no pour was recorded." :
+    status === "interrupted_uncertain" ? "The device became unavailable before the host could confirm the outcome. No pulses were invented or discarded; review diagnostics and history after reconnecting." :
     "Waiting for the authoritative device state.";
   return `<section class="pour-screen"><div class="pour-panel card">
     <p class="pour-state">${escapeHtml(status)}</p>
     <h1 tabindex="-1">${escapeHtml(title)}</h1>
-    <div class="pour-amount">${formatVolume(volume)}</div>
-    <p class="countdown">${escapeHtml(pulses)} raw pulses</p>
+    ${["timed_out", "interrupted_uncertain"].includes(status) ? `<div class="pour-amount">${status === "timed_out" ? "No flow" : "Needs review"}</div>` : `<output class="pour-amount" aria-label="Measured pour volume">${formatVolume(volume)}</output>`}
+    <p class="countdown" aria-live="polite">${escapeHtml(countdown)}</p>
     <p>${escapeHtml(note)}</p>
-    ${status === "complete" && purpose !== "pour" ? '<a class="button" href="#/calibration">Enter scale mass</a>' : `
+    ${["timed_out", "interrupted_uncertain"].includes(status) ? '<button data-action="dismiss-terminal">Return home</button>' : status === "complete" && purpose !== "pour" ? '<a class="button" href="#/calibration">Enter scale mass</a>' : `
       <button class="${afterFlow ? "danger" : "secondary"}" data-action="cancel" ${state.pending.has("cancel") ? "disabled" : ""}>${cancelLabel}</button>`}
   </div></section>`;
 }
@@ -314,7 +615,7 @@ function completionView() {
       <div class="metric">${formatVolume(pour.volume_ml)}</div>
       <p>${escapeHtml(pour.participant_name || "Guest / Unattributed")} · ${escapeHtml(pour.raw_pulses)} raw pulses</p>
       ${warning ? `<p class="warning-text">Review needed: ${escapeHtml(pour.quality.replaceAll("_", " "))}. Counted pulses were retained.</p>` : '<p class="good-text">Complete measurement saved.</p>'}
-      <p id="return-countdown" class="muted">Returning home shortly. Interaction pauses auto-return.</p>
+      <p id="return-countdown" class="muted">${state.completionPaused ? "Auto-return paused." : "Returning home shortly. Interaction pauses auto-return."}</p>
       <div class="button-row"><button data-action="home-now">Return home</button><button class="secondary" data-action="stay">Stay here</button></div>
     </section>`);
 }
@@ -324,6 +625,13 @@ function scheduleCompletionReturn() {
   if (state.completionPaused) return;
   const seconds = Number(state.snapshot?.settings?.completion_seconds ?? 9);
   if (seconds > 0) state.completionTimer = window.setTimeout(() => navigate("/"), seconds * 1000);
+}
+
+function pauseCompletionReturn() {
+  state.completionPaused = true;
+  window.clearTimeout(state.completionTimer);
+  const message = document.querySelector("#return-countdown");
+  if (message) message.textContent = "Auto-return paused.";
 }
 
 function historyView() {
@@ -341,9 +649,36 @@ function historyView() {
 
 function historyRows(rows) {
   if (!rows.length) return '<p class="empty">No matching pours.</p>';
+  const action = (row) => row.participant_id
+    ? "Assigned"
+    : state.reassignPourId === row.id
+      ? reassignmentEditor(row)
+      : `<button class="secondary" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button>`;
   return `<div class="table-wrap"><table><thead><tr><th>When</th><th>Person</th><th>Amount</th><th>Evidence</th><th>Action</th></tr></thead><tbody>${rows.map((row) => `
-    <tr><td>${formatTime(row.ended_at)}</td><td>${escapeHtml(row.participant_name || "Guest / Unattributed")}</td><td>${formatVolume(row.volume_ml)}</td><td>${escapeHtml(row.raw_pulses)} pulses<br>${escapeHtml(row.quality.replaceAll("_", " "))}</td><td>${row.participant_id ? "Assigned" : `<button class="secondary" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button>`}</td></tr>`).join("")}</tbody></table></div>
-    <div class="sample-cards">${rows.map((row) => `<article class="sample-card"><strong>${formatVolume(row.volume_ml)}</strong><br>${escapeHtml(row.participant_name || "Guest / Unattributed")}<br><span class="muted">${formatTime(row.ended_at)} · ${escapeHtml(row.raw_pulses)} pulses</span>${row.participant_id ? "" : `<div><button class="secondary" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button></div>`}</article>`).join("")}</div>`;
+    <tr><td>${formatTime(row.ended_at)}</td><td>${escapeHtml(row.participant_name || "Guest / Unattributed")}</td><td>${formatVolume(row.volume_ml)}</td><td>${escapeHtml(row.raw_pulses)} pulses<br>${escapeHtml(row.quality.replaceAll("_", " "))}${pourDetails(row)}</td><td>${action(row)}</td></tr>`).join("")}</tbody></table></div>
+    <div class="sample-cards">${rows.map((row) => `<article class="sample-card"><strong>${formatVolume(row.volume_ml)}</strong><br>${escapeHtml(row.participant_name || "Guest / Unattributed")}<br><span class="muted">${formatTime(row.ended_at)} · ${escapeHtml(row.raw_pulses)} pulses · ${escapeHtml(row.quality.replaceAll("_", " "))}</span>${pourDetails(row)}${action(row)}</article>`).join("")}</div>`;
+}
+
+function pourDetails(row) {
+  return `<details class="pour-details"><summary>Measurement details</summary><dl class="status-list">
+    <dt>Started</dt><dd>${formatTime(row.started_at)}</dd><dt>Ended</dt><dd>${formatTime(row.ended_at)}</dd>
+    <dt>Keg</dt><dd>${escapeHtml(row.keg_label || row.keg_id || "Not assigned")}</dd>
+    <dt>Calibration</dt><dd>${escapeHtml(row.calibration_id || "No active calibration")}</dd>
+    <dt>Device</dt><dd>${escapeHtml(row.device_id)} / ${escapeHtml(row.boot_id)}</dd>
+    <dt>Event</dt><dd>${escapeHtml(row.event_seq ?? "Recovered counter evidence")}</dd>
+    <dt>Fault</dt><dd>${escapeHtml(row.fault || "none")}</dd>
+  </dl></details>`;
+}
+
+function reassignmentEditor(row) {
+  const options = (state.snapshot.participants || []).map((participant) =>
+    `<option value="${escapeHtml(participant.id)}">${escapeHtml(participant.display_name)}</option>`
+  ).join("");
+  return `<form class="reassign-form stack" data-pour="${escapeHtml(row.id)}">
+    <label>Assign participant<select name="participant_id" required><option value="">Choose a person</option>${options}</select></label>
+    <label>Reason<input name="reason" maxlength="500" value="Confirmed by administrator" required></label>
+    <div class="button-row"><button>Review assignment</button><button type="button" class="secondary" data-action="cancel-reassign">Cancel</button></div>
+  </form>`;
 }
 
 function kegView() {
@@ -356,7 +691,7 @@ function kegView() {
         ${decimal(inventory?.remaining_ml) < 0 ? `<p class="danger-text">Overrun: ${formatVolume(Math.abs(decimal(inventory.remaining_ml)))}. Review calibration and adjustments.</p>` : ""}
         ${inventory?.has_unknown_pours ? '<p class="warning-text">Unknown-volume raw pulse evidence exists and is not silently deducted.</p>' : ""}` : '<p class="empty">No keg installed.</p>'}</section>
       <section class="card"><h2>${keg ? "Replace keg" : "Install first keg"}</h2>
-        <form id="keg-form" class="stack"><label>Label<input name="label" maxlength="120" required autocomplete="off"></label><label>Starting volume (mL)<input name="starting_volume_ml" type="number" inputmode="decimal" min="1" max="200000" step="0.1" required></label><label>Notes (optional)<textarea name="notes" maxlength="1000"></textarea></label><button>${keg ? "Review and replace" : "Install keg"}</button></form>
+        <form id="keg-form" class="stack"><label>Label<input name="label" maxlength="120" required autocomplete="off"></label><label>Starting volume (mL)<input name="starting_volume_ml" type="number" inputmode="decimal" min="1" max="200000" step="0.1" required></label><label>Installed at<input name="installed_at" type="datetime-local" step="0.001" value="${localDateTimeInput()}" required><span class="field-help">Recorded with this kiosk's time zone and stored in UTC.</span></label><label>Notes (optional)<textarea name="notes" maxlength="1000"></textarea></label><button>${keg ? "Review and replace" : "Install keg"}</button></form>
       </section>
     </div>
     ${keg ? `<section class="card"><h2>Manual inventory adjustment</h2><form id="adjustment-form" class="grid two"><label>Signed amount (mL)<input name="amount_ml" type="number" inputmode="decimal" step="0.1" min="-200000" max="200000" required><span class="field-help">Positive adds inventory; negative removes it.</span></label><label>Reason<input name="reason" maxlength="500" required></label><button>Review adjustment</button></form></section>` : ""}
@@ -365,19 +700,43 @@ function kegView() {
 
 function sampleReview(detail) {
   const analysis = detail.analysis;
+  const editable = detail.status === "draft";
   const rows = detail.samples.map((sample, index) => {
     const a = analysis?.samples?.[index];
     const flagged = a?.suspected_outlier || sample.suspected_outlier;
-    return `<tr class="${flagged ? "outlier" : ""}"><td>${sample.ordinal}</td><td>${sample.raw_pulses}</td><td>${sample.mass_g} g</td><td>${Number(sample.derived_volume_ml).toFixed(2)} mL</td><td>${a ? Number(a.residual_ml).toFixed(2) : "—"} mL</td><td>${flagged ? "Suspected outlier" : "Consistent"}</td><td><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></td></tr>`;
+    const consistency = !sample.included
+      ? flagged ? "Excluded — suspected outlier" : "Excluded by user"
+      : flagged ? "Suspected outlier" : "Consistent";
+    const predicted = a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—";
+    const residual = a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—";
+    const action = editable
+      ? `<td><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></td>`
+      : "";
+    return `<tr class="${flagged ? "outlier" : !sample.included ? "excluded" : ""}"><td>${sample.ordinal}</td><td>${sample.raw_pulses}</td><td>${sample.mass_g} g</td><td>${Number(sample.derived_volume_ml).toFixed(2)} mL</td><td>${predicted}</td><td>${residual}</td><td>${consistency}</td>${action}</tr>`;
   }).join("");
   const cards = detail.samples.map((sample, index) => {
     const a = analysis?.samples?.[index];
     const flagged = a?.suspected_outlier || sample.suspected_outlier;
-    return `<article class="sample-card ${flagged ? "outlier" : ""}"><strong>Sample ${sample.ordinal}</strong><br>${sample.raw_pulses} pulses · ${sample.mass_g} g<br>${flagged ? '<span class="warning-text">Suspected outlier</span>' : "Consistent"}<div><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></div></article>`;
+    const consistency = !sample.included
+      ? flagged ? "Excluded — suspected outlier" : "Excluded by user"
+      : flagged ? "Suspected outlier" : "Consistent";
+    const consistencyClass = flagged ? "warning-text" : sample.included ? "good-text" : "muted";
+    const action = editable
+      ? `<div><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></div>`
+      : "";
+    return `<article class="sample-card ${flagged ? "outlier" : !sample.included ? "excluded" : ""}"><strong>Sample ${sample.ordinal}</strong><p>${sample.raw_pulses} pulses · ${sample.mass_g} g</p><dl class="sample-metrics"><dt>Actual scale volume</dt><dd>${Number(sample.derived_volume_ml).toFixed(2)} mL</dd><dt>Predicted volume</dt><dd>${a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—"}</dd><dt>Residual / error</dt><dd>${a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—"}</dd></dl><p class="${consistencyClass}">${consistency}</p>${action}</article>`;
   }).join("");
-  return `<section class="card"><h2>Sample review</h2><p>${detail.samples.length}/10 captured · ${analysis?.included_count ?? detail.samples.filter((x) => x.included).length} included. Suspected outliers remain included until you decide.</p>
-    <div class="table-wrap"><table><thead><tr><th>#</th><th>Pulses</th><th>Mass</th><th>Scale volume</th><th>Residual</th><th>Consistency</th><th>Include</th></tr></thead><tbody>${rows}</tbody></table></div><div class="sample-cards">${cards}</div>
-    ${analysis ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%</p><button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>'}
+  const guidance = editable
+    ? "Suspected outliers remain included until you decide."
+    : `This ${escapeHtml(detail.status)} calibration is read-only; its inclusion decisions are preserved.`;
+  const analysisSummary = analysis
+    ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%</p>${editable ? `<button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : ""}`
+    : editable
+      ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>'
+      : "";
+  return `<section class="card"><h2>Sample review</h2><p>${detail.samples.length}/10 captured · ${analysis?.included_count ?? detail.samples.filter((x) => x.included).length} included. ${guidance}</p>
+    <div class="table-wrap"><table><thead><tr><th>#</th><th>Pulses</th><th>Mass</th><th>Actual scale volume</th><th>Predicted volume</th><th>Residual / error</th><th>Consistency</th>${editable ? "<th>Use sample</th>" : ""}</tr></thead><tbody>${rows}</tbody></table></div><div class="sample-cards">${cards}</div>
+    ${analysisSummary}
   </section>`;
 }
 
@@ -385,9 +744,12 @@ function calibrationView() {
   const active = state.snapshot.active_calibration;
   const capture = state.snapshot.pending_capture;
   const verification = state.snapshot.last_verification;
+  const captureDensity = capture?.density_g_per_ml
+    || state.calibrationDetails?.find((item) => item.id === capture?.calibration_id)?.default_density_g_per_ml
+    || "1.000";
   return page("Calibration & verification", "Use a tared scale. Mass ÷ density gives volume; KegPulse uses total pulses ÷ total volume.", `
     <section class="card setup-callout"><h2>Ten-pour procedure</h2><ol class="step-list"><li>Tare an empty glass on the scale.</li><li>Use water at 1.000 g/mL first, then repeat with the installed keg and known/approximate beer density.</li><li>Capture ten varied-size pours; enter the scale mass after each.</li><li>Review residuals and explicitly include or exclude suspected outliers.</li><li>Activate only after reviewing the aggregate factor.</li></ol><p class="warning-text">Density directly affects volume. KegPulse is not a legal-for-trade meter.</p></section>
-    ${capture?.status === "complete" ? `<section class="card"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.000" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>` : ""}
+    ${capture?.status === "complete" ? `<section class="card"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>` : ""}
     ${verification ? `<section class="card ${verification.warning ? "outlier" : ""}"><h2>Latest verification</h2><dl class="status-list"><dt>Predicted</dt><dd>${formatVolume(verification.predicted_volume_ml)}</dd><dt>Scale volume</dt><dd>${formatVolume(verification.actual_volume_ml)}</dd><dt>Absolute error</dt><dd>${formatVolume(verification.absolute_error_ml)}</dd><dt>Percentage error</dt><dd>${Number(verification.percentage_error).toFixed(2)}%</dd></dl><p class="${verification.warning ? "warning-text" : "good-text"}">${verification.warning ? "Drift warning: investigate sensor, flow conditions, tubing, or calibration. The factor was not changed." : "Verification is within the configured warning threshold."}</p></section>` : ""}
     <div class="grid two">
       <section class="card"><h2>Active calibration</h2>${active ? `<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active. Complete a run below.</p>'}</section>
@@ -400,7 +762,7 @@ function calibrationView() {
 }
 
 function calibrationRuns(details) {
-  return details.map((detail) => `<article class="card"><h2>${escapeHtml(detail.liquid)} · ${escapeHtml(detail.status)}</h2><p>Created ${formatTime(detail.created_at)}</p>${detail.status === "draft" && detail.samples.length < 10 ? `<button data-action="capture-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${detail.samples.length + 1}">Capture sample ${detail.samples.length + 1}</button>` : ""}${detail.samples.length ? sampleReview(detail) : '<p class="empty">No samples captured yet.</p>'}</article>`).join("");
+  return details.map((detail) => `<article class="card" data-calibration-status="${escapeHtml(detail.status)}"><h2>${escapeHtml(detail.liquid)} · ${escapeHtml(detail.status)}</h2><p>Created ${formatTime(detail.created_at)}</p>${detail.status === "draft" && detail.samples.length < 10 ? `<button data-action="capture-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${detail.samples.length + 1}">Capture sample ${detail.samples.length + 1}</button>` : ""}${detail.samples.length ? sampleReview(detail) : '<p class="empty">No samples captured yet.</p>'}</article>`).join("");
 }
 
 function participantsView() {
@@ -417,11 +779,22 @@ function participantList(items) {
 function settingsView() {
   const s = state.snapshot;
   const device = s.device;
+  const portOptions = (state.serialPorts || []).map((port) => `<option value="${escapeHtml(port.device)}">${escapeHtml(port.description)}</option>`).join("");
+  const diagnosticRows = state.diagnostics === null
+    ? '<button data-action="load-diagnostics" class="secondary">Load recent diagnostics</button>'
+    : state.diagnostics.length
+      ? `<ol class="diagnostic-list">${state.diagnostics.map((item) => `<li><strong>${escapeHtml(item.level)} · ${escapeHtml(item.code)}</strong><br><span class="muted">${formatTime(item.created_at)}</span><br><code>${escapeHtml(JSON.stringify(item.context || {}))}</code></li>`).join("")}</ol>`
+      : '<p class="empty">No recent diagnostics.</p>';
+  const timingSource = s.mode === "demo"
+    ? "host simulator setting"
+    : "host reference only; actual firmware value is compile-time and not reported by KP1";
   return page("Device & settings", "Hardware state and recovery information stay visible. LAN mode is configured offline and requires a PIN.", `
-    <div class="grid two"><section class="card"><h2>Flow device</h2><dl class="status-list"><dt>Connection</dt><dd>${escapeHtml(s.connection.state)} — ${escapeHtml(s.connection.detail)}</dd><dt>Protocol</dt><dd>${escapeHtml(device.identity.proto || "—")}</dd><dt>Firmware</dt><dd>${escapeHtml(device.identity.fw || "—")}</dd><dt>Device ID</dt><dd>${escapeHtml(device.identity.device || "—")}</dd><dt>Boot ID</dt><dd>${escapeHtml(device.identity.boot || "—")}</dd><dt>State</dt><dd>${escapeHtml(device.status.state || "—")}</dd><dt>Lifetime pulses</dt><dd>${escapeHtml(device.status.lifetime || "0")}</dd><dt>Recovered pulses</dt><dd>${escapeHtml(device.counters?.recovery || "0")}</dd><dt>Device fault</dt><dd>${escapeHtml(device.counters?.fault || "none")}</dd><dt>Rejected noise edges</dt><dd>${escapeHtml(device.counters?.rejected || "0")}</dd><dt>Noise gate</dt><dd>${escapeHtml(device.counters?.noise_gate_us || "0")} µs</dd><dt>Queue overflows</dt><dd>${escapeHtml(s.connection.queue_overflows)}</dd></dl><button data-action="load-ports" class="secondary">Scan serial ports</button><div id="port-results">${state.serialPorts === null ? "" : state.serialPorts.length ? `<ul>${state.serialPorts.map((p) => `<li>${escapeHtml(p.device)} — ${escapeHtml(p.description)}</li>`).join("")}</ul>` : '<p class="empty">No serial ports detected.</p>'}</div></section>
-    <section class="card"><h2>Display</h2><form id="settings-form" class="stack"><label>Units<select name="display_units"><option value="us_fl_oz" ${s.settings.display_units === "us_fl_oz" ? "selected" : ""}>US fl oz</option><option value="ml" ${s.settings.display_units === "ml" ? "selected" : ""}>mL</option><option value="l" ${s.settings.display_units === "l" ? "selected" : ""}>Liters</option></select></label><label>Completion display (seconds)<input name="completion_seconds" type="number" min="0" max="60" value="${escapeHtml(s.settings.completion_seconds)}"></label><label>Verification warning (%)<input name="verification_warning_pct" type="number" min="0.1" max="100" step="0.1" value="${escapeHtml(s.settings.verification_warning_pct)}"></label><button>Save settings</button></form></section></div>
-    <div class="grid two"><section class="card"><h2>Administrator PIN</h2><p>${state.security?.pin_configured ? "A PIN protects administrative actions." : "No PIN is configured. Anyone with physical access to this loopback kiosk can administer it."}</p>${state.security?.authenticated ? '<p class="good-text">Administrator unlocked for this session.</p>' : '<p class="warning-text">Administrator locked.</p>'}<form id="pin-form" class="stack"><label>${state.security?.pin_configured ? "New PIN" : "PIN"}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>${state.security?.pin_configured ? "Change PIN" : "Set PIN"}</button></form>${state.security?.pin_configured && !state.security?.authenticated ? '<form id="login-form" class="stack"><label>Unlock with PIN<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="current-password" required></label><button>Unlock administrator</button></form>' : ""}</section>
-    <section class="card"><h2>Data & privacy</h2><p>Database, logs, backups, and exports remain on this device. Backups are not encrypted; store them securely.</p><button data-action="backup">Create atomic backup</button><a class="button secondary" href="/api-docs">Local API schema</a><p>Network mode: <strong>${s.settings?.lan_mode ? "trusted LAN" : "loopback only"}</strong>. No telemetry or cloud dependency.</p></section></div>
+    ${s.settings?.lan_mode ? '<aside class="banner warning" role="status"><strong>Trusted-LAN mode is active.</strong> Traffic is plain HTTP on the trusted network; an administrator PIN and exact allowlists are required.</aside>' : ""}
+    <div class="grid two"><section class="card"><h2>Flow device</h2><dl class="status-list"><dt>Connection</dt><dd>${escapeHtml(s.connection.state)} — ${escapeHtml(s.connection.detail)}</dd><dt>Protocol</dt><dd>${escapeHtml(device.identity.proto || "—")}</dd><dt>Firmware</dt><dd>${escapeHtml(device.identity.fw || "—")}</dd><dt>Device ID</dt><dd>${escapeHtml(device.identity.device || "—")}</dd><dt>Boot ID</dt><dd>${escapeHtml(device.identity.boot || "—")}</dd><dt>State</dt><dd>${escapeHtml(device.status.state || "—")}</dd><dt>Lifetime pulses</dt><dd>${escapeHtml(device.status.lifetime || "0")}</dd><dt>Recovered pulses</dt><dd>${escapeHtml(device.counters?.recovery || "0")}</dd><dt>Device fault</dt><dd>${escapeHtml(device.counters?.fault || "none")}</dd><dt>Rejected noise edges</dt><dd>${escapeHtml(device.counters?.rejected || "0")}</dd><dt>Noise gate</dt><dd>${escapeHtml(device.counters?.noise_gate_us || "0")} µs</dd><dt>Host flow-gap default</dt><dd>${escapeHtml(s.settings.flow_gap_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Host settling default</dt><dd>${escapeHtml(s.settings.settling_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Queue overflows</dt><dd>${escapeHtml(s.connection.queue_overflows)}</dd></dl><div class="button-row"><button data-action="load-ports" class="secondary">Scan serial ports</button>${s.mode === "hardware" ? '<button data-action="serial-reconnect" class="secondary">Reconnect device</button>' : ""}</div><div id="port-results">${state.serialPorts === null ? "" : state.serialPorts.length ? `<ul>${state.serialPorts.map((p) => `<li>${escapeHtml(p.device)} — ${escapeHtml(p.description)}</li>`).join("")}</ul>` : '<p class="empty">No serial ports detected.</p>'}</div></section>
+    <section class="card"><h2>Display & timing</h2><form id="settings-form" class="stack"><label>Units<select name="display_units"><option value="us_fl_oz" ${s.settings.display_units === "us_fl_oz" ? "selected" : ""}>US fl oz</option><option value="ml" ${s.settings.display_units === "ml" ? "selected" : ""}>mL</option><option value="l" ${s.settings.display_units === "l" ? "selected" : ""}>Liters</option></select></label><label>Completion display (seconds)<input name="completion_seconds" type="number" min="0" max="60" value="${escapeHtml(s.settings.completion_seconds)}"></label><label>Arming timeout (milliseconds)<input name="arm_timeout_ms" type="number" min="1000" max="120000" step="100" value="${escapeHtml(s.settings.arm_timeout_ms)}"></label><label>Verification warning (%)<input name="verification_warning_pct" type="number" min="0.1" max="100" step="0.1" value="${escapeHtml(s.settings.verification_warning_pct)}"></label>${s.mode === "hardware" ? `<label>Preferred serial port<input name="serial_port" list="serial-port-options" maxlength="260" value="${escapeHtml(s.settings.serial_port || "")}" placeholder="Auto-detect after handshake"><span class="field-help">Choose a scanned port or enter a COM or /dev path. Save, then reconnect.</span></label><datalist id="serial-port-options">${portOptions}</datalist>` : ""}<button>Save settings</button></form></section></div>
+    <div class="grid two"><section class="card"><h2>Administrator PIN</h2><p>${state.security?.pin_configured ? "A PIN protects administrative actions." : "No PIN is configured. Anyone with physical access to this loopback kiosk can administer it."}</p><p id="admin-auth-status" class="${state.security?.authenticated ? "good-text" : "warning-text"}" role="status">${state.security?.authenticated ? "Administrator unlocked for this session." : "Administrator locked."}</p><form id="pin-form" class="stack"><label>${state.security?.pin_configured ? "New PIN" : "PIN"}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>${state.security?.pin_configured ? "Change PIN" : "Set PIN"}</button></form><div id="admin-login-slot">${state.security?.pin_configured && !state.security?.authenticated ? loginFormMarkup(true) : ""}</div></section>
+    <section class="card"><h2>Data & privacy</h2><p>Database, rotating logs, backups, and exports remain on this device. Backups are not encrypted; store them securely.</p><button data-action="backup">Create atomic backup</button><a class="button secondary" href="/api-docs">Local API schema</a><p>Network mode: <strong>${s.settings?.lan_mode ? "trusted LAN" : "loopback only"}</strong>. No telemetry or cloud dependency.</p></section></div>
+    <section class="card"><h2>Recent device diagnostics</h2><p>Bounded local recovery and protocol events; routine personal pour history is not logged here.</p>${diagnosticRows}</section>
     ${s.mode === "demo" ? demoPanel() : ""}
   `);
 }
@@ -431,20 +804,34 @@ function demoPanel() {
 }
 
 function loginView() {
-  return page("Administrator login", "This device requires a PIN before local data and controls are shown.", `<section class="card"><form id="login-form" class="stack"><label>Admin PIN<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="current-password" required></label><button>Unlock KegPulse</button></form></section>`);
+  return page("Administrator login", "This device requires a PIN before local data and controls are shown.", `<section class="card">${loginFormMarkup()}</section>`);
 }
 
 function render() {
+  const priorFocus = focusSelector(document.activeElement);
+  const priorSelection = document.activeElement instanceof HTMLInputElement
+    ? [document.activeElement.selectionStart, document.activeElement.selectionEnd]
+    : null;
   if (!state.snapshot) {
-    if (state.security?.lan_mode && !state.security?.authenticated) {
+    if (state.hostAvailable === false) {
+      const message = state.hostError instanceof Error ? state.hostError.message : "Waiting for the local service.";
+      main.innerHTML = page("KegPulse service unavailable", "The browser cannot confirm hardware or data while the local service is down.", `<section class="card"><p>${escapeHtml(message)}</p><button data-action="retry">Try again</button></section>`);
+      bindForms();
+      main.querySelector("h1")?.focus({ preventScroll: true });
+      state.renderedRoute = "__unavailable__";
+    } else if (state.security?.lan_mode && !state.security?.authenticated) {
       main.innerHTML = loginView();
       bindForms();
       main.querySelector("h1")?.focus({ preventScroll: true });
+      state.renderedRoute = "__login__";
     }
+    syncHostControls();
     return;
   }
-  const shouldFocus = state.renderedRoute !== route();
-  if (state.snapshot.settings?.lan_mode && !state.security?.authenticated) {
+  const loginRequired = state.snapshot.settings?.lan_mode && !state.security?.authenticated;
+  const renderKey = loginRequired ? "__login__" : route();
+  const shouldFocus = state.renderedRoute !== renderKey;
+  if (loginRequired) {
     main.innerHTML = loginView();
   } else {
     const current = route();
@@ -459,11 +846,25 @@ function render() {
     else main.innerHTML = page("Not found", "That screen does not exist.", '<a class="button" href="#/">Return home</a>');
   }
   bindForms();
-  if (shouldFocus) main.querySelector("h1")?.focus({ preventScroll: true });
-  state.renderedRoute = route();
+  if (shouldFocus) {
+    main.querySelector("h1")?.focus({ preventScroll: true });
+  } else if (priorFocus) {
+    const candidates = [...main.querySelectorAll(priorFocus)];
+    const replacement = candidates.find((item) => item.offsetParent !== null) || candidates[0];
+    replacement?.focus({ preventScroll: true });
+    if (replacement instanceof HTMLInputElement && priorSelection && priorSelection[0] !== null) {
+      replacement.setSelectionRange(priorSelection[0], priorSelection[1]);
+    }
+  }
+  state.renderedRoute = renderKey;
+  syncHostControls();
 }
 
 async function arm(participantId) {
+  if (!armIsAvailable()) {
+    showError("The flow device is not idle and ready. Wait for the visible device state to recover before arming.");
+    return;
+  }
   try {
     await mutation("arm", "/api/v1/sessions/arm", { participant_id: participantId || null, idempotency_key: uuidKey() });
     navigate("/pour");
@@ -491,12 +892,8 @@ async function loadHistory() {
 }
 
 async function showReassign(pourId) {
-  const names = state.snapshot.participants.map((p) => `${p.display_name} (${p.id})`).join("\n");
-  const chosen = window.prompt(`Enter participant ID:\n${names}`);
-  if (!chosen) return;
-  const reason = window.prompt("Reason for reassignment:", "Confirmed by administrator");
-  if (!reason) return;
-  try { await mutation(`assign-${pourId}`, `/api/v1/history/${pourId}/reassign`, { participant_id: chosen.trim(), reason }); await loadHistory(); } catch (error) { showError(error); }
+  state.reassignPourId = pourId;
+  render();
 }
 
 async function loadCalibrations() {
@@ -526,6 +923,19 @@ async function demo(action, values = {}) {
   try { await mutation(`demo-${action}`, "/api/v1/demo/action", { action, ...values }); } catch (error) { showError(error); }
 }
 
+function bindLoginForm() {
+  document.querySelector("#login-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); const form = new FormData(event.currentTarget);
+    try {
+      state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin: form.get("pin") }) });
+      await refresh();
+      syncSecurityUi();
+      if (!state.socket) connectSocket();
+      showToast("Administrator unlocked");
+    } catch (error) { showError(error); }
+  });
+}
+
 function bindForms() {
   document.querySelector("#participant-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -535,7 +945,7 @@ function bindForms() {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     const accepted = await confirmAction("The current keg will be closed and preserved in history. Install this new keg?", "Install keg");
     if (!accepted) return;
-    try { await mutation("keg", "/api/v1/kegs/replace", { label: form.get("label"), starting_volume_ml: form.get("starting_volume_ml"), notes: form.get("notes") }); showToast("Keg installed"); } catch (error) { showError(error); }
+    try { await mutation("keg", "/api/v1/kegs/replace", { label: form.get("label"), starting_volume_ml: form.get("starting_volume_ml"), installed_at: new Date(form.get("installed_at")).toISOString(), notes: form.get("notes") }); showToast("Keg installed"); } catch (error) { showError(error); }
   });
   document.querySelector("#adjustment-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -555,19 +965,34 @@ function bindForms() {
   });
   document.querySelector("#settings-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    try { await mutation("settings", "/api/v1/settings", { display_units: form.get("display_units"), completion_seconds: Number(form.get("completion_seconds")), verification_warning_pct: form.get("verification_warning_pct") }, "PATCH"); showToast("Settings saved"); } catch (error) { showError(error); }
+    const payload = { display_units: form.get("display_units"), completion_seconds: Number(form.get("completion_seconds")), arm_timeout_ms: Number(form.get("arm_timeout_ms")), verification_warning_pct: form.get("verification_warning_pct") };
+    if (form.has("serial_port")) {
+      const serialPort = String(form.get("serial_port") || "").trim();
+      payload.serial_port = serialPort || null;
+    }
+    try { const result = await mutation("settings", "/api/v1/settings", payload, "PATCH"); showToast(result?.serial_reconnect_required ? "Settings saved. Reconnect the device to apply the selected port." : "Settings saved"); } catch (error) { showError(error); }
   });
   document.querySelector("#pin-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try { await mutation("pin", "/api/v1/security/pin", { pin: form.get("pin") }, "PUT"); state.security = await api("/api/v1/security/context"); showToast("Administrator PIN updated; unlock again with the new PIN"); render(); } catch (error) { showError(error); }
   });
-  document.querySelector("#login-form")?.addEventListener("submit", async (event) => {
-    event.preventDefault(); const form = new FormData(event.currentTarget);
-    try { state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin: form.get("pin") }) }); await refresh(); if (!state.socket) connectSocket(); showToast("Administrator unlocked"); } catch (error) { showError(error); }
-  });
+  bindLoginForm();
   for (const form of document.querySelectorAll(".participant-edit")) form.addEventListener("submit", async (event) => {
     event.preventDefault(); const element = event.currentTarget; const data = new FormData(element);
     try { await mutation(`profile-${element.dataset.id}`, `/api/v1/participants/${element.dataset.id}`, { display_name: data.get("display_name"), active: data.get("active") !== null }, "PATCH"); await loadParticipants(); } catch (error) { showError(error); }
+  });
+  for (const form of document.querySelectorAll(".reassign-form")) form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const element = event.currentTarget;
+    const data = new FormData(element);
+    const participant = element.querySelector("select")?.selectedOptions[0]?.textContent || "the selected participant";
+    const accepted = await confirmAction(`Assign this measured pour to ${participant}? Volume and timestamps will not change.`, "Assign pour");
+    if (!accepted) return;
+    try {
+      await mutation(`assign-${element.dataset.pour}`, `/api/v1/history/${element.dataset.pour}/reassign`, { participant_id: data.get("participant_id"), reason: data.get("reason") });
+      state.reassignPourId = null;
+      await loadHistory();
+    } catch (error) { showError(error); }
   });
 }
 
@@ -579,12 +1004,17 @@ main.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-action]"); if (!button) return;
   const action = button.dataset.action;
   if (action === "retry") return window.location.reload();
+  if (action === "dismiss-terminal") {
+    state.dismissedTerminalId = state.snapshot?.terminal_notice?.session_id || "dismissed";
+    return navigate("/");
+  }
   if (action === "arm") return arm(button.dataset.participant);
   if (action === "cancel") return cancelPour();
   if (action === "home-now") { state.completionPaused = false; return navigate("/"); }
-  if (action === "stay") { state.completionPaused = true; window.clearTimeout(state.completionTimer); document.querySelector("#return-countdown")?.classList.add("hidden"); return; }
+  if (action === "stay") { pauseCompletionReturn(); return; }
   if (action === "load-history") return loadHistory();
   if (action === "show-reassign") return showReassign(button.dataset.pour);
+  if (action === "cancel-reassign") { state.reassignPourId = null; render(); return; }
   if (action === "load-calibrations") return loadCalibrations();
   if (action === "capture-sample") return captureSample(button.dataset.calibration, button.dataset.ordinal);
   if (action === "toggle-sample") { try { await mutation(`sample-${button.dataset.ordinal}`, `/api/v1/calibrations/${button.dataset.calibration}/samples/${button.dataset.ordinal}`, { included: button.dataset.included === "1" }, "PATCH"); await loadCalibrations(); } catch (error) { showError(error); } return; }
@@ -592,6 +1022,8 @@ main.addEventListener("click", async (event) => {
   if (action === "start-verification") return startVerification();
   if (action === "load-participants") return loadParticipants();
   if (action === "load-ports") { try { state.serialPorts = await api("/api/v1/serial/ports"); render(); } catch (error) { showError(error); } return; }
+  if (action === "serial-reconnect") { try { await mutation("serial-reconnect", "/api/v1/serial/reconnect"); showToast("Device reconnect requested"); } catch (error) { showError(error); } return; }
+  if (action === "load-diagnostics") { try { state.diagnostics = await api("/api/v1/diagnostics?limit=100"); render(); } catch (error) { showError(error); } return; }
   if (action === "backup") { try { const result = await mutation("backup", "/api/v1/backup"); showToast(`Backup created: ${result.filename}`); } catch (error) { showError(error); } return; }
   if (action === "demo-pulse") return demo("pulse", { count: Number(button.dataset.count) });
   if (action === "demo-finish") return demo("finish");
@@ -604,14 +1036,13 @@ main.addEventListener("click", async (event) => {
 
 main.addEventListener("focusin", (event) => {
   if (route() === "/complete" && event.target.matches("button, a, input, select, textarea")) {
-    state.completionPaused = true;
-    window.clearTimeout(state.completionTimer);
+    pauseCompletionReturn();
   }
 });
 main.addEventListener("change", (event) => {
   if (event.target.matches("#history-filter")) loadHistory();
 });
-document.addEventListener("pointerdown", () => { if (route() === "/complete") state.completionPaused = true; }, { passive: true });
+document.addEventListener("pointerdown", () => { if (route() === "/complete") pauseCompletionReturn(); }, { passive: true });
 
 menuButton.addEventListener("click", () => {
   const open = !nav.classList.contains("open");
@@ -619,22 +1050,36 @@ menuButton.addEventListener("click", () => {
   menuButton.setAttribute("aria-expanded", String(open));
 });
 nav.addEventListener("click", () => { nav.classList.remove("open"); menuButton.setAttribute("aria-expanded", "false"); });
-window.addEventListener("hashchange", () => { state.completionPaused = false; render(); updateChrome(); });
+window.addEventListener("hashchange", () => {
+  state.completionPaused = false;
+  render();
+  updateChrome();
+  if (route() === "/history") void loadHistory();
+});
+window.addEventListener("offline", () => {
+  setHostAvailability(false, new Error("The kiosk network connection is offline."));
+  startPolling();
+  if (state.socket && state.socket.readyState < WebSocket.CLOSING) state.socket.close();
+});
+window.addEventListener("online", () => { void refresh(); });
 
 async function initialize() {
   try {
-    state.security = await api("/api/v1/security/context");
+    state.security = await refreshSecurityContext();
     if (state.security.lan_mode && !state.security.authenticated) {
-      render();
+      enterLoginMode();
     } else {
-      await refresh();
-      connectSocket();
+      const ready = await refresh();
+      if (ready) {
+        if (route() === "/history") await loadHistory();
+        connectSocket();
+      }
     }
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => {});
   } catch (error) {
-    main.innerHTML = page("KegPulse service unavailable", "The browser cannot confirm hardware or data while the local service is down.", `<section class="card"><p>${escapeHtml(error.message)}</p><button data-action="retry">Try again</button></section>`);
+    setHostAvailability(false, error);
     startPolling();
   }
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => {});
 }
 
 initialize();

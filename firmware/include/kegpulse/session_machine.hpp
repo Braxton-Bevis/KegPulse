@@ -46,6 +46,7 @@ struct Snapshot {
   bool attributed;
   uint64_t session_pulses;
   uint64_t lifetime_pulses;
+  uint32_t arm_remaining_ms;
   uint32_t next_sequence;
   uint8_t retained_results;
   uint64_t recovery_pulses;
@@ -63,10 +64,13 @@ class SessionMachine {
                       uint32_t now_ms, bool* duplicate, bool* produced_result);
   MachineError add_pulses(uint32_t count, uint32_t captured_ms,
                           bool* produced_result);
+  MachineError add_pulse_batch(uint32_t count, uint32_t first_captured_ms,
+                               uint32_t last_captured_ms,
+                               bool* produced_result);
   MachineError tick(uint32_t now_ms, bool* produced_result);
   MachineError mark_counter_saturated(uint32_t now_ms, bool* produced_result);
   MachineError acknowledge(uint32_t sequence, bool* already);
-  Snapshot snapshot() const;
+  Snapshot snapshot(uint32_t now_ms) const;
   const Result* result_at(uint8_t index) const;
   uint8_t result_count() const { return result_count_; }
 

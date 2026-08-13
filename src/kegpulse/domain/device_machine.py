@@ -35,6 +35,7 @@ class DeviceStatus:
     session_pulses: int
     lifetime_pulses: int
     uptime_ms: int
+    arm_remaining_ms: int
     next_event_seq: int
     retained_results: int
     recovery_pulses: int
@@ -292,6 +293,13 @@ class DeviceSessionMachine:
         session_id = active.session_id if active else terminal.session_id if terminal else None
         attributed = active.attributed if active else terminal.attributed if terminal else False
         pulses = active.pulses if active else terminal.raw_pulses if terminal else 0
+        arm_remaining = 0
+        if (
+            active is not None
+            and active.state == DeviceState.ARMED
+            and active.arm_deadline_ms is not None
+        ):
+            arm_remaining = max(0, active.arm_deadline_ms - self._last_now_ms)
         return DeviceStatus(
             state=self.state,
             boot_id=self.boot_id,
@@ -301,6 +309,7 @@ class DeviceSessionMachine:
             session_pulses=pulses,
             lifetime_pulses=self.lifetime_pulses,
             uptime_ms=self._last_now_ms,
+            arm_remaining_ms=arm_remaining,
             next_event_seq=self.next_event_seq,
             retained_results=len(self.results),
             recovery_pulses=self.recovery_pulses,

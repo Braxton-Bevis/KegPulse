@@ -29,10 +29,17 @@ static constexpr kegpulse::Field k_arm_fields[] = {
     {"sid", "12345678123456781234567812345678"},
     {"ttl", "15000"},
 };
+
+static constexpr kegpulse::Field k_ack_fields[] = {
+    {"dev", "4B454750554C5345"},
+    {"boot", "0000000000000001"},
+    {"seq", "1"},
+};
 static constexpr GoldenVector k_vectors[] = {
     {"ping", 'Q', "12AB34CD", "PING", k_ping_fields, 1, "KP1|Q|12AB34CD|PING|nonce=42*CBA4\n"},
     {"status", 'Q', "00000001", "STATUS", nullptr, 0, "KP1|Q|00000001|STATUS*9E3E\n"},
     {"arm", 'Q', "00000002", "ARM", k_arm_fields, 4, "KP1|Q|00000002|ARM|boot=0000000000000001|seq=1|sid=12345678123456781234567812345678|ttl=15000*82D7\n"},
+    {"ack", 'Q', "00000003", "ACK", k_ack_fields, 3, "KP1|Q|00000003|ACK|dev=4B454750554C5345|boot=0000000000000001|seq=1*0C49\n"},
 };
 static constexpr size_t k_vector_count = sizeof(k_vectors) / sizeof(k_vectors[0]);
 
