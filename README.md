@@ -210,6 +210,15 @@ use the documented [Pi source deployment](docs/RASPBERRY_PI.md).
 - **Corrupt config/database:** copy the data directory first. Config rejects unknown/oversized data;
   restore only a validated KegPulse backup.
 
+## License
+
+KegPulse is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+It is free to use, modify, and share for any noncommercial purpose — personal
+projects, hobby kegerators, research, and education. **Commercial use is not
+permitted** without a separate license from the copyright holder.
+
+Copyright (c) 2026 Braxton Bevis.
+
 ## Documentation
 
 - [Execution outcomes](docs/EXECUTION_PLAN.md)
