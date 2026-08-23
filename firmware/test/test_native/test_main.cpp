@@ -147,12 +147,93 @@ void test_parser_recovers_after_oversize() {
   kegpulse::ParsedFrame frame{};
   kegpulse::ParseError error = kegpulse::ParseError::NONE;
   bool yielded = false;
-  for (size_t index = 0; index <= kegpulse::kMaxFrameBytes; ++index) {
+  for (size_t index = 0; index <= kegpulse::kMaxInboundFrameBytes; ++index) {
     yielded = parser.push('x', &frame, &error);
     TEST_ASSERT_FALSE(yielded);
   }
   TEST_ASSERT_TRUE(parser.push('\n', &frame, &error));
   TEST_ASSERT_EQUAL(kegpulse::ParseError::TOO_LONG, error);
+}
+
+void test_inbound_parser_accepts_boundary_and_recovers_after_oversize() {
+  const char* arm_fields_values[] = {
+      "FFFFFFFFFFFFFFFF",
+      "4294967295",
+      "ffffffffffffffffffffffffffffffff",
+      "4294967295",
+  };
+  kegpulse::Field arm_fields[] = {
+      {"boot", arm_fields_values[0]},
+      {"seq", arm_fields_values[1]},
+      {"sid", arm_fields_values[2]},
+      {"ttl", arm_fields_values[3]},
+  };
+  char encoded[kegpulse::kMaxFrameBytes + 1]{};
+  size_t written = 0;
+  TEST_ASSERT_TRUE(kegpulse::encode_frame(
+      encoded, sizeof(encoded), 'Q', "FFFFFFFF", "ARM", arm_fields, 4,
+      &written));
+  TEST_ASSERT_EQUAL_UINT32(113, written);
+
+  kegpulse::FrameParser parser;
+  kegpulse::ParsedFrame frame{};
+  kegpulse::ParseError error = kegpulse::ParseError::NONE;
+  bool yielded = false;
+  for (size_t index = 0; index < written; ++index) {
+    yielded = parser.push(encoded[index], &frame, &error);
+  }
+  TEST_ASSERT_TRUE(yielded);
+  TEST_ASSERT_EQUAL(kegpulse::ParseError::NONE, error);
+  TEST_ASSERT_EQUAL_STRING("ARM", frame.operation);
+  TEST_ASSERT_EQUAL_STRING("ffffffffffffffffffffffffffffffff", frame.get("sid"));
+
+  const char nonce[] =
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+  const char boundary_padding[] = "xxxxxxxxxxxxxxxxxxxxxxx";
+  kegpulse::Field boundary_fields[] = {
+      {"nonce", nonce},
+      {"padding", boundary_padding},
+  };
+  TEST_ASSERT_TRUE(kegpulse::encode_frame(encoded, sizeof(encoded), 'Q',
+                                          "FFFFFFFF", "PING",
+                                          boundary_fields, 2, &written));
+  TEST_ASSERT_EQUAL_UINT32(kegpulse::kMaxInboundFrameBytes, written);
+  yielded = false;
+  for (size_t index = 0; index < written; ++index) {
+    yielded = parser.push(encoded[index], &frame, &error);
+  }
+  TEST_ASSERT_TRUE(yielded);
+  TEST_ASSERT_EQUAL(kegpulse::ParseError::NONE, error);
+  TEST_ASSERT_EQUAL_STRING("PING", frame.operation);
+
+  const char oversized_padding[] = "xxxxxxxxxxxxxxxxxxxxxxxx";
+  kegpulse::Field oversized_fields[] = {
+      {"nonce", nonce},
+      {"padding", oversized_padding},
+  };
+  TEST_ASSERT_TRUE(kegpulse::encode_frame(encoded, sizeof(encoded), 'Q',
+                                          "FFFFFFFE", "PING",
+                                          oversized_fields, 2, &written));
+  TEST_ASSERT_EQUAL_UINT32(129, written);
+  yielded = false;
+  for (size_t index = 0; index < written; ++index) {
+    yielded = parser.push(encoded[index], &frame, &error);
+  }
+  TEST_ASSERT_TRUE(yielded);
+  TEST_ASSERT_EQUAL(kegpulse::ParseError::TOO_LONG, error);
+
+  kegpulse::Field ping_field{"nonce", "42"};
+  TEST_ASSERT_TRUE(kegpulse::encode_frame(encoded, sizeof(encoded), 'Q',
+                                          "FFFFFFFD", "PING", &ping_field, 1,
+                                          &written));
+  yielded = false;
+  for (size_t index = 0; index < written; ++index) {
+    yielded = parser.push(encoded[index], &frame, &error);
+  }
+  TEST_ASSERT_TRUE(yielded);
+  TEST_ASSERT_EQUAL(kegpulse::ParseError::NONE, error);
+  TEST_ASSERT_EQUAL_STRING("PING", frame.operation);
+  TEST_ASSERT_EQUAL_STRING("42", frame.get("nonce"));
 }
 
 void test_counters_command_and_worst_case_response_round_trip() {
@@ -407,6 +488,7 @@ int main(int, char**) {
   RUN_TEST(test_protocol_rejects_invalid_request_ids_and_duplicate_fields);
   RUN_TEST(test_upper_hex_identity_and_ack_wire_binding);
   RUN_TEST(test_parser_recovers_after_oversize);
+  RUN_TEST(test_inbound_parser_accepts_boundary_and_recovers_after_oversize);
   RUN_TEST(test_counters_command_and_worst_case_response_round_trip);
   RUN_TEST(test_worst_case_status_and_compact_result_fit_frame_limit);
   RUN_TEST(test_attributed_session_boundary_and_completion);

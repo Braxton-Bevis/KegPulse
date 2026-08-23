@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -34,17 +36,22 @@ from .api.models import (
     CapturedMeasurementRequest,
     DemoAction,
     DiagnosticResponse,
+    FundAdjustmentRequest,
     HealthResponse,
     InclusionRequest,
     InventoryAdjustmentResponse,
+    KegRemainingUpdate,
     KegRequest,
     KegResponse,
+    ManagementResponse,
+    ManagementSettingsUpdate,
     OkResponse,
     ParticipantCreate,
     ParticipantResponse,
     ParticipantUpdate,
     PinConfiguredResponse,
     PinRequest,
+    PourPhotoResponse,
     PourResponse,
     ReassignmentRequest,
     SecurityContextResponse,
@@ -178,6 +185,16 @@ def create_app(
         session = security.require_access(request)
         if security.pin_configured and (session is None or not session.admin):
             raise HTTPException(status_code=401, detail="administrator login required")
+
+    def management_admin(request: Request, *, mutation: bool = False) -> None:
+        if not security.pin_configured:
+            raise HTTPException(
+                status_code=409, detail="configure an administrator PIN before using management"
+            )
+        if mutation:
+            admin(request)
+        else:
+            admin_access(request)
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_request: Request, exc: NotFoundError) -> Response:
@@ -488,6 +505,113 @@ def create_app(
         result = repository.reassign_pour(pour_id, payload.participant_id, payload.reason)
         await coordinator.publish()
         return result
+
+    @app.post(
+        "/api/v1/calibrations/{calibration_id}/activate-provisional",
+        response_model=CalibrationResponse,
+    )
+    async def activate_provisional_calibration(
+        calibration_id: str, request: Request
+    ) -> dict[str, Any]:
+        admin(request)
+        result = repository.activate_provisional_calibration(calibration_id)
+        await coordinator.publish()
+        return result
+
+    @app.get("/api/v1/management", response_model=ManagementResponse)
+    async def management(request: Request) -> dict[str, Any]:
+        management_admin(request)
+        return repository.management_summary()
+
+    @app.patch("/api/v1/management/settings", response_model=ManagementResponse)
+    async def update_management_settings(
+        request: Request, payload: ManagementSettingsUpdate
+    ) -> dict[str, Any]:
+        management_admin(request, mutation=True)
+        if payload.price_per_fl_oz is not None:
+            cents = payload.price_per_fl_oz * 100
+            repository.set_setting("beer_price_cents_per_fl_oz", str(cents))
+        if payload.webcam_enabled is not None:
+            repository.set_setting("webcam_enabled", payload.webcam_enabled)
+        return repository.management_summary()
+
+    @app.post(
+        "/api/v1/management/participants/{participant_id}/funds",
+        response_model=ParticipantResponse,
+    )
+    async def adjust_funds(
+        participant_id: str, request: Request, payload: FundAdjustmentRequest
+    ) -> dict[str, Any]:
+        management_admin(request, mutation=True)
+        cents = int((payload.amount_dollars * 100).to_integral_exact())
+        result = repository.adjust_participant_balance(participant_id, cents, payload.reason)
+        await coordinator.publish()
+        return result
+
+    @app.post(
+        "/api/v1/management/keg/remaining",
+        response_model=InventoryAdjustmentResponse,
+    )
+    async def set_keg_remaining(request: Request, payload: KegRemainingUpdate) -> dict[str, Any]:
+        management_admin(request, mutation=True)
+        result = repository.set_current_keg_remaining_percent(
+            payload.percent_remaining, payload.reason
+        )
+        await coordinator.publish()
+        return result
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/photos",
+        status_code=201,
+        response_model=PourPhotoResponse,
+    )
+    async def upload_pour_photo(session_id: str, request: Request) -> dict[str, Any]:
+        operational(request)
+        if not repository.get_setting("webcam_enabled", False):
+            raise HTTPException(status_code=409, detail="pour camera is disabled")
+        if not request.headers.get("content-type", "").lower().startswith("image/jpeg"):
+            raise HTTPException(status_code=415, detail="pour photos must be JPEG images")
+        try:
+            canonical_session = str(uuid.UUID(session_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="pour session not found") from exc
+        body = await request.body()
+        if (
+            not 4 <= len(body) <= 61_440
+            or not body.startswith(b"\xff\xd8")
+            or not body.endswith(b"\xff\xd9")
+        ):
+            raise HTTPException(status_code=422, detail="invalid or oversized JPEG photo")
+        photo_name = f"{uuid.uuid4()}.jpg"
+        directory = paths.photos / canonical_session
+        directory.mkdir(parents=True, exist_ok=True)
+        relative = f"{canonical_session}/{photo_name}"
+        final_path = directory / photo_name
+        temporary = final_path.with_suffix(".tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, final_path)
+            if os.name != "nt":
+                final_path.chmod(0o600)
+            return repository.add_pour_photo(
+                canonical_session, relative, len(body), hashlib.sha256(body).hexdigest()
+            )
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            raise
+
+    @app.get("/api/v1/management/photos/{photo_id}", include_in_schema=False)
+    async def pour_photo(photo_id: str, request: Request) -> FileResponse:
+        management_admin(request)
+        photo = repository.get_pour_photo(photo_id)
+        path = (paths.photos / str(photo["relative_path"])).resolve()
+        if paths.photos.resolve() not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="pour photo file not found")
+        return FileResponse(path, media_type="image/jpeg")
 
     @app.get(
         "/api/v1/export.{format}",

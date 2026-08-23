@@ -17,7 +17,10 @@ crc = 4HEXDIG ; uppercase
 LF = %x0A ; an optional CR immediately before LF is accepted
 ```
 
-The maximum encoded frame is 256 bytes including LF. CRC is CRC-16/CCITT-FALSE: polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR. It covers bytes beginning with `K` and ending immediately before `*`.
+The maximum encoded device response is 256 bytes including LF. Nano-bound host requests are limited
+to 128 bytes including LF; the longest defined request is a maximum-width `ARM` at 113 bytes. CRC is
+CRC-16/CCITT-FALSE: polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR. It
+covers bytes beginning with `K` and ending immediately before `*`.
 
 `Q` is a host request, `R` a response or device result, and `E` an error. Keys may appear only once. Integers are unsigned base-10 unless a field says otherwise. Device and boot IDs are 16 uppercase hex digits; session IDs are UUIDs without hyphens (32 lowercase hex digits).
 
@@ -66,7 +69,7 @@ An error frame has operation `ERROR`, required fields `code` and `op`, and an op
 |---|---|
 | `MALFORMED` | Invalid framing, token, duplicate key, or field shape |
 | `BAD_CRC` | CRC did not match |
-| `TOO_LONG` | More than 256 bytes before LF |
+| `TOO_LONG` | An encoded Nano-bound request exceeds 128 bytes including LF, or another KP1 frame exceeds 256 bytes |
 | `UNSUPPORTED_VERSION` | Protocol range excludes KP1 |
 | `UNSUPPORTED` | Unknown command or unsupported optional behavior |
 | `BUSY` | Another active session or retained-result capacity prevents the command |
@@ -78,7 +81,8 @@ An error frame has operation `ERROR`, required fields `code` and `op`, and an op
 ## Parsing and replay rules
 
 - Bytes are accumulated until LF. Multiple frames in a read are split by LF; partial frames wait for more bytes.
-- When the maximum is exceeded, bytes are discarded through the next LF, one `TOO_LONG` condition is emitted, and parsing resumes.
+- When the applicable maximum is exceeded, bytes are discarded through the next LF, one `TOO_LONG`
+  condition is emitted, and parsing resumes.
 - Non-ASCII/control bytes, unknown versions, malformed CRCs, duplicate keys, missing fields, and overflowing integers are rejected deterministically.
 - Timing gaps do not delimit frames. A corrupted device response is ignored by the host and recovered with `STATUS`/`RESULTS`.
 - Request IDs correlate a response. Repeating the last identical state-changing request returns its semantic result with `already=1`.

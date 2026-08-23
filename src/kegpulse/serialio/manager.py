@@ -240,7 +240,11 @@ class DeviceManager:
                 delay = 0.25
                 self._connected_loop()
             except (TransportError, TimeoutError, OSError, ValueError) as exc:
-                LOGGER.warning("device connection unavailable: %s", type(exc).__name__)
+                LOGGER.warning(
+                    "device connection unavailable: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 self._set_state(ConnectionState.RECONNECTING, str(exc)[:200])
             finally:
                 if self._transport:

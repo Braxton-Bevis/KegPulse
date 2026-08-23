@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Hardened measurement integrity end to end: reduced Nano stack usage so protocol formatting cannot
+  overwrite the recovery counter, added host-side counter-relationship and pulse-rate-envelope
+  validation, and quarantined semantically invalid RESULT/COUNTERS/status frames as durable
+  measurement anomalies with acknowledgement so poisoned retained results cannot flood retries.
+- Migrated previously stored corrupt recovery pours out of pour history and inventory (schema v4),
+  preserving each raw reading as anomaly evidence and resetting only the poisoned recovery
+  checkpoints; the dashboard clamps out-of-envelope volume instead of rendering it.
+- Displayed pour volume in US fluid ounces, milliliters, and estimated grams during live flow,
+  completion, recent pours, and history.
+- Generalized explicit provisional calibration activation from exactly one sample to any partial
+  run (one to nine samples) using the included-sample aggregate factor, analyzed partial runs in
+  the review screen (predicted volume, residuals, MAD outlier flags from three included samples),
+  and stopped labeling unjudgeable samples "Consistent".
+
 ## 1.0.0 — 2026-08-12
 
 - Added the local-first FastAPI host, versioned SQLite persistence, bounded serial manager,

@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -64,6 +64,28 @@ def test_requires_ten_and_minimum_included() -> None:
     ]
     with pytest.raises(DomainError, match="at least seven"):
         analyze_calibration(samples)
+
+
+def test_partial_run_analyzes_with_relaxed_included_minimum() -> None:
+    # The exact three samples captured on 2026-08-18 while the D2 signal was noisy.
+    samples = [
+        make_sample(1878, 328, 1),
+        make_sample(1155, 38, 1),
+        make_sample(296, 192, 1),
+    ]
+    analysis = analyze_calibration(samples, require_ten=False)
+    assert analysis.included_count == 3
+    with localcontext() as context:
+        context.prec = 38
+        assert analysis.pulses_per_ml == Decimal(3329) / Decimal(558)
+    # Sample 2 (30.4 pulses/mL vs 5.7 and 1.5) must surface as a suspected outlier.
+    assert [item.suspected_outlier for item in analysis.samples] == [False, True, False]
+
+
+def test_partial_run_still_requires_an_included_sample() -> None:
+    samples = [make_sample(1878, 328, 1, included=False)]
+    with pytest.raises(DomainError, match="at least one"):
+        analyze_calibration(samples, require_ten=False)
 
 
 def test_conversion_and_verification() -> None:

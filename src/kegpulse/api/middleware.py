@@ -121,7 +121,7 @@ class RequestPolicyMiddleware:
                         (b"x-frame-options", b"DENY"),
                         (
                             b"permissions-policy",
-                            b"camera=(), microphone=(), geolocation=(), payment=()",
+                            b"camera=(self), microphone=(), geolocation=(), payment=()",
                         ),
                         (
                             b"content-security-policy",

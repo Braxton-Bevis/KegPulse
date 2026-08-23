@@ -234,7 +234,7 @@ bool FrameParser::push(char byte, ParsedFrame* output, ParseError* error) {
     }
     return false;
   }
-  if (length_ >= kMaxFrameBytes) {
+  if (length_ >= kMaxInboundFrameBytes) {
     length_ = 0;
     discarding_ = true;
     if (byte == '\n') {

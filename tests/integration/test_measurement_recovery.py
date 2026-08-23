@@ -50,6 +50,16 @@ def _configure_keg_and_calibration(repository: Repository) -> str:
     return str(keg["id"])
 
 
+def _counter_fields(recovery: int, *, accepted: int | None = None) -> dict[str, str]:
+    return {
+        "accepted": str(recovery if accepted is None else accepted),
+        "recovery": str(recovery),
+        "rejected": "0",
+        "noise_gate_us": "0",
+        "fault": "none",
+    }
+
+
 def _activate_calibration_with_factor(repository: Repository, pulses_per_ml: int) -> str:
     calibration = repository.create_calibration("water", Decimal("1.000"))
     for ordinal in range(1, 11):
@@ -105,6 +115,18 @@ class _QueuedManager(_ManagerStub):
         return drained
 
 
+class _AckManager(_ManagerStub):
+    def request(
+        self, operation: str, fields: dict[str, object] | None = None, *, timeout: float = 3
+    ) -> Frame:
+        del timeout
+        supplied = fields or {}
+        self.requests.append((operation, supplied))
+        if operation != "ACK":
+            raise AssertionError(f"unexpected device request: {operation}")
+        return Frame("R", "00000001", "ACK", {"already": "0"})
+
+
 class _ArmManager(_ManagerStub):
     def __init__(self, repository: Repository, arm_error: BaseException) -> None:
         self.device_id = "AAAAAAAAAAAAAAAA"
@@ -144,6 +166,7 @@ class _ArmManager(_ManagerStub):
             "state": "armed",
             "boot": self.boot_id,
             "sid": self.bound_at_arm["session_id"].replace("-", ""),
+            "pulses": "0",
             "lifetime": "100",
             "uptime": "500",
             "retained": "0",
@@ -178,12 +201,19 @@ async def test_hello_status_and_counters_failures_retry_without_stopping_event_t
                 "R",
                 "00000002",
                 "STATUS",
-                {"state": "pouring", "sid": session_hex, "boot": old_boot},
+                {
+                    "state": "pouring",
+                    "sid": session_hex,
+                    "boot": old_boot,
+                    "pulses": "0",
+                    "lifetime": "25",
+                    "uptime": "1234",
+                },
             ),
         ),
         ManagerEvent(
             "counters",
-            Frame("R", "00000003", "COUNTERS", {"recovery": "25"}),
+            Frame("R", "00000003", "COUNTERS", _counter_fields(25)),
             device_id=old_device,
             boot_id=old_boot,
             uptime_ms=1_234,
@@ -328,7 +358,7 @@ async def test_recovery_counter_uses_event_identity_and_is_exactly_once(
     )
     event = ManagerEvent(
         "counters",
-        Frame("R", "00000001", "COUNTERS", {"recovery": "25"}),
+        Frame("R", "00000001", "COUNTERS", _counter_fields(25)),
         device_id=old_device,
         boot_id=old_boot,
         uptime_ms=4_321,
@@ -351,6 +381,7 @@ async def test_recovery_counter_uses_event_identity_and_is_exactly_once(
                 "device_id": old_device,
                 "boot_id": old_boot,
                 "recovery_pulses": 25,
+                "accepted_pulses": 25,
                 "device_uptime_ms": 4_321,
                 "keg_id": None,
                 "calibration_id": None,
@@ -360,6 +391,7 @@ async def test_recovery_counter_uses_event_identity_and_is_exactly_once(
                 "device_id": old_device,
                 "boot_id": old_boot,
                 "recovery_pulses": 25,
+                "accepted_pulses": 25,
                 "device_uptime_ms": 4_321,
                 "keg_id": None,
                 "calibration_id": None,
@@ -389,6 +421,116 @@ async def test_recovery_counter_uses_event_identity_and_is_exactly_once(
 
 
 @pytest.mark.asyncio
+async def test_impossible_counter_is_quarantined_then_lower_valid_reading_recovers(
+    tmp_path: Path,
+) -> None:
+    database, repository = _open_repository(tmp_path)
+    _configure_keg_and_calibration(repository)
+    device_id = "4B454750554C5345"
+    boot_id = "00000000000004AC"
+    manager = _ManagerStub(identity={"device": device_id, "boot": boot_id})
+    coordinator = KegPulseCoordinator(
+        repository,
+        manager,  # type: ignore[arg-type]
+        AppConfig(no_browser=True),
+    )
+    corrupt = ManagerEvent(
+        "counters",
+        Frame(
+            "R",
+            "00000001",
+            "COUNTERS",
+            _counter_fields(3_688_509_900_321_862_200, accepted=18),
+        ),
+        device_id=device_id,
+        boot_id=boot_id,
+        uptime_ms=10_675,
+    )
+    corrected_baseline = ManagerEvent(
+        "counters",
+        Frame("R", "00000002", "COUNTERS", _counter_fields(0, accepted=18)),
+        device_id=device_id,
+        boot_id=boot_id,
+        uptime_ms=11_000,
+    )
+    valid_recovery = ManagerEvent(
+        "counters",
+        Frame("R", "00000003", "COUNTERS", _counter_fields(7, accepted=25)),
+        device_id=device_id,
+        boot_id=boot_id,
+        uptime_ms=12_000,
+    )
+
+    try:
+        await coordinator._process_event(corrupt)
+        await coordinator._process_event(corrupt)
+        assert repository.list_pours() == []
+        assert len(repository.list_measurement_anomalies()) == 1
+        assert not coordinator._event_retries
+
+        await coordinator._process_event(corrected_baseline)
+        await coordinator._process_event(valid_recovery)
+
+        pours = repository.list_pours()
+        assert len(pours) == 1
+        assert pours[0]["raw_pulses"] == 7
+        assert repository.inventory().remaining_ml == Decimal("998.6")
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_semantically_invalid_retained_result_is_quarantined_and_acked(
+    tmp_path: Path,
+) -> None:
+    database, repository = _open_repository(tmp_path)
+    device_id = "4B454750554C5345"
+    boot_id = "00000000000004AD"
+    manager = _AckManager(identity={"device": device_id, "boot": boot_id})
+    coordinator = KegPulseCoordinator(
+        repository,
+        manager,  # type: ignore[arg-type]
+        AppConfig(no_browser=True),
+    )
+    event = ManagerEvent(
+        "result",
+        Frame(
+            "R",
+            "00000000",
+            "RESULT",
+            {
+                "dev": device_id,
+                "boot": boot_id,
+                "seq": "1",
+                "sid": "none",
+                "attr": "0",
+                "st": "unknown",
+                "pulses": "18",
+                "life": "18",
+                "start": "1000",
+                "end": "2000",
+                "fault": "none",
+            },
+        ),
+        device_id=device_id,
+        boot_id=boot_id,
+    )
+
+    try:
+        await coordinator._process_event(event)
+        await coordinator._process_event(event)
+
+        assert repository.list_pours() == []
+        anomalies = repository.list_measurement_anomalies()
+        assert len(anomalies) == 1
+        assert anomalies[0]["source"] == "result"
+        assert [operation for operation, _ in manager.requests] == ["ACK", "ACK"]
+        assert not coordinator._event_retries
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
 async def test_delayed_measurements_keep_context_captured_before_keg_replacement(
     tmp_path: Path,
 ) -> None:
@@ -405,7 +547,7 @@ async def test_delayed_measurements_keep_context_captured_before_keg_replacement
     )
     counter_event = ManagerEvent(
         "counters",
-        Frame("R", "00000001", "COUNTERS", {"recovery": "25"}),
+        Frame("R", "00000001", "COUNTERS", _counter_fields(25)),
         device_id=old_device,
         boot_id=old_boot,
         uptime_ms=1_000,
@@ -545,7 +687,7 @@ async def test_counter_context_boundaries_commit_in_cumulative_order_after_failu
     boot_id = "BBBBBBBBBBBBBBBB"
     first = ManagerEvent(
         "counters",
-        Frame("R", "00000001", "COUNTERS", {"recovery": "10"}),
+        Frame("R", "00000001", "COUNTERS", _counter_fields(10)),
         device_id=device_id,
         boot_id=boot_id,
         uptime_ms=1_000,
@@ -557,7 +699,7 @@ async def test_counter_context_boundaries_commit_in_cumulative_order_after_failu
     new_calibration_id = _activate_calibration_with_factor(repository, 10)
     later = ManagerEvent(
         "counters",
-        Frame("R", "00000002", "COUNTERS", {"recovery": "20"}),
+        Frame("R", "00000002", "COUNTERS", _counter_fields(20)),
         device_id=device_id,
         boot_id=boot_id,
         uptime_ms=2_000,
@@ -775,6 +917,7 @@ async def test_same_boot_idle_positive_delta_is_recovered_once_and_decrements_in
             "state": "idle",
             "boot": "boot-a",
             "sid": "none",
+            "pulses": "0",
             "lifetime": "125",
             "uptime": "5000",
             "retained": "0",
@@ -858,6 +1001,7 @@ async def test_zero_lower_or_cross_boot_counters_never_invent_a_pour(
             "state": "idle",
             "boot": device_boot,
             "sid": "none",
+            "pulses": "0",
             "lifetime": str(device_lifetime),
             "uptime": "50",
             "retained": "0",

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900" role="img" aria-labelledby="title desc">
+  <title id="title">KegPulse Arduino Nano flow sensor wiring</title>
+  <desc id="desc">Three-wire hall flow sensor wired to Nano 5V, ground, and D2, with an optional ten kilo-ohm pull-up resistor between 5V and D2.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#f2b544"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="900" fill="#0d0f10"/>
+  <text x="70" y="80" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="42" font-weight="700">KegPulse flow sensor wiring</text>
+  <text x="70" y="122" fill="#a8afb2" font-family="Segoe UI, Arial, sans-serif" font-size="22">Use the sensor labels if its wire colors differ from the common colors shown here.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="205" width="370" height="445" rx="8" fill="#171a1c" stroke="#454c4f" stroke-width="3"/>
+    <text x="255" y="260" text-anchor="middle" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="700">3-wire flow sensor</text>
+    <circle cx="255" cy="420" r="105" fill="#22272a" stroke="#72c8ff" stroke-width="5"/>
+    <path d="M180 420 C210 350 300 350 330 420 C300 490 210 490 180 420 Z" fill="none" stroke="#72c8ff" stroke-width="7"/>
+    <circle cx="255" cy="420" r="25" fill="#72c8ff"/>
+    <line x1="130" y1="560" x2="355" y2="560" stroke="#f2b544" stroke-width="7" marker-end="url(#arrow)"/>
+    <text x="242" y="605" text-anchor="middle" fill="#f2b544" font-family="Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">Liquid follows arrow</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1000" y="185" width="330" height="485" rx="8" fill="#171a1c" stroke="#454c4f" stroke-width="3"/>
+    <text x="1165" y="245" text-anchor="middle" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="32" font-weight="700">Arduino Nano</text>
+    <rect x="1070" y="280" width="190" height="310" rx="8" fill="#176e57" stroke="#66d49e" stroke-width="4"/>
+    <rect x="1120" y="260" width="90" height="45" rx="4" fill="#b9c1c4"/>
+    <text x="1165" y="290" text-anchor="middle" fill="#111315" font-family="Segoe UI, Arial, sans-serif" font-size="18" font-weight="700">USB</text>
+    <circle cx="1030" cy="320" r="11" fill="#ff6565"/><text x="1060" y="329" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">5V</text>
+    <circle cx="1030" cy="455" r="11" fill="#f2b544"/><text x="1060" y="464" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">D2</text>
+    <circle cx="1030" cy="590" r="11" fill="#72c8ff"/><text x="1060" y="599" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">GND</text>
+  </g>
+
+  <text x="475" y="294" fill="#ff8a8a" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="700">VCC / + (often red or brown)</text>
+  <line x1="440" y1="320" x2="1030" y2="320" stroke="#ff6565" stroke-width="8"/>
+  <circle cx="730" cy="320" r="10" fill="#ff6565"/>
+
+  <text x="475" y="429" fill="#ffd078" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="700">SIGNAL / S (often yellow, green, or white)</text>
+  <line x1="440" y1="455" x2="1030" y2="455" stroke="#f2b544" stroke-width="8"/>
+  <circle cx="730" cy="455" r="10" fill="#f2b544"/>
+
+  <text x="475" y="564" fill="#9ddcff" font-family="Segoe UI, Arial, sans-serif" font-size="23" font-weight="700">GND / - (often black or blue)</text>
+  <line x1="440" y1="590" x2="1030" y2="590" stroke="#72c8ff" stroke-width="8"/>
+
+  <g>
+    <line x1="730" y1="320" x2="730" y2="350" stroke="#e7a93b" stroke-width="5"/>
+    <polyline points="730,350 710,362 750,378 710,394 750,410 710,426 730,438" fill="none" stroke="#e7a93b" stroke-width="5" stroke-linejoin="round"/>
+    <line x1="730" y1="438" x2="730" y2="455" stroke="#e7a93b" stroke-width="5"/>
+    <rect x="770" y="480" width="200" height="70" rx="6" fill="#22272a" stroke="#e7a93b" stroke-width="2"/>
+    <text x="870" y="510" text-anchor="middle" fill="#ffd078" font-family="Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">10K resistor</text>
+    <text x="870" y="538" text-anchor="middle" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="18">Either direction</text>
+  </g>
+
+  <rect x="70" y="710" width="1260" height="135" rx="8" fill="#171a1c" stroke="#3f7159" stroke-width="3"/>
+  <text x="105" y="755" fill="#66d49e" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="700">Quick pulse test</text>
+  <text x="105" y="797" fill="#f5f2ea" font-family="Segoe UI, Arial, sans-serif" font-size="22">With power on, briefly touch D2 to GND, then release. Repeat several times. Each touch should count one pulse.</text>
+  <text x="105" y="827" fill="#ff8a8a" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="700">Never connect 5V directly to GND. Do not replace the 10K resistor with a plain wire.</text>
+</svg>

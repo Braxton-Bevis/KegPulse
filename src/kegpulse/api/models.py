@@ -109,6 +109,29 @@ class PinRequest(ApiModel):
     pin: str = Field(min_length=6, max_length=20, pattern=r"^[0-9]+$")
 
 
+class ManagementSettingsUpdate(ApiModel):
+    price_per_fl_oz: Decimal | None = Field(
+        default=None, ge=Decimal("0"), le=Decimal("1000"), decimal_places=2
+    )
+    webcam_enabled: bool | None = None
+
+
+class FundAdjustmentRequest(ApiModel):
+    amount_dollars: Decimal = Field(ge=Decimal("-100000"), le=Decimal("100000"), decimal_places=2)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def nonzero_amount(self) -> FundAdjustmentRequest:
+        if self.amount_dollars == 0:
+            raise ValueError("amount_dollars must be nonzero")
+        return self
+
+
+class KegRemainingUpdate(ApiModel):
+    percent_remaining: Decimal = Field(ge=Decimal("0"), le=Decimal("100"), decimal_places=2)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class DemoAction(ApiModel):
     action: Literal[
         "pulse", "advance", "finish", "disconnect", "reconnect", "reset", "fault", "flush", "script"
@@ -159,6 +182,37 @@ class ParticipantResponse(ResponseModel):
     active: int
     created_at: str
     updated_at: str
+    balance_cents: int = 0
+
+
+class AccountLedgerResponse(ResponseModel):
+    id: str
+    participant_id: str
+    participant_name: str
+    amount_cents: int
+    kind: Literal["adjustment", "charge", "refund"]
+    pour_id: str | None = None
+    reason: str
+    balance_after_cents: int
+    created_at: str
+
+
+class PourPhotoResponse(ResponseModel):
+    id: str
+    session_id: str
+    captured_at: str
+    size_bytes: int
+    sha256: str | None = None
+    pour_id: str | None = None
+    participant_name: str | None = None
+
+
+class ManagementResponse(ResponseModel):
+    price_cents_per_fl_oz: str
+    webcam_enabled: bool
+    participants: list[ParticipantResponse]
+    ledger: list[AccountLedgerResponse]
+    photos: list[PourPhotoResponse]
 
 
 class KegResponse(ResponseModel):
@@ -277,6 +331,7 @@ class PourResponse(ResponseModel):
     created_at: str
     participant_name: str | None = None
     keg_label: str | None = None
+    calibration_density_g_per_ml: str | None = None
 
 
 class InventoryResponse(ResponseModel):

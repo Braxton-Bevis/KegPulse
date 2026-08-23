@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -49,6 +49,62 @@ def test_participants_keg_adjustment_and_overrun(repository: Repository) -> None
     assert repository.list_participants(active_only=True) == []
 
 
+def test_admin_can_set_current_keg_to_audited_remaining_percentage(
+    repository: Repository,
+) -> None:
+    keg = repository.replace_keg("Partially full keg", 10_000)
+    correction = repository.set_current_keg_remaining_percent(
+        Decimal("90"), "Starting with a partial keg"
+    )
+    inventory = repository.inventory(keg["id"])
+
+    assert correction["amount_ml"] == "-1000"
+    assert correction["reason"] == "Starting with a partial keg"
+    assert inventory is not None
+    assert inventory.remaining_ml == Decimal("9000")
+    assert inventory.percent_remaining == Decimal("90")
+
+
+def test_completed_pour_debits_stored_price_and_preserves_ledger(repository: Repository) -> None:
+    participant = repository.create_participant("Account holder")
+    repository.adjust_participant_balance(participant["id"], 2500, "Opening funds")
+    calibration = repository.create_calibration("water", 1)
+    for ordinal in range(1, 11):
+        repository.add_calibration_sample(calibration["id"], ordinal, ordinal * 5, ordinal, 1)
+    repository.activate_calibration(calibration["id"])
+    repository.set_setting("beer_price_cents_per_fl_oz", "50")
+    session, _ = repository.create_provisional(participant["id"], "priced-pour-session")
+    repository.bind_provisional(session["session_id"], "device", "boot", 1, 0)
+
+    pour, duplicate = repository.finalize_device_result(
+        DeviceResult(
+            "device",
+            "boot",
+            1,
+            session["session_id"],
+            True,
+            DeviceState.COMPLETE,
+            1479,
+            1479,
+            10,
+            1000,
+        )
+    )
+
+    assert not duplicate
+    assert pour is not None
+    summary = repository.management_summary()
+    account = next(item for item in summary["participants"] if item["id"] == participant["id"])
+    assert account["balance_cents"] == 2000
+    assert [entry["amount_cents"] for entry in summary["ledger"][:2]] == [-500, 2500]
+    with repository.db.read() as connection:
+        charge = connection.execute(
+            "SELECT * FROM pour_charges WHERE pour_id=?", (pour["id"],)
+        ).fetchone()
+    assert charge["rate_cents_per_fl_oz"] == "50"
+    assert charge["amount_cents"] == 500
+
+
 def create_active_calibration(repository: Repository) -> dict[str, object]:
     calibration = repository.create_calibration("water", 1)
     for ordinal in range(1, 11):
@@ -58,6 +114,71 @@ def create_active_calibration(repository: Repository) -> dict[str, object]:
     detail = repository.calibration_detail(calibration["id"])
     assert detail["analysis"]["pulses_per_ml"] == "5"
     return repository.activate_calibration(calibration["id"])
+
+
+def test_one_sample_calibration_can_be_explicitly_activated_as_provisional(
+    repository: Repository,
+) -> None:
+    calibration = repository.create_calibration("water", 1)
+    repository.add_calibration_sample(calibration["id"], 1, 397, 75, 1)
+
+    active = repository.activate_provisional_calibration(calibration["id"])
+
+    assert active["status"] == "active"
+    with localcontext() as context:
+        context.prec = 38
+        assert Decimal(active["pulses_per_ml"]) == Decimal(397) / Decimal(75)
+    assert "[PROVISIONAL:" in active["notes"]
+
+
+def test_partial_run_activates_as_provisional_using_included_samples(
+    repository: Repository,
+) -> None:
+    calibration = repository.create_calibration("water", 1)
+    repository.add_calibration_sample(calibration["id"], 1, 1878, 328, 1)
+    repository.add_calibration_sample(calibration["id"], 2, 1155, 38, 1)
+    repository.add_calibration_sample(calibration["id"], 3, 296, 192, 1)
+
+    active = repository.activate_provisional_calibration(calibration["id"])
+
+    assert active["status"] == "active"
+    with localcontext() as context:
+        context.prec = 38
+        assert Decimal(active["pulses_per_ml"]) == Decimal(3329) / Decimal(558)
+    assert "[PROVISIONAL: estimate from 3 included samples" in active["notes"]
+
+
+def test_partial_run_provisional_activation_honors_exclusions(
+    repository: Repository,
+) -> None:
+    calibration = repository.create_calibration("water", 1)
+    repository.add_calibration_sample(calibration["id"], 1, 1878, 328, 1)
+    repository.add_calibration_sample(calibration["id"], 2, 1155, 38, 1)
+    repository.add_calibration_sample(calibration["id"], 3, 296, 192, 1)
+    repository.set_sample_included(calibration["id"], 2, False)
+
+    active = repository.activate_provisional_calibration(calibration["id"])
+
+    with localcontext() as context:
+        context.prec = 38
+        assert Decimal(active["pulses_per_ml"]) == Decimal(1878 + 296) / Decimal(328 + 192)
+    assert "[PROVISIONAL: estimate from 2 included samples" in active["notes"]
+
+
+def test_partial_run_detail_flags_wild_sample_as_outlier(repository: Repository) -> None:
+    calibration = repository.create_calibration("water", 1)
+    repository.add_calibration_sample(calibration["id"], 1, 1878, 328, 1)
+    repository.add_calibration_sample(calibration["id"], 2, 1155, 38, 1)
+    repository.add_calibration_sample(calibration["id"], 3, 296, 192, 1)
+
+    detail = repository.calibration_detail(calibration["id"])
+
+    assert detail["analysis"] is not None
+    assert detail["analysis"]["included_count"] == 3
+    flags = [item["suspected_outlier"] for item in detail["analysis"]["samples"]]
+    assert flags == [False, True, False]
+    stored_flags = [bool(row["suspected_outlier"]) for row in detail["samples"]]
+    assert stored_flags == [False, True, False]
 
 
 def test_calibration_version_samples_and_verification(repository: Repository) -> None:
@@ -101,6 +222,8 @@ def test_finalize_is_idempotent_and_preserves_historical_factor(repository: Repo
     assert first["keg_id"] == keg["id"]
     inventory = repository.inventory()
     assert inventory and inventory.remaining_ml == Decimal(900)
+    listed = repository.list_pours(limit=1)[0]
+    assert listed["calibration_density_g_per_ml"] == "1"
 
 
 def test_unattributed_interrupted_and_timeout_paths(repository: Repository) -> None:
@@ -245,7 +368,9 @@ def test_reassignment_is_audited(repository: Repository) -> None:
     assert pour
     assigned = repository.reassign_pour(pour["id"], participant["id"], "Confirmed by host")
     assert assigned["participant_id"] == participant["id"]
+    assert assigned["participant_name"] == "Taylor"
     assert assigned["volume_ml"] == pour["volume_ml"]
+    assert assigned["calibration_density_g_per_ml"] == "1"
     with repository.db.read() as connection:
         assert connection.execute("SELECT count(*) FROM attribution_audit").fetchone()[0] == 1
 

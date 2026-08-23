@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-    <meta name="theme-color" content="#14231d">
+    <meta name="theme-color" content="#111315">
     <meta name="description" content="Local-first keg flow monitor">
     <title>KegPulse</title>
     <link rel="manifest" href="/manifest.webmanifest">
@@ -19,6 +19,9 @@
       </a>
       <div class="header-status" aria-live="polite" aria-atomic="true">
         <span id="connection-badge" class="badge neutral">● Starting</span>
+        <span id="keg-battery" class="keg-battery hidden" role="img" aria-label="Keg level unavailable">
+          <span class="keg-battery-body"><span class="keg-battery-fill"></span><span class="keg-battery-value">--%</span></span>
+        </span>
         <span id="keg-summary">No keg configured</span>
       </div>
       <button id="menu-button" class="icon-button" type="button" aria-expanded="false" aria-controls="site-nav">
@@ -30,6 +33,7 @@
         <a href="#/keg">Keg</a>
         <a href="#/calibration">Calibration</a>
         <a href="#/participants">People</a>
+        <a href="#/management">Management</a>
         <a href="#/settings">Device &amp; settings</a>
       </nav>
     </header>

@@ -87,8 +87,13 @@ def analyze_calibration(
     if require_ten and len(values) != MIN_SAMPLES:
         raise DomainError("a calibration run requires exactly ten samples")
     included = [sample for sample in values if sample.included]
-    if len(included) < MIN_INCLUDED_SAMPLES:
-        raise DomainError("at least seven samples must be included")
+    minimum_included = MIN_INCLUDED_SAMPLES if require_ten else 1
+    if len(included) < minimum_included:
+        raise DomainError(
+            "at least seven samples must be included"
+            if require_ten
+            else "at least one sample must be included"
+        )
     with localcontext() as context:
         context.prec = 38
         total_pulses = sum((Decimal(sample.raw_pulses) for sample in included), Decimal(0))

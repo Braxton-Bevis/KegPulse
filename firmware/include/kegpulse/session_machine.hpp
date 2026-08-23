@@ -7,6 +7,7 @@ namespace kegpulse {
 
 constexpr uint8_t kResultCapacity = 4;
 constexpr uint64_t kMaxResultPulses = UINT64_C(0x7FFFFFFFFFFFFFFF);
+constexpr size_t kFaultCapacity = 18;
 
 enum class DeviceState : uint8_t {
   IDLE,
@@ -36,13 +37,13 @@ struct Result {
   uint64_t lifetime;
   uint32_t started_ms;
   uint32_t ended_ms;
-  char fault[24];
+  char fault[kFaultCapacity];
 };
 
 struct Snapshot {
   DeviceState state;
   uint32_t sequence;
-  char session_id[33];
+  const char* session_id;
   bool attributed;
   uint64_t session_pulses;
   uint64_t lifetime_pulses;
@@ -72,7 +73,9 @@ class SessionMachine {
   MachineError acknowledge(uint32_t sequence, bool* already);
   Snapshot snapshot(uint32_t now_ms) const;
   const Result* result_at(uint8_t index) const;
-  uint8_t result_count() const { return result_count_; }
+  uint8_t result_count() const {
+    return result_count_ <= kResultCapacity ? result_count_ : kResultCapacity;
+  }
 
  private:
   struct Active {
@@ -93,6 +96,7 @@ class SessionMachine {
   MachineError allocate_sequence(uint32_t* sequence);
   MachineError finalize(DeviceState status, uint32_t ended_ms,
                         const char* fault);
+  void add_recovery_pulses(uint32_t count);
   void copy_session(char destination[33], const char* source) const;
 
   uint32_t arm_timeout_ms_;

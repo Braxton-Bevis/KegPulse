@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 from collections import deque
@@ -10,8 +12,15 @@ from decimal import Decimal
 from typing import Any
 
 from kegpulse.config import AppConfig
-from kegpulse.domain.errors import ConflictError
+from kegpulse.domain.errors import ConflictError, MeasurementRejectedError
 from kegpulse.domain.models import DeviceResult, DeviceState
+from kegpulse.domain.pulse_integrity import (
+    CounterSnapshot,
+    elapsed_u32,
+    ensure_plausible_pulse_count,
+    parse_counter_snapshot,
+    parse_status_pulse_snapshot,
+)
 from kegpulse.domain.reconciliation import ReconciliationAction, reconcile_provisional
 from kegpulse.persistence.repository import Repository
 from kegpulse.serialio.manager import (
@@ -309,6 +318,10 @@ class KegPulseCoordinator:
         if event.kind == "result" and event.frame:
             try:
                 result = self._device_result(event.frame.fields)
+            except ValueError as exc:
+                await self._quarantine_invalid_result(event, str(exc))
+                return
+            try:
                 captured_device = event.device_id or result.device_id
                 captured_boot = event.boot_id or result.boot_id
                 if result.device_id != captured_device or result.boot_id != captured_boot:
@@ -319,6 +332,9 @@ class KegPulseCoordinator:
                     calibration_id=event.calibration_id,
                     context_captured=event.context_captured,
                 )
+            except MeasurementRejectedError as exc:
+                await self._quarantine_invalid_result(event, str(exc))
+                return
             except Exception as exc:
                 LOGGER.exception("device result could not be committed")
                 self._diagnostic("error", "result_commit_failed", {"type": type(exc).__name__})
@@ -359,6 +375,11 @@ class KegPulseCoordinator:
                 LOGGER.warning("device result committed but ACK is pending: %s", type(exc).__name__)
                 self._diagnostic("warning", "ack_pending", {"event_seq": result.event_seq})
         elif event.kind == "status" and event.frame:
+            try:
+                parse_status_pulse_snapshot(event.frame.fields)
+            except MeasurementRejectedError as exc:
+                self._quarantine_status(event, str(exc))
+                return
             current_identity = self.manager.identity
             if event.frame.fields.get("boot") == current_identity.get("boot"):
                 await self._mirror_session_state(event.frame.fields)
@@ -380,18 +401,24 @@ class KegPulseCoordinator:
         ):
             raise ValueError("recovery counter is missing its captured device identity")
         try:
-            recovery_pulses = int(event.frame.fields["recovery"])
-        except (KeyError, ValueError) as exc:
-            raise ValueError("recovery counter is malformed") from exc
-        recovered, duplicate = self.repository.checkpoint_recovery_pulses(
-            device_id=event.device_id,
-            boot_id=event.boot_id,
-            recovery_pulses=recovery_pulses,
-            device_uptime_ms=event.uptime_ms,
-            keg_id=event.keg_id,
-            calibration_id=event.calibration_id,
-            context_captured=event.context_captured,
-        )
+            counters = parse_counter_snapshot(event.frame.fields, event.uptime_ms)
+        except MeasurementRejectedError as exc:
+            self._quarantine_counter(event, str(exc))
+            return
+        try:
+            recovered, duplicate = self.repository.checkpoint_recovery_pulses(
+                device_id=event.device_id,
+                boot_id=event.boot_id,
+                recovery_pulses=counters.recovery_pulses,
+                accepted_pulses=counters.accepted_pulses,
+                device_uptime_ms=event.uptime_ms,
+                keg_id=event.keg_id,
+                calibration_id=event.calibration_id,
+                context_captured=event.context_captured,
+            )
+        except (ConflictError, MeasurementRejectedError) as exc:
+            self._quarantine_counter(event, str(exc), counters=counters)
+            return
         if recovered is not None and not duplicate:
             self._diagnostic(
                 "warning",
@@ -401,6 +428,121 @@ class KegPulseCoordinator:
                     "pour_id": recovered["id"],
                     "boot": event.boot_id,
                 },
+            )
+
+    @staticmethod
+    def _frame_fingerprint(fields: dict[str, str]) -> str:
+        encoded = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _quarantine_invalid_result(self, event: ManagerEvent, reason: str) -> None:
+        if event.frame is None:
+            return
+        fields = event.frame.fields
+        sequence_text = fields.get("seq", "")
+        try:
+            sequence = int(sequence_text)
+        except ValueError:
+            sequence = 0
+        usable_sequence = sequence if 1 <= sequence <= 0xFFFFFFFF else None
+        suffix = (
+            str(usable_sequence) if usable_sequence is not None else self._frame_fingerprint(fields)
+        )
+        inserted = self.repository.record_measurement_anomaly(
+            identity_key=f"result:{event.device_id}:{event.boot_id}:{suffix}",
+            source="result",
+            device_id=event.device_id or None,
+            boot_id=event.boot_id or None,
+            event_seq=usable_sequence,
+            observed_value=fields.get("pulses", "unavailable"),
+            reason=reason,
+            context={"fields": fields},
+        )
+        if inserted:
+            self._diagnostic(
+                "error",
+                "measurement_result_quarantined",
+                {"boot": event.boot_id, "seq": sequence_text[:20], "reason": reason[:160]},
+            )
+        current = self.manager.identity
+        if (
+            usable_sequence is None
+            or current.get("device") != event.device_id
+            or current.get("boot") != event.boot_id
+        ):
+            return
+        try:
+            await asyncio.to_thread(
+                self.manager.request,
+                "ACK",
+                {"dev": event.device_id, "boot": event.boot_id, "seq": usable_sequence},
+            )
+        except Exception as exc:
+            LOGGER.warning("quarantined device result ACK is pending: %s", type(exc).__name__)
+            self._diagnostic(
+                "warning", "quarantined_result_ack_pending", {"event_seq": usable_sequence}
+            )
+
+    def _quarantine_counter(
+        self,
+        event: ManagerEvent,
+        reason: str,
+        *,
+        counters: CounterSnapshot | None = None,
+    ) -> None:
+        if event.frame is None:
+            return
+        fields = event.frame.fields
+        fingerprint = self._frame_fingerprint(fields)
+        inserted = self.repository.record_measurement_anomaly(
+            identity_key=f"counter:{event.device_id}:{event.boot_id}:{fingerprint}",
+            source="recovery_counter",
+            device_id=event.device_id or None,
+            boot_id=event.boot_id or None,
+            observed_value=fields.get("recovery", "unavailable"),
+            reason=reason,
+            context={"fields": fields, "uptime_ms": event.uptime_ms},
+        )
+        if inserted:
+            self._diagnostic(
+                "error",
+                "measurement_counter_quarantined",
+                {
+                    "boot": event.boot_id,
+                    "accepted": (
+                        counters.accepted_pulses
+                        if counters is not None
+                        else fields.get("accepted", "unavailable")
+                    ),
+                    "recovery": (
+                        counters.recovery_pulses
+                        if counters is not None
+                        else fields.get("recovery", "unavailable")
+                    ),
+                    "reason": reason[:160],
+                },
+            )
+
+    def _quarantine_status(self, event: ManagerEvent, reason: str) -> None:
+        if event.frame is None:
+            return
+        fields = event.frame.fields
+        inserted = self.repository.record_measurement_anomaly(
+            identity_key=(
+                f"status:{event.device_id}:{event.boot_id}:{self._frame_fingerprint(fields)}"
+            ),
+            source="status",
+            device_id=event.device_id or None,
+            boot_id=event.boot_id or None,
+            observed_value=fields.get("lifetime", "unavailable"),
+            reason=reason,
+            context={"fields": fields},
+        )
+        if inserted:
+            self._diagnostic(
+                "error",
+                "measurement_status_quarantined",
+                {"boot": event.boot_id, "reason": reason[:160]},
             )
 
     def _remember_confirmed_hardware(self, event: ManagerEvent) -> None:
@@ -466,10 +608,8 @@ class KegPulseCoordinator:
             raise ValueError("device result sequence is out of range")
         if not 0 <= pulses <= 0x7FFFFFFFFFFFFFFF or not pulses <= lifetime <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("device result counters are out of range")
-        if not 0 <= started <= 0xFFFFFFFF or not 0 <= ended <= 0xFFFFFFFF:
-            raise ValueError("device result time is out of range")
-        if ((ended - started) & 0xFFFFFFFF) >= 0x80000000:
-            raise ValueError("device result duration is ambiguous across timer rollover")
+        duration = elapsed_u32(started, ended)
+        ensure_plausible_pulse_count(pulses, duration, "device result pulse count")
         if status == DeviceState.TIMED_OUT and pulses != 0:
             raise ValueError("timed-out device result cannot contain pulses")
         return DeviceResult(
@@ -517,14 +657,33 @@ class KegPulseCoordinator:
             return
         try:
             device_state = DeviceState(status["state"])
-            device_lifetime = int(status["lifetime"])
-            device_uptime = int(status["uptime"])
+            pulse_status = parse_status_pulse_snapshot(status)
+            device_lifetime = pulse_status.lifetime_pulses
+            device_uptime = pulse_status.uptime_ms
             retained_results = int(status["retained"])
-        except (KeyError, ValueError):
+            if not 0 <= retained_results <= 255:
+                raise MeasurementRejectedError("retained result count is out of range")
+        except (KeyError, ValueError, MeasurementRejectedError) as exc:
+            identity_key = (
+                f"reconciliation-status:{identity.get('device', '')}:"
+                f"{identity.get('boot', '')}:{self._frame_fingerprint(status)}"
+            )
+            self.repository.record_measurement_anomaly(
+                identity_key=identity_key,
+                source="status_reconciliation",
+                device_id=identity.get("device"),
+                boot_id=identity.get("boot"),
+                observed_value=status.get("lifetime", "unavailable"),
+                reason=str(exc),
+                context={"fields": status, "session": provisional["session_id"]},
+            )
             self._diagnostic(
                 "warning",
                 "reconciliation_status_invalid",
-                {"session": provisional["session_id"][:8]},
+                {"session": provisional["session_id"][:8], "reason": str(exc)[:160]},
+            )
+            self.repository.update_provisional_status(
+                provisional["session_id"], "interrupted_uncertain"
             )
             return
         decision = reconcile_provisional(
@@ -545,14 +704,40 @@ class KegPulseCoordinator:
             and device_state == DeviceState.IDLE
             and retained_results == 0
         ):
-            recovered, duplicate = self.repository.recover_same_boot_delta(
-                provisional["session_id"],
-                device_id=identity["device"],
-                boot_id=identity["boot"],
-                confirmed_lifetime=int(provisional["confirmed_lifetime"]),
-                current_lifetime=device_lifetime,
-                device_uptime_ms=device_uptime,
-            )
+            try:
+                recovered, duplicate = self.repository.recover_same_boot_delta(
+                    provisional["session_id"],
+                    device_id=identity["device"],
+                    boot_id=identity["boot"],
+                    confirmed_lifetime=int(provisional["confirmed_lifetime"]),
+                    current_lifetime=device_lifetime,
+                    device_uptime_ms=device_uptime,
+                )
+            except MeasurementRejectedError as exc:
+                self.repository.record_measurement_anomaly(
+                    identity_key=(
+                        f"same-boot:{identity['device']}:{identity['boot']}:"
+                        f"{provisional['session_id']}:{device_lifetime}"
+                    ),
+                    source="same_boot_recovery",
+                    device_id=identity["device"],
+                    boot_id=identity["boot"],
+                    observed_value=device_lifetime,
+                    reason=str(exc),
+                    context={
+                        "confirmed_lifetime": provisional["confirmed_lifetime"],
+                        "device_uptime_ms": device_uptime,
+                    },
+                )
+                self.repository.update_provisional_status(
+                    provisional["session_id"], "interrupted_uncertain"
+                )
+                self._diagnostic(
+                    "error",
+                    "same_boot_recovery_quarantined",
+                    {"session": provisional["session_id"][:8], "reason": str(exc)[:160]},
+                )
+                return
             self._diagnostic(
                 "warning",
                 "same_boot_pulses_recovered",
@@ -695,11 +880,29 @@ class KegPulseCoordinator:
         terminal_notice = self.repository.recent_terminal_provisional()
         calibration = self.repository.active_calibration()
         verifications = self.repository.list_verifications(limit=1)
-        device_status = self.manager.status
+        raw_device_status = self.manager.status
+        device_status: dict[str, Any] = dict(raw_device_status)
+        device_counters: dict[str, Any] = dict(self.manager.counters)
         live_volume: str | None = None
-        if device_status and calibration and calibration.get("pulses_per_ml"):
-            pulses = int(device_status.get("pulses", "0"))
-            live_volume = str(Decimal(pulses) / Decimal(calibration["pulses_per_ml"]))
+        try:
+            pulse_status = (
+                parse_status_pulse_snapshot(raw_device_status) if raw_device_status else None
+            )
+        except MeasurementRejectedError:
+            pulse_status = None
+            device_status["pulses"] = None
+            device_status["lifetime"] = None
+        if pulse_status is not None and calibration and calibration.get("pulses_per_ml"):
+            live_volume = str(
+                Decimal(pulse_status.session_pulses) / Decimal(calibration["pulses_per_ml"])
+            )
+        if raw_device_status and device_counters:
+            try:
+                parse_counter_snapshot(device_counters, int(raw_device_status.get("uptime", "")))
+            except (MeasurementRejectedError, ValueError):
+                device_counters["accepted"] = None
+                device_counters["recovery"] = None
+                device_counters["rejected"] = None
         return {
             "schema_version": 1,
             "revision": self._revision,
@@ -715,7 +918,7 @@ class KegPulseCoordinator:
             "device": {
                 "identity": self.manager.identity,
                 "status": device_status,
-                "counters": self.manager.counters,
+                "counters": device_counters,
             },
             "session": provisional,
             "terminal_notice": terminal_notice,

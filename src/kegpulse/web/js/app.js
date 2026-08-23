@@ -1,6 +1,7 @@
 const main = document.querySelector("#main");
 const badge = document.querySelector("#connection-badge");
 const kegSummary = document.querySelector("#keg-summary");
+const kegBattery = document.querySelector("#keg-battery");
 const banner = document.querySelector("#degraded-banner");
 const announcer = document.querySelector("#announcer");
 const toast = document.querySelector("#toast");
@@ -28,10 +29,17 @@ const state = {
   historyFilter: "all",
   participantDetails: null,
   serialPorts: null,
+  management: null,
+  cameraStream: null,
+  cameraLastCapture: 0,
+  cameraUploadActive: false,
+  cameraStatus: "Camera not armed",
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
   lastMeasurementAnnouncement: 0,
+  flowRateMlMin: 0,
+  lastFlowPulseAt: 0,
   dismissedTerminalId: null,
   dialogInvoker: null,
   pending: new Set(),
@@ -320,12 +328,58 @@ const decimal = (value, fallback = 0) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const MAX_DISPLAY_VOLUME_ML = 1_000_000;
+const displayVolume = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && Math.abs(parsed) <= MAX_DISPLAY_VOLUME_ML
+    ? parsed
+    : null;
+};
+
 const formatVolume = (ml, units = state.snapshot?.settings?.display_units || "us_fl_oz") => {
   if (ml === null || ml === undefined || ml === "") return "Unknown volume";
-  const value = decimal(ml);
+  const value = displayVolume(ml);
+  if (value === null) return "Reading unavailable";
   if (units === "ml") return `${Math.round(value)} mL`;
   if (units === "l") return `${(value / 1000).toFixed(2)} L`;
   return `${(value / 29.5735295625).toFixed(1)} fl oz`;
+};
+
+const pourMeasurements = (ml, density = state.snapshot?.active_calibration?.default_density_g_per_ml) => {
+  if (ml === null || ml === undefined || ml === "") return null;
+  const volumeMl = displayVolume(ml);
+  const densityValue = Number(density);
+  if (volumeMl === null || volumeMl < 0) return null;
+  return {
+    ml: volumeMl.toFixed(1),
+    flOz: (volumeMl / 29.5735295625).toFixed(1),
+    grams: Number.isFinite(densityValue) && densityValue > 0
+      ? (volumeMl * densityValue).toFixed(1)
+      : null,
+  };
+};
+
+const pourMeasurementText = (ml, density) => {
+  const values = pourMeasurements(ml, density);
+  if (!values) return "Unknown volume";
+  return `${values.flOz} fl oz · ${values.ml} mL${values.grams ? ` · ~${values.grams} g` : ""}`;
+};
+
+const pourMeasurementMarkup = (ml, density, element = "div") => {
+  const values = pourMeasurements(ml, density);
+  if (!values) return `<${element} class="pour-amount">Unknown volume</${element}>`;
+  return `<${element} class="measurement-trio" aria-label="${values.flOz} US fluid ounces, ${values.ml} milliliters${values.grams ? `, approximately ${values.grams} grams` : ""}">
+    <span class="measurement-primary"><strong>${values.flOz}</strong><small>US fl oz</small></span>
+    <span><strong>${values.ml}</strong><small>mL</small></span>
+    ${values.grams ? `<span><strong>~${values.grams}</strong><small>estimated g</small></span>` : ""}
+  </${element}>`;
+};
+
+const formatFlowRate = (mlPerMinute, units = state.snapshot?.settings?.display_units || "us_fl_oz") => {
+  const value = Math.max(0, decimal(mlPerMinute));
+  if (units === "ml") return { value: value.toFixed(0), unit: "mL/min" };
+  if (units === "l") return { value: (value / 1000).toFixed(2), unit: "L/min" };
+  return { value: (value / 29.5735295625).toFixed(1), unit: "fl oz/min" };
 };
 
 const formatTime = (value) => value ? new Intl.DateTimeFormat(undefined, {
@@ -366,7 +420,7 @@ async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = options.method || "GET";
   if (!["GET", "HEAD"].includes(method)) {
-    headers.set("Content-Type", "application/json");
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (state.security?.csrf_token) headers.set("X-KegPulse-CSRF", state.security.csrf_token);
   }
   const response = await fetch(path, { cache: "no-store", credentials: "same-origin", ...options, method, headers });
@@ -537,6 +591,20 @@ function updateChrome() {
   kegSummary.textContent = keg
     ? `${keg.label}: ${formatVolume(inventory?.remaining_ml)}`
     : "No keg configured";
+  if (keg && inventory) {
+    const rawPercent = Number(inventory.percent_remaining);
+    const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, rawPercent)) : 0;
+    const rounded = Math.round(percent);
+    kegBattery.classList.remove("hidden", "low", "critical");
+    if (percent <= 10) kegBattery.classList.add("critical");
+    else if (percent <= 25) kegBattery.classList.add("low");
+    kegBattery.querySelector(".keg-battery-fill").style.width = `${percent}%`;
+    kegBattery.querySelector(".keg-battery-value").textContent = `${rounded}%`;
+    kegBattery.setAttribute("aria-label", `Keg ${rounded}% remaining by volume`);
+  } else {
+    kegBattery.className = "keg-battery hidden";
+    kegBattery.setAttribute("aria-label", "Keg level unavailable");
+  }
   const loginRequired = state.security?.lan_mode && !state.security?.authenticated;
   const degraded = state.socketFailures > 0 || state.snapshot?.connection?.state !== "connected";
   if (state.hostAvailable === false) {
@@ -629,13 +697,46 @@ function reconcileRoute(previous, next) {
   }
 }
 
+function updateFlowRate(previous, next) {
+  const phase = String(next?.device?.status?.state || "unknown").toLowerCase();
+  if (phase !== "pouring") {
+    state.flowRateMlMin = 0;
+    state.lastFlowPulseAt = 0;
+    return;
+  }
+  const priorPulses = decimal(previous?.device?.status?.pulses);
+  const nextPulses = decimal(next?.device?.status?.pulses);
+  const priorVolume = Number(previous?.live_volume_ml);
+  const nextVolume = Number(next?.live_volume_ml);
+  const priorTime = Date.parse(previous?.generated_at || "");
+  const nextTime = Date.parse(next?.generated_at || "");
+  const elapsedMinutes = (nextTime - priorTime) / 60000;
+  if (
+    nextPulses > priorPulses
+    && Number.isFinite(priorVolume)
+    && Number.isFinite(nextVolume)
+    && nextVolume >= priorVolume
+    && elapsedMinutes > 0
+  ) {
+    const measured = (nextVolume - priorVolume) / elapsedMinutes;
+    state.flowRateMlMin = state.flowRateMlMin > 0
+      ? state.flowRateMlMin * 0.55 + measured * 0.45
+      : measured;
+    state.lastFlowPulseAt = performance.now();
+  } else if (state.lastFlowPulseAt && performance.now() - state.lastFlowPulseAt > 1200) {
+    state.flowRateMlMin = 0;
+  }
+}
+
 function applySnapshot(snapshot) {
   if (state.snapshot && Number(snapshot.revision) < Number(state.snapshot.revision)) return;
   const previousGuideTitle = route() === "/settings" && state.snapshot?.mode === "demo"
     ? demoGuideContext("/settings").guide?.title
     : null;
   const previous = state.snapshot;
+  updateFlowRate(previous, snapshot);
   state.snapshot = snapshot;
+  syncPourCamera(snapshot);
   reconcileRoute(previous, snapshot);
   updateChrome();
   // A snapshot may arrive between a user's final field edit and the form's
@@ -748,8 +849,8 @@ function connectSocket() {
   socket.addEventListener("error", () => socket.close());
 }
 
-function page(title, subtitle, content) {
-  return `<section><h1 tabindex="-1">${escapeHtml(title)}</h1>${subtitle ? `<p class="lead">${escapeHtml(subtitle)}</p>` : ""}${content}</section>`;
+function page(title, subtitle, content, className = "") {
+  return `<section class="${escapeHtml(className)}"><h1 tabindex="-1">${escapeHtml(title)}</h1>${subtitle ? `<p class="lead">${escapeHtml(subtitle)}</p>` : ""}${content}</section>`;
 }
 
 function demoGuideStorageKey(path) {
@@ -908,38 +1009,197 @@ function homeView() {
     ? "The tap opened without a selected participant. KegPulse is preserving the measurement."
     : readyToArm ? "Select a person before opening the tap, or choose Guest." : "Review the visible device state before opening the tap.";
   const armDisabled = state.pending.has("arm") || !readyToArm;
+  const calibrated = s.live_volume_ml !== null || Boolean(s.active_calibration);
+  const rate = formatFlowRate(state.flowRateMlMin);
+  const activePulses = decimal(s.device?.status?.pulses);
+  const flowClass = devicePhase === "pouring"
+    ? "flowing"
+    : devicePhase === "settling" ? "settling" : "idle";
+  const connectionClass = s.connection?.state === "connected" ? "connected" : "disconnected";
+  const liveAmount = s.live_volume_ml !== null && s.live_volume_ml !== undefined
+    ? pourMeasurementText(s.live_volume_ml, s.active_calibration?.default_density_g_per_ml)
+    : `${activePulses} raw ${activePulses === 1 ? "pulse" : "pulses"}`;
   const buttons = participants.map((participant) => `
-    <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>
-      ${escapeHtml(participant.display_name)}
+    <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" aria-label="${escapeHtml(participant.display_name)}" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>
+      <span class="participant-avatar" aria-hidden="true">${escapeHtml(participant.display_name.trim().charAt(0).toUpperCase() || "?")}</span>
+      <span>${escapeHtml(participant.display_name)}</span>
     </button>`).join("");
   return page(title, subtitle, `
-    ${warnings.length ? `<aside class="card setup-callout" aria-labelledby="setup-title"><h2 id="setup-title">Setup and review</h2><ul>${warnings.join("")}</ul></aside>` : ""}
-    <section class="card device-phase-card ${unattributedFlow ? "active" : ""}" aria-labelledby="home-device-title">
-      <h2 id="home-device-title">Flow device</h2>
-      <div class="device-phase">${escapeHtml(phaseLabel)}</div>
-      <p id="home-device-detail">${escapeHtml(deviceDetail)}</p>
+    <section class="flow-dock ${flowClass} ${connectionClass}" aria-label="Live tap status">
+      <div class="flow-dock-copy">
+        <div class="flow-heading-row">
+          <p class="flow-eyebrow"><span class="flow-status-dot" aria-hidden="true"></span> Live tap</p>
+          <span class="flow-phase">${escapeHtml(phaseLabel)}</span>
+        </div>
+        <div class="flow-metrics">
+          <div class="flow-rate" aria-label="Current flow rate"><strong>${calibrated ? escapeHtml(rate.value) : "--"}</strong><span>${escapeHtml(rate.unit)}</span></div>
+          <div class="flow-total"><span>Current pour</span><strong>${escapeHtml(liveAmount)}</strong></div>
+        </div>
+        <p id="home-device-detail" class="flow-detail">${escapeHtml(deviceDetail)}${calibrated ? " Live rate is calibrated." : " Complete calibration to calculate ounces per minute."}</p>
+      </div>
+      <div class="beer-flow-scene" aria-hidden="true">
+        <div class="tap-neck"></div><div class="tap-nozzle"></div>
+        <div class="beer-stream"><span></span><span></span></div>
+        <div class="beer-glass"><div class="beer-fill"><i></i><i></i><i></i><i></i></div><div class="beer-foam"></div></div>
+      </div>
     </section>
+    ${warnings.length ? `<aside class="card setup-callout" aria-labelledby="setup-title"><h2 id="setup-title">Setup and review</h2><ul>${warnings.join("")}</ul></aside>` : ""}
     <div class="grid two">
       <section class="card" aria-labelledby="keg-title">
         <h2 id="keg-title">${escapeHtml(s.keg?.label || "No current keg")}</h2>
         <div class="metric">${inventory ? formatVolume(inventory.remaining_ml) : "—"}</div>
-        <p>${inventory ? `${decimal(inventory.percent_remaining).toFixed(1)}% remaining` : "Configure a keg in Admin."}</p>
+        <p>${inventory ? `${percent.toFixed(1)}% remaining` : "Configure a keg in Admin."}</p>
         <progress class="progress" max="100" value="${percent}" aria-label="Keg percent remaining">${percent}%</progress>
       </section>
       <section class="card" aria-labelledby="last-title">
         <h2 id="last-title">Last pour</h2>
-        ${s.last_pour ? `<div class="metric">${formatVolume(s.last_pour.volume_ml)}</div><p>${escapeHtml(s.last_pour.participant_name || "Guest / Unattributed")} · ${formatTime(s.last_pour.ended_at)}</p><p class="muted">${escapeHtml(s.last_pour.quality.replaceAll("_", " "))} · ${escapeHtml(s.last_pour.raw_pulses)} raw pulses</p>` : '<p class="empty">No pours recorded yet.</p>'}
+        ${s.last_pour ? `${pourMeasurementMarkup(s.last_pour.volume_ml, s.last_pour.calibration_density_g_per_ml)}<p>${escapeHtml(s.last_pour.participant_name || "Guest / Unattributed")} · ${formatTime(s.last_pour.ended_at)}</p><p class="muted">${escapeHtml(s.last_pour.quality.replaceAll("_", " "))} · ${escapeHtml(s.last_pour.raw_pulses)} raw pulses</p>` : '<p class="empty">No pours recorded yet.</p>'}
       </section>
     </div>
-    <section class="card" aria-labelledby="people-title">
-      <h2 id="people-title">Who is pouring?</h2>
+    <section class="card people-panel" aria-labelledby="people-title">
+      <p class="section-kicker">Pour attribution</p><h2 id="people-title">Who is pouring?</h2>
       <div class="participant-grid">
         ${buttons}
-        <button class="participant-button guest" data-action="arm" data-participant="" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>${participants.length === 0 ? "Start pour" : "Guest / Unattributed"}</button>
+        <button class="participant-button guest" data-action="arm" data-participant="" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}><span class="participant-avatar" aria-hidden="true">G</span><span>${participants.length === 0 ? "Start pour" : "Guest / Unattributed"}</span></button>
       </div>
       ${participants.length === 0 ? '<p class="muted">No profiles yet. “Start pour” records an unattributed event; you can assign it later.</p>' : ""}
     </section>
-  `);
+  `, "home-page");
+}
+
+const formatMoney = (cents) => new Intl.NumberFormat(undefined, {
+  style: "currency", currency: "USD",
+}).format(Number(cents || 0) / 100);
+
+async function loadManagement() {
+  if (!state.security?.pin_configured || !state.security?.authenticated) {
+    state.management = null;
+    render();
+    return;
+  }
+  try {
+    state.management = await api("/api/v1/management");
+    render();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      state.security = await refreshSecurityContext();
+      state.management = null;
+      render();
+      return;
+    }
+    showError(error);
+  }
+}
+
+function managementView() {
+  if (!state.security?.pin_configured) {
+    return page("Management", "Pricing, balances, and pour evidence require an administrator PIN.", `
+      <section class="card narrow-card"><h2>Create administrator PIN</h2>
+      <form id="pin-form" class="stack"><label>New PIN<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>Protect management</button></form></section>`);
+  }
+  if (!state.security?.authenticated) {
+    return page("Management", "Unlock the protected controls with the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
+  const m = state.management;
+  if (!m) return page("Management", "Loading protected account and camera settings.", '<section class="card"><button data-action="load-management">Load management</button></section>');
+  const people = m.participants.map((person) => `<article class="account-row">
+    <div><h3>${escapeHtml(person.display_name)}</h3><p class="account-balance">${formatMoney(person.balance_cents)}</p></div>
+    <form class="fund-form stack" data-participant="${escapeHtml(person.id)}">
+      <label>Funds change ($)<input name="amount_dollars" type="number" step="0.01" min="-100000" max="100000" placeholder="25.00" required></label>
+      <label>Reason<input name="reason" maxlength="500" placeholder="Cash added" required></label>
+      <button>Record funds</button>
+    </form></article>`).join("") || '<p class="empty">Add people before managing balances.</p>';
+  const ledger = m.ledger.map((entry) => `<tr><td>${escapeHtml(new Date(entry.created_at).toLocaleString())}</td><td>${escapeHtml(entry.participant_name)}</td><td>${escapeHtml(entry.kind)}</td><td class="money ${Number(entry.amount_cents) < 0 ? "negative" : "positive"}">${formatMoney(entry.amount_cents)}</td><td>${escapeHtml(entry.reason)}</td></tr>`).join("") || '<tr><td colspan="5">No account activity yet.</td></tr>';
+  const photos = m.photos.map((photo) => `<figure class="evidence-photo"><img src="/api/v1/management/photos/${encodeURIComponent(photo.id)}" alt="Pour evidence captured ${escapeHtml(new Date(photo.captured_at).toLocaleString())}" loading="lazy"><figcaption>${escapeHtml(photo.participant_name || "Unattributed")}<br>${escapeHtml(new Date(photo.captured_at).toLocaleString())}</figcaption></figure>`).join("") || '<p class="empty">No pour photos have been captured.</p>';
+  const keg = state.snapshot?.keg;
+  const inventory = state.snapshot?.inventory;
+  const kegControl = keg && inventory
+    ? `<section class="card"><h2>Keg level</h2><p class="metric">${escapeHtml(Number(inventory.percent_remaining).toFixed(1))}%</p><p>${escapeHtml(formatVolume(inventory.remaining_ml))} remaining in ${escapeHtml(keg.label)}.</p><form id="keg-remaining-form" class="stack"><label>Set remaining volume (%)<input name="percent_remaining" type="number" min="0" max="100" step="0.1" value="${escapeHtml(Number(inventory.percent_remaining).toFixed(1))}" required></label><label>Reason<input name="reason" maxlength="500" value="Manual keg level correction" required></label><button>Update keg level</button></form><p class="field-help">This records an audited inventory correction; measured pour history is not changed.</p></section>`
+    : '<section class="card"><h2>Keg level</h2><p class="empty">Install a keg before setting its remaining level.</p></section>';
+  return page("Management", "Protected pricing, participant funds, and local pour evidence.", `
+    <div class="grid two management-grid"><section class="card"><h2>Beer price</h2><form id="management-settings-form" class="stack"><label>Price per US fl oz ($)<input name="price_per_fl_oz" type="number" min="0" max="1000" step="0.01" value="${escapeHtml((Number(m.price_cents_per_fl_oz) / 100).toFixed(2))}" required></label><button>Save price</button></form><p class="field-help">Each completed attributed pour stores the price used at that moment.</p></section>
+    ${kegControl}<section class="card"><h2>Pour camera</h2><div class="camera-preview"><video id="camera-preview" autoplay muted playsinline></video><span>${escapeHtml(state.cameraStatus)}</span></div><p>Photos stay on this computer and are taken once per second only while beer is flowing.</p><div class="button-row"><button data-action="camera-enable">${state.cameraStream ? "Camera armed" : "Enable camera"}</button><button class="secondary" data-action="camera-disable" ${!m.webcam_enabled && !state.cameraStream ? "disabled" : ""}>Disable</button></div></section></div>
+    <section class="management-band"><h2>Participant funds</h2><div class="account-list">${people}</div></section>
+    <section class="management-band"><h2>Account ledger</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Person</th><th>Type</th><th>Amount</th><th>Reason</th></tr></thead><tbody>${ledger}</tbody></table></div></section>
+    <section class="management-band"><h2>Pour evidence</h2><div class="evidence-grid">${photos}</div></section>`);
+}
+
+function attachCameraPreview() {
+  for (const video of document.querySelectorAll(".camera-preview video")) {
+    if (state.cameraStream) video.srcObject = state.cameraStream;
+  }
+}
+
+async function enableCamera() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not provide camera access.");
+    state.cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    state.cameraStatus = "Camera armed for the next pour";
+    state.management = await mutation("camera-enable", "/api/v1/management/settings", { webcam_enabled: true }, "PATCH");
+    render();
+  } catch (error) {
+    state.cameraStream?.getTracks().forEach((track) => track.stop());
+    state.cameraStream = null;
+    state.cameraStatus = "Camera permission unavailable";
+    showError(error);
+    render();
+  }
+}
+
+async function disableCamera() {
+  state.cameraStream?.getTracks().forEach((track) => track.stop());
+  state.cameraStream = null;
+  state.cameraStatus = "Camera disabled";
+  try {
+    state.management = await mutation("camera-disable", "/api/v1/management/settings", { webcam_enabled: false }, "PATCH");
+    render();
+  } catch (error) { showError(error); }
+}
+
+async function capturePourPhoto(sessionId) {
+  if (state.cameraUploadActive || !state.cameraStream) return;
+  const track = state.cameraStream.getVideoTracks()[0];
+  const settings = track?.getSettings?.() || {};
+  const video = document.createElement("video");
+  video.srcObject = state.cameraStream;
+  video.muted = true;
+  video.playsInline = true;
+  await video.play();
+  const sourceWidth = video.videoWidth || settings.width || 640;
+  const sourceHeight = video.videoHeight || settings.height || 480;
+  const width = Math.min(480, sourceWidth);
+  const height = Math.max(1, Math.round(sourceHeight * width / sourceWidth));
+  const canvas = document.createElement("canvas");
+  canvas.width = width; canvas.height = height;
+  canvas.getContext("2d").drawImage(video, 0, 0, width, height);
+  video.srcObject = null;
+  let quality = 0.62;
+  let blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  while (blob && blob.size > 60_000 && quality > 0.25) {
+    quality -= 0.1;
+    blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  }
+  if (!blob || blob.size > 61_440) throw new Error("Camera frame is too large to store safely.");
+  state.cameraUploadActive = true;
+  try {
+    await api(`/api/v1/sessions/${encodeURIComponent(sessionId)}/photos`, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+    state.cameraStatus = "Capturing this pour";
+  } finally {
+    state.cameraUploadActive = false;
+  }
+}
+
+function syncPourCamera(snapshot) {
+  const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
+  const session = snapshot?.session;
+  if (!state.cameraStream || !state.management?.webcam_enabled || phase !== "pouring" || session?.purpose !== "pour") return;
+  const now = performance.now();
+  if (now - state.cameraLastCapture < 1000) return;
+  state.cameraLastCapture = now;
+  void capturePourPhoto(session.session_id).catch((error) => {
+    state.cameraStatus = "Camera capture failed";
+    showError(error);
+  });
 }
 
 function pourView() {
@@ -971,12 +1231,25 @@ function pourView() {
     status === "timed_out" ? "No pulse arrived before the deadline, so no pour was recorded." :
     status === "interrupted_uncertain" ? "The device became unavailable before the host could confirm the outcome. No pulses were invented or discarded; review diagnostics and history after reconnecting." :
     "Waiting for the authoritative device state.";
+  const cameraEnabled = Boolean(state.management?.webcam_enabled);
+  const cameraReady = cameraEnabled && Boolean(state.cameraStream);
+  const cameraCapturing = cameraReady && status === "pouring";
+  const cameraLabel = cameraCapturing
+    ? "Recording pour evidence"
+    : cameraReady
+      ? status === "settling" ? "Camera paused while flow is stopped" : "Camera ready; recording starts with flow"
+      : cameraEnabled ? "Camera enabled but unavailable in this browser" : "Camera recording is off";
+  const cameraMonitor = purpose === "pour" ? `<aside class="pour-camera-monitor ${cameraCapturing ? "recording" : cameraReady ? "ready" : "off"}" aria-label="Pour camera status">
+    ${cameraReady ? '<div class="camera-preview pour-camera-preview"><video autoplay muted playsinline></video></div>' : '<div class="camera-placeholder" aria-hidden="true">CAM</div>'}
+    <div><p class="camera-state"><span class="camera-record-dot" aria-hidden="true"></span>${escapeHtml(cameraLabel)}</p><p class="camera-disclosure">Local snapshots are saved once per second only while beer is flowing.</p></div>
+  </aside>` : "";
   return `<section class="pour-screen"><div class="pour-panel card">
     <p class="pour-state">${escapeHtml(status)}</p>
     <h1 tabindex="-1">${escapeHtml(title)}</h1>
-    ${["timed_out", "interrupted_uncertain"].includes(status) ? `<div class="pour-amount">${status === "timed_out" ? "No flow" : "Needs review"}</div>` : `<output class="pour-amount" aria-label="Measured pour volume">${formatVolume(volume)}</output>`}
+    ${["timed_out", "interrupted_uncertain"].includes(status) ? `<div class="pour-amount">${status === "timed_out" ? "No flow" : "Needs review"}</div>` : pourMeasurementMarkup(volume, s.active_calibration?.default_density_g_per_ml, "output")}
     <p class="countdown" aria-live="polite">${escapeHtml(countdown)}</p>
     <p>${escapeHtml(note)}</p>
+    ${cameraMonitor}
     ${["timed_out", "interrupted_uncertain"].includes(status) ? '<button data-action="dismiss-terminal">Return home</button>' : status === "complete" && purpose !== "pour" ? '<a class="button" href="#/calibration">Enter scale mass</a>' : `
       <button class="${afterFlow ? "danger" : "secondary"}" data-action="cancel" ${state.pending.has("cancel") ? "disabled" : ""}>${cancelLabel}</button>`}
   </div></section>`;
@@ -989,7 +1262,7 @@ function completionView() {
   scheduleCompletionReturn();
   return page("Pour recorded", "The host has saved this measurement.", `
     <section class="card" data-completion-panel>
-      <div class="metric">${formatVolume(pour.volume_ml)}</div>
+      ${pourMeasurementMarkup(pour.volume_ml, pour.calibration_density_g_per_ml)}
       <p>${escapeHtml(pour.participant_name || "Guest / Unattributed")} · ${escapeHtml(pour.raw_pulses)} raw pulses</p>
       ${warning ? `<p class="warning-text">Review needed: ${escapeHtml(pour.quality.replaceAll("_", " "))}. Counted pulses were retained.</p>` : '<p class="good-text">Complete measurement saved.</p>'}
       <p id="return-countdown" class="muted">${state.completionPaused ? "Auto-return paused." : "Returning home shortly. Interaction pauses auto-return."}</p>
@@ -1032,8 +1305,8 @@ function historyRows(rows) {
       ? reassignmentEditor(row)
       : `<button class="secondary" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button>`;
   return `<div class="table-wrap"><table><thead><tr><th>When</th><th>Person</th><th>Amount</th><th>Evidence</th><th>Action</th></tr></thead><tbody>${rows.map((row) => `
-    <tr><td>${formatTime(row.ended_at)}</td><td>${escapeHtml(row.participant_name || "Guest / Unattributed")}</td><td>${formatVolume(row.volume_ml)}</td><td>${escapeHtml(row.raw_pulses)} pulses<br>${escapeHtml(row.quality.replaceAll("_", " "))}${pourDetails(row)}</td><td>${action(row)}</td></tr>`).join("")}</tbody></table></div>
-    <div class="sample-cards">${rows.map((row) => `<article class="sample-card"><strong>${formatVolume(row.volume_ml)}</strong><br>${escapeHtml(row.participant_name || "Guest / Unattributed")}<br><span class="muted">${formatTime(row.ended_at)} · ${escapeHtml(row.raw_pulses)} pulses · ${escapeHtml(row.quality.replaceAll("_", " "))}</span>${pourDetails(row)}${action(row)}</article>`).join("")}</div>`;
+    <tr><td>${formatTime(row.ended_at)}</td><td>${escapeHtml(row.participant_name || "Guest / Unattributed")}</td><td>${escapeHtml(pourMeasurementText(row.volume_ml, row.calibration_density_g_per_ml))}</td><td>${escapeHtml(row.raw_pulses)} pulses<br>${escapeHtml(row.quality.replaceAll("_", " "))}${pourDetails(row)}</td><td>${action(row)}</td></tr>`).join("")}</tbody></table></div>
+    <div class="sample-cards">${rows.map((row) => `<article class="sample-card"><strong>${escapeHtml(pourMeasurementText(row.volume_ml, row.calibration_density_g_per_ml))}</strong><br>${escapeHtml(row.participant_name || "Guest / Unattributed")}<br><span class="muted">${formatTime(row.ended_at)} · ${escapeHtml(row.raw_pulses)} pulses · ${escapeHtml(row.quality.replaceAll("_", " "))}</span>${pourDetails(row)}${action(row)}</article>`).join("")}</div>`;
 }
 
 function pourDetails(row) {
@@ -1078,12 +1351,16 @@ function kegView() {
 function sampleReview(detail) {
   const analysis = detail.analysis;
   const editable = detail.status === "draft";
+  const includedCount = analysis?.included_count ?? detail.samples.filter((x) => x.included).length;
+  const canJudgeConsistency = includedCount >= 3;
+  const consistencyLabel = (sample, flagged) => !sample.included
+    ? flagged ? "Excluded — suspected outlier" : "Excluded by user"
+    : flagged ? "Suspected outlier"
+      : canJudgeConsistency ? "Consistent" : "Too few samples to judge";
   const rows = detail.samples.map((sample, index) => {
     const a = analysis?.samples?.[index];
     const flagged = a?.suspected_outlier || sample.suspected_outlier;
-    const consistency = !sample.included
-      ? flagged ? "Excluded — suspected outlier" : "Excluded by user"
-      : flagged ? "Suspected outlier" : "Consistent";
+    const consistency = consistencyLabel(sample, flagged);
     const predicted = a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—";
     const residual = a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—";
     const action = editable
@@ -1094,10 +1371,10 @@ function sampleReview(detail) {
   const cards = detail.samples.map((sample, index) => {
     const a = analysis?.samples?.[index];
     const flagged = a?.suspected_outlier || sample.suspected_outlier;
-    const consistency = !sample.included
-      ? flagged ? "Excluded — suspected outlier" : "Excluded by user"
-      : flagged ? "Suspected outlier" : "Consistent";
-    const consistencyClass = flagged ? "warning-text" : sample.included ? "good-text" : "muted";
+    const consistency = consistencyLabel(sample, flagged);
+    const consistencyClass = flagged
+      ? "warning-text"
+      : sample.included ? (canJudgeConsistency ? "good-text" : "muted") : "muted";
     const action = editable
       ? `<div><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></div>`
       : "";
@@ -1106,14 +1383,21 @@ function sampleReview(detail) {
   const guidance = editable
     ? "Suspected outliers remain included until you decide."
     : `This ${escapeHtml(detail.status)} calibration is read-only; its inclusion decisions are preserved.`;
+  const fullyActivatable = detail.samples.length === 10 && includedCount >= 7;
   const analysisSummary = analysis
-    ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%</p>${editable ? `<button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : ""}`
+    ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%</p>${editable && fullyActivatable ? `<button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : editable ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>' : ""}`
     : editable
       ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>'
       : "";
+  const provisionalAction = editable
+    && detail.samples.length >= 1
+    && detail.samples.length < 10
+    && includedCount >= 1
+    ? `<aside class="banner warning provisional-calibration"><strong>Temporary estimate only.</strong> ${includedCount < 3 ? "So few samples cannot measure repeatability or identify an outlier." : "A partial run cannot fully measure repeatability; review any flagged outlier before relying on it."}<button class="secondary" data-action="activate-provisional-calibration" data-calibration="${escapeHtml(detail.id)}">Use ${includedCount}-sample estimate for now</button></aside>`
+    : "";
   return `<section class="card"><h2>Sample review</h2><p>${detail.samples.length}/10 captured · ${analysis?.included_count ?? detail.samples.filter((x) => x.included).length} included. ${guidance}</p>
     <div class="table-wrap"><table><thead><tr><th>#</th><th>Pulses</th><th>Mass</th><th>Actual scale volume</th><th>Predicted volume</th><th>Residual / error</th><th>Consistency</th>${editable ? "<th>Use sample</th>" : ""}</tr></thead><tbody>${rows}</tbody></table></div><div class="sample-cards">${cards}</div>
-    ${analysisSummary}
+    ${analysisSummary}${provisionalAction}
   </section>`;
 }
 
@@ -1129,7 +1413,7 @@ function calibrationView() {
     ${capture?.status === "complete" ? `<section class="card"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>` : ""}
     ${verification ? `<section class="card ${verification.warning ? "outlier" : ""}"><h2>Latest verification</h2><dl class="status-list"><dt>Predicted</dt><dd>${formatVolume(verification.predicted_volume_ml)}</dd><dt>Scale volume</dt><dd>${formatVolume(verification.actual_volume_ml)}</dd><dt>Absolute error</dt><dd>${formatVolume(verification.absolute_error_ml)}</dd><dt>Percentage error</dt><dd>${Number(verification.percentage_error).toFixed(2)}%</dd></dl><p class="${verification.warning ? "warning-text" : "good-text"}">${verification.warning ? "Drift warning: investigate sensor, flow conditions, tubing, or calibration. The factor was not changed." : "Verification is within the configured warning threshold."}</p></section>` : ""}
     <div class="grid two">
-      <section class="card"><h2>Active calibration</h2>${active ? `<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active. Complete a run below.</p>'}</section>
+      <section class="card"><h2>Active calibration</h2>${active ? `${String(active.notes || "").includes("[PROVISIONAL:") ? '<p class="warning-text">Provisional estimate from a partial sample run. Volumes and charges may be inaccurate until the full calibration is completed.</p>' : ""}<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active. Complete a run below.</p>'}</section>
       <section class="card"><h2>New calibration run</h2><form id="calibration-form" class="stack"><label>Liquid<input name="liquid" maxlength="80" value="water" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.000" required></label><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Create ten-pour run</button></form></section>
     </div>
     <section id="calibration-runs" class="stack">${state.calibrationDetails
@@ -1219,11 +1503,13 @@ function render() {
     else if (current === "/keg") main.innerHTML = kegView();
     else if (current === "/calibration") main.innerHTML = calibrationView();
     else if (current === "/participants") main.innerHTML = participantsView();
+    else if (current === "/management") main.innerHTML = managementView();
     else if (current === "/settings") main.innerHTML = settingsView();
     else main.innerHTML = page("Not found", "That screen does not exist.", '<a class="button" href="#/">Return home</a>');
   }
   mountDemoGuide();
   bindForms();
+  attachCameraPreview();
   if (shouldFocus) {
     main.querySelector("h1")?.focus({ preventScroll: true });
   } else if (priorFocus) {
@@ -1312,6 +1598,7 @@ function bindLoginForm() {
       syncSecurityUi();
       if (!state.socket) connectSocket();
       showToast("Administrator unlocked");
+      if (route() === "/management") await loadManagement();
     } catch (error) { showError(error); }
   });
 }
@@ -1355,6 +1642,29 @@ function bindForms() {
   document.querySelector("#pin-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try { await mutation("pin", "/api/v1/security/pin", { pin: form.get("pin") }, "PUT"); state.security = await api("/api/v1/security/context"); showToast("Administrator PIN updated; unlock again with the new PIN"); render(); } catch (error) { showError(error); }
+  });
+  document.querySelector("#management-settings-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); const form = new FormData(event.currentTarget);
+    try {
+      state.management = await mutation("management-settings", "/api/v1/management/settings", { price_per_fl_oz: form.get("price_per_fl_oz") }, "PATCH");
+      showToast("Beer price saved"); render();
+    } catch (error) { showError(error); }
+  });
+  document.querySelector("#keg-remaining-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); const form = new FormData(event.currentTarget);
+    const accepted = await confirmAction(`Set the current keg to ${form.get("percent_remaining")}% remaining? This creates an audited inventory correction.`, "Update keg level");
+    if (!accepted) return;
+    try {
+      await mutation("keg-remaining", "/api/v1/management/keg/remaining", { percent_remaining: form.get("percent_remaining"), reason: form.get("reason") });
+      showToast("Keg level updated"); await loadManagement();
+    } catch (error) { showError(error); }
+  });
+  for (const formElement of document.querySelectorAll(".fund-form")) formElement.addEventListener("submit", async (event) => {
+    event.preventDefault(); const element = event.currentTarget; const form = new FormData(element);
+    try {
+      await mutation(`funds-${element.dataset.participant}`, `/api/v1/management/participants/${element.dataset.participant}/funds`, { amount_dollars: form.get("amount_dollars"), reason: form.get("reason") });
+      showToast("Funds recorded"); await loadManagement();
+    } catch (error) { showError(error); }
   });
   bindLoginForm();
   for (const form of document.querySelectorAll(".participant-edit")) form.addEventListener("submit", async (event) => {
@@ -1408,8 +1718,12 @@ main.addEventListener("click", async (event) => {
   if (action === "capture-sample") return captureSample(button.dataset.calibration, button.dataset.ordinal);
   if (action === "toggle-sample") { try { await mutation(`sample-${button.dataset.ordinal}`, `/api/v1/calibrations/${button.dataset.calibration}/samples/${button.dataset.ordinal}`, { included: button.dataset.included === "1" }, "PATCH"); await loadCalibrations(); } catch (error) { showError(error); } return; }
   if (action === "activate-calibration") { const accepted = await confirmAction("Activate this reviewed factor? Historical pours will keep their original calibration.", "Activate calibration"); if (accepted) { try { await mutation("activate", `/api/v1/calibrations/${button.dataset.calibration}/activate`); showToast("Calibration activated"); await loadCalibrations(); } catch (error) { showError(error); } } return; }
+  if (action === "activate-provisional-calibration") { const accepted = await confirmAction("Use the included samples as a temporary calibration? Volume, keg inventory, and user charges may be inaccurate until a full ten-sample calibration replaces it.", "Use temporary estimate"); if (accepted) { try { await mutation("activate-provisional", `/api/v1/calibrations/${button.dataset.calibration}/activate-provisional`); showToast("Provisional calibration activated"); await loadCalibrations(); } catch (error) { showError(error); } } return; }
   if (action === "start-verification") return startVerification();
   if (action === "load-participants") return loadParticipants();
+  if (action === "load-management") return loadManagement();
+  if (action === "camera-enable") return enableCamera();
+  if (action === "camera-disable") return disableCamera();
   if (action === "load-ports") { try { state.serialPorts = await api("/api/v1/serial/ports"); render(); } catch (error) { showError(error); } return; }
   if (action === "serial-reconnect") { try { await mutation("serial-reconnect", "/api/v1/serial/reconnect"); showToast("Device reconnect requested"); } catch (error) { showError(error); } return; }
   if (action === "load-diagnostics") { try { state.diagnostics = await api("/api/v1/diagnostics?limit=100"); render(); } catch (error) { showError(error); } return; }
@@ -1444,6 +1758,7 @@ window.addEventListener("hashchange", () => {
   render();
   updateChrome();
   if (route() === "/history") void loadHistory();
+  if (route() === "/management") void loadManagement();
 });
 window.addEventListener("offline", () => {
   setHostAvailability(false, new Error("The kiosk network connection is offline."));
@@ -1461,6 +1776,7 @@ async function initialize() {
       const ready = await refresh();
       if (ready) {
         if (route() === "/history") await loadHistory();
+        if (route() === "/management") await loadManagement();
         connectSocket();
       }
     }

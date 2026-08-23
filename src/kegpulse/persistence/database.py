@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 APPLICATION_ID = 0x4B50554C
-CURRENT_SCHEMA = 2
+CURRENT_SCHEMA = 4
 REQUIRED_TABLES = {
     "participants",
     "kegs",
@@ -24,6 +24,10 @@ REQUIRED_TABLES = {
     "attribution_audit",
     "settings",
     "device_diagnostics",
+    "account_ledger",
+    "pour_charges",
+    "pour_photos",
+    "measurement_anomalies",
 }
 
 
@@ -137,7 +141,22 @@ class Database:
             }
             required_tables = REQUIRED_TABLES
             if version == 1:
-                required_tables = REQUIRED_TABLES - {"device_recovery_checkpoints"}
+                required_tables = REQUIRED_TABLES - {
+                    "device_recovery_checkpoints",
+                    "account_ledger",
+                    "pour_charges",
+                    "pour_photos",
+                    "measurement_anomalies",
+                }
+            elif version == 2:
+                required_tables = REQUIRED_TABLES - {
+                    "account_ledger",
+                    "pour_charges",
+                    "pour_photos",
+                    "measurement_anomalies",
+                }
+            elif version == 3:
+                required_tables = REQUIRED_TABLES - {"measurement_anomalies"}
             if not required_tables.issubset(tables):
                 raise ValueError("backup is missing required KegPulse tables")
             if version >= 2:
@@ -158,6 +177,15 @@ class Database:
                     or "superseded_at" not in sample_columns
                 ):
                     raise ValueError("backup is missing required KegPulse schema columns")
+            if version >= 4:
+                checkpoint_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(device_recovery_checkpoints)"
+                    ).fetchall()
+                }
+                if not {"accepted_pulses", "device_uptime_ms"}.issubset(checkpoint_columns):
+                    raise ValueError("backup is missing recovery checkpoint integrity columns")
         finally:
             connection.close()
 

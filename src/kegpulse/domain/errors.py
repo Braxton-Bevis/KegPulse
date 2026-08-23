@@ -12,3 +12,7 @@ class NotFoundError(DomainError):
 
 class AuthorizationError(DomainError):
     """Administrative authorization is required or invalid."""
+
+
+class MeasurementRejectedError(DomainError):
+    """A device reading is structurally valid but cannot represent physical flow."""

@@ -5,7 +5,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from kegpulse.domain.calibration import (
@@ -16,9 +16,15 @@ from kegpulse.domain.calibration import (
     pulses_to_ml,
     verification_error,
 )
-from kegpulse.domain.errors import ConflictError, NotFoundError
+from kegpulse.domain.errors import ConflictError, MeasurementRejectedError, NotFoundError
 from kegpulse.domain.inventory import InventoryState, calculate_inventory
 from kegpulse.domain.models import DeviceResult, DeviceState
+from kegpulse.domain.pulse_integrity import (
+    UINT32_MAX,
+    UINT64_MAX,
+    elapsed_u32,
+    ensure_plausible_pulse_count,
+)
 from kegpulse.domain.units import finite_decimal
 
 from .database import Database
@@ -91,6 +97,118 @@ class Repository:
                 "SELECT * FROM participants WHERE id=?", (participant_id,)
             ).fetchone()
         return dict(row)
+
+    def adjust_participant_balance(
+        self, participant_id: str, amount_cents: int, reason: str
+    ) -> dict[str, Any]:
+        clean_reason = reason.strip()
+        if isinstance(amount_cents, bool) or amount_cents == 0 or abs(amount_cents) > 10_000_000:
+            raise ValueError("fund adjustment must be a nonzero amount within $100,000")
+        if not 1 <= len(clean_reason) <= 500:
+            raise ValueError("an adjustment reason is required")
+        with self.db.transaction() as connection:
+            participant = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+            if participant is None:
+                raise NotFoundError("participant not found")
+            balance = int(participant["balance_cents"]) + amount_cents
+            now = utc_now()
+            connection.execute(
+                "UPDATE participants SET balance_cents=?, updated_at=? WHERE id=?",
+                (balance, now, participant_id),
+            )
+            connection.execute(
+                "INSERT INTO account_ledger(id, participant_id, amount_cents, kind, pour_id, "
+                "reason, balance_after_cents, created_at) "
+                "VALUES(?, ?, ?, 'adjustment', NULL, ?, ?, ?)",
+                (_id(), participant_id, amount_cents, clean_reason, balance, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+        return dict(row)
+
+    def management_summary(self) -> dict[str, Any]:
+        with self.db.read() as connection:
+            participants = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM participants ORDER BY display_name COLLATE NOCASE, created_at"
+                )
+            ]
+            ledger = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT l.*, p.display_name AS participant_name FROM account_ledger l "
+                    "JOIN participants p ON p.id=l.participant_id "
+                    "ORDER BY l.created_at DESC, l.id DESC LIMIT 100"
+                )
+            ]
+            photos = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT ph.id, ph.session_id, ph.captured_at, ph.size_bytes, "
+                    "pe.id AS pour_id, participants.display_name AS participant_name "
+                    "FROM pour_photos ph "
+                    "LEFT JOIN pour_events pe ON pe.session_id=ph.session_id "
+                    "LEFT JOIN participants ON participants.id=pe.participant_id "
+                    "ORDER BY ph.captured_at DESC LIMIT 100"
+                )
+            ]
+        return {
+            "price_cents_per_fl_oz": str(self.get_setting("beer_price_cents_per_fl_oz", "0")),
+            "webcam_enabled": bool(self.get_setting("webcam_enabled", False)),
+            "participants": participants,
+            "ledger": ledger,
+            "photos": photos,
+        }
+
+    @staticmethod
+    def _charge_pour(
+        connection: sqlite3.Connection,
+        *,
+        pour_id: str,
+        participant_id: str,
+        volume_ml: Decimal,
+        now: str,
+    ) -> None:
+        setting = connection.execute(
+            "SELECT value_json FROM settings WHERE key='beer_price_cents_per_fl_oz'"
+        ).fetchone()
+        try:
+            rate = Decimal(str(json.loads(setting["value_json"]))) if setting else Decimal("0")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            rate = Decimal("0")
+        if rate <= 0:
+            return
+        amount = int(
+            ((volume_ml / Decimal("29.5735295625")) * rate).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        if amount <= 0:
+            return
+        participant = connection.execute(
+            "SELECT balance_cents FROM participants WHERE id=?", (participant_id,)
+        ).fetchone()
+        if participant is None:
+            return
+        balance = int(participant["balance_cents"]) - amount
+        connection.execute(
+            "UPDATE participants SET balance_cents=?, updated_at=? WHERE id=?",
+            (balance, now, participant_id),
+        )
+        connection.execute(
+            "INSERT INTO pour_charges(pour_id, participant_id, volume_ml, "
+            "rate_cents_per_fl_oz, amount_cents, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (pour_id, participant_id, str(volume_ml), str(rate), amount, now),
+        )
+        connection.execute(
+            "INSERT INTO account_ledger(id, participant_id, amount_cents, kind, pour_id, reason, "
+            "balance_after_cents, created_at) VALUES(?, ?, ?, 'charge', ?, ?, ?, ?)",
+            (_id(), participant_id, -amount, pour_id, "Beer pour", balance, now),
+        )
 
     # Kegs and inventory
     def current_keg(self) -> dict[str, Any] | None:
@@ -292,7 +410,7 @@ class Repository:
     def _update_outlier_flags(
         self, connection: sqlite3.Connection, rows: list[sqlite3.Row]
     ) -> None:
-        if sum(bool(row["included"]) for row in rows) < 7:
+        if sum(bool(row["included"]) for row in rows) < 3:
             return
         analysis = analyze_calibration(self._samples_from_rows(rows), require_ten=False)
         for row, item in zip(rows, analysis.samples, strict=True):
@@ -346,8 +464,8 @@ class Repository:
             ).fetchall()
         output = dict(calibration)
         output["samples"] = [dict(row) for row in samples]
-        if len(samples) == 10 and sum(bool(row["included"]) for row in samples) >= 7:
-            analysis = analyze_calibration(self._samples_from_rows(samples))
+        if samples and any(bool(row["included"]) for row in samples):
+            analysis = analyze_calibration(self._samples_from_rows(samples), require_ten=False)
             output["analysis"] = self._analysis_dict(analysis)
         else:
             output["analysis"] = None
@@ -624,6 +742,9 @@ class Repository:
         recovered_pulses = current_lifetime - confirmed_lifetime
         if recovered_pulses <= 0 or device_uptime_ms < 0:
             raise ValueError("recovery requires a positive same-boot counter delta")
+        ensure_plausible_pulse_count(
+            recovered_pulses, device_uptime_ms, "same-boot recovered pulse count"
+        )
         recovery_session = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -889,10 +1010,10 @@ class Repository:
         calibration_id: str | None = None,
         context_captured: bool = False,
     ) -> tuple[dict[str, Any] | None, bool]:
+        duration = elapsed_u32(result.started_ms, result.ended_ms)
+        ensure_plausible_pulse_count(result.raw_pulses, duration, "device result pulse count")
         now = datetime.now(UTC)
         ended_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        # Device milliseconds are uint32 and may wrap during a valid event.
-        duration = (result.ended_ms - result.started_ms) & 0xFFFFFFFF
         started_at = (
             (now - timedelta(milliseconds=duration))
             .isoformat(timespec="milliseconds")
@@ -1050,6 +1171,14 @@ class Repository:
                     ended_at,
                 ),
             )
+            if participant_id is not None and volume is not None:
+                self._charge_pour(
+                    connection,
+                    pour_id=pour_id,
+                    participant_id=participant_id,
+                    volume_ml=volume,
+                    now=ended_at,
+                )
             if provisional:
                 connection.execute(
                     "UPDATE provisional_sessions SET status='complete', updated_at=? "
@@ -1066,6 +1195,7 @@ class Repository:
         boot_id: str,
         recovery_pulses: int,
         device_uptime_ms: int,
+        accepted_pulses: int | None = None,
         keg_id: str | None = None,
         calibration_id: str | None = None,
         context_captured: bool = False,
@@ -1073,9 +1203,14 @@ class Repository:
         """Atomically materialize only the new portion of a cumulative recovery counter."""
         if not 1 <= len(device_id) <= 64 or not 1 <= len(boot_id) <= 64:
             raise ValueError("device and boot identities are required")
-        if isinstance(recovery_pulses, bool) or not 0 <= recovery_pulses <= 0xFFFFFFFFFFFFFFFF:
-            raise ValueError("recovery_pulses is out of range")
-        if isinstance(device_uptime_ms, bool) or not 0 <= device_uptime_ms <= 0xFFFFFFFF:
+        accepted = recovery_pulses if accepted_pulses is None else accepted_pulses
+        if isinstance(recovery_pulses, bool) or not 0 <= recovery_pulses <= UINT64_MAX:
+            raise MeasurementRejectedError("recovery_pulses is out of range")
+        if isinstance(accepted, bool) or not 0 <= accepted <= UINT64_MAX:
+            raise MeasurementRejectedError("accepted_pulses is out of range")
+        if recovery_pulses > accepted:
+            raise MeasurementRejectedError("recovery pulses exceed accepted pulses")
+        if isinstance(device_uptime_ms, bool) or not 0 <= device_uptime_ms <= UINT32_MAX:
             raise ValueError("device_uptime_ms is out of range")
         now = utc_now()
         with self.db.transaction() as connection:
@@ -1083,10 +1218,26 @@ class Repository:
                 "SELECT * FROM device_recovery_checkpoints WHERE device_id=? AND boot_id=?",
                 (device_id, boot_id),
             ).fetchone()
-            previous = int(checkpoint["recovery_pulses"]) if checkpoint else 0
-            if recovery_pulses < previous:
-                raise ConflictError("same-boot recovery counter cannot decrease")
-            if recovery_pulses == previous:
+            previous_recovery = int(checkpoint["recovery_pulses"]) if checkpoint else 0
+            previous_accepted = int(checkpoint["accepted_pulses"]) if checkpoint else 0
+            previous_uptime = int(checkpoint["device_uptime_ms"]) if checkpoint else 0
+            if recovery_pulses < previous_recovery or accepted < previous_accepted:
+                raise ConflictError("same-boot pulse counters cannot decrease")
+            accepted_delta = accepted - previous_accepted
+            recovery_delta = recovery_pulses - previous_recovery
+            if recovery_delta > accepted_delta:
+                raise MeasurementRejectedError(
+                    "recovery pulse delta exceeds the accepted pulse delta"
+                )
+            elapsed = (
+                (device_uptime_ms - previous_uptime) & UINT32_MAX
+                if checkpoint
+                else device_uptime_ms
+            )
+            if checkpoint and elapsed >= 0x80000000:
+                raise ConflictError("same-boot device uptime moved backwards ambiguously")
+            ensure_plausible_pulse_count(recovery_delta, elapsed, "recovery pulse counter delta")
+            if recovery_delta == 0:
                 prior = (
                     connection.execute(
                         "SELECT * FROM pour_events WHERE id=?", (checkpoint["last_pour_id"],)
@@ -1094,14 +1245,31 @@ class Repository:
                     if checkpoint and checkpoint["last_pour_id"]
                     else None
                 )
+                connection.execute(
+                    "INSERT INTO device_recovery_checkpoints("
+                    "device_id, boot_id, recovery_pulses, last_pour_id, updated_at, "
+                    "accepted_pulses, device_uptime_ms) VALUES(?, ?, ?, NULL, ?, ?, ?) "
+                    "ON CONFLICT(device_id, boot_id) DO UPDATE SET "
+                    "accepted_pulses=excluded.accepted_pulses, "
+                    "device_uptime_ms=excluded.device_uptime_ms, "
+                    "updated_at=excluded.updated_at",
+                    (
+                        device_id,
+                        boot_id,
+                        str(recovery_pulses),
+                        now,
+                        str(accepted),
+                        device_uptime_ms,
+                    ),
+                )
                 return (_dict(prior), True)
 
-            delta = recovery_pulses - previous
+            delta = recovery_delta
             session_id = str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     "kegpulse://recovery-counter/"
-                    f"{device_id}/{boot_id}/{previous}/{recovery_pulses}",
+                    f"{device_id}/{boot_id}/{previous_recovery}/{recovery_pulses}",
                 )
             )
             keg = None
@@ -1146,14 +1314,87 @@ class Repository:
             )
             connection.execute(
                 "INSERT INTO device_recovery_checkpoints(device_id, boot_id, recovery_pulses, "
-                "last_pour_id, updated_at) VALUES(?, ?, ?, ?, ?) "
+                "last_pour_id, updated_at, accepted_pulses, device_uptime_ms) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(device_id, boot_id) DO UPDATE SET "
                 "recovery_pulses=excluded.recovery_pulses, "
-                "last_pour_id=excluded.last_pour_id, updated_at=excluded.updated_at",
-                (device_id, boot_id, str(recovery_pulses), pour_id, now),
+                "last_pour_id=excluded.last_pour_id, updated_at=excluded.updated_at, "
+                "accepted_pulses=excluded.accepted_pulses, "
+                "device_uptime_ms=excluded.device_uptime_ms",
+                (
+                    device_id,
+                    boot_id,
+                    str(recovery_pulses),
+                    pour_id,
+                    now,
+                    str(accepted),
+                    device_uptime_ms,
+                ),
             )
             row = connection.execute("SELECT * FROM pour_events WHERE id=?", (pour_id,)).fetchone()
         return dict(row), False
+
+    def record_measurement_anomaly(
+        self,
+        *,
+        identity_key: str,
+        source: str,
+        observed_value: object,
+        reason: str,
+        context: dict[str, Any],
+        device_id: str | None = None,
+        boot_id: str | None = None,
+        event_seq: object | None = None,
+    ) -> bool:
+        clean_key = identity_key.strip()
+        clean_source = source.strip()
+        clean_reason = reason.strip()
+        if not 1 <= len(clean_key) <= 500:
+            raise ValueError("measurement anomaly identity is invalid")
+        if not 1 <= len(clean_source) <= 40:
+            raise ValueError("measurement anomaly source is invalid")
+        if not 1 <= len(clean_reason) <= 500:
+            raise ValueError("measurement anomaly reason is invalid")
+        encoded = json.dumps(context, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        if len(encoded) > 4000:
+            encoded = json.dumps(
+                {"truncated": True, "keys": sorted(str(key)[:80] for key in context)[:40]},
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        with self.db.transaction() as connection:
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO measurement_anomalies("
+                "id, identity_key, source, device_id, boot_id, event_seq, observed_value, "
+                "reason, context_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _id(),
+                    clean_key,
+                    clean_source,
+                    device_id,
+                    boot_id,
+                    None if event_seq is None else str(event_seq),
+                    str(observed_value)[:200],
+                    clean_reason,
+                    encoded,
+                    utc_now(),
+                ),
+            ).rowcount
+            connection.execute(
+                "DELETE FROM measurement_anomalies WHERE id NOT IN "
+                "(SELECT id FROM measurement_anomalies ORDER BY created_at DESC, rowid DESC "
+                "LIMIT 500)"
+            )
+        return inserted == 1
+
+    def list_measurement_anomalies(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(limit, 500))
+        with self.db.read() as connection:
+            rows = connection.execute(
+                "SELECT * FROM measurement_anomalies ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_pours(
         self,
@@ -1175,9 +1416,13 @@ class Repository:
         with self.db.read() as connection:
             rows = connection.execute(
                 "SELECT p.*, participants.display_name AS participant_name, "
-                "kegs.label AS keg_label "
+                "kegs.label AS keg_label, "
+                "calibrations.default_density_g_per_ml AS calibration_density_g_per_ml "
                 "FROM pour_events p LEFT JOIN participants ON participants.id=p.participant_id "
-                "LEFT JOIN kegs ON kegs.id=p.keg_id" + clause + " ORDER BY p.ended_at DESC LIMIT ?",
+                "LEFT JOIN kegs ON kegs.id=p.keg_id "
+                "LEFT JOIN calibrations ON calibrations.id=p.calibration_id"
+                + clause
+                + " ORDER BY p.ended_at DESC LIMIT ?",
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1197,9 +1442,12 @@ class Repository:
             with self.db.read() as connection:
                 rows = connection.execute(
                     "SELECT p.*, participants.display_name AS participant_name, "
-                    "kegs.label AS keg_label FROM pour_events p "
+                    "kegs.label AS keg_label, "
+                    "calibrations.default_density_g_per_ml AS calibration_density_g_per_ml "
+                    "FROM pour_events p "
                     "LEFT JOIN participants ON participants.id=p.participant_id "
-                    "LEFT JOIN kegs ON kegs.id=p.keg_id"
+                    "LEFT JOIN kegs ON kegs.id=p.keg_id "
+                    "LEFT JOIN calibrations ON calibrations.id=p.calibration_id"
                     + where
                     + " ORDER BY p.ended_at DESC, p.id DESC LIMIT ?",
                     parameters,
@@ -1234,7 +1482,205 @@ class Repository:
                 "UPDATE pour_events SET participant_id=?, attributed=1 WHERE id=?",
                 (participant_id, pour_id),
             )
-            row = connection.execute("SELECT * FROM pour_events WHERE id=?", (pour_id,)).fetchone()
+            charge = connection.execute(
+                "SELECT * FROM pour_charges WHERE pour_id=?", (pour_id,)
+            ).fetchone()
+            old_participant_id = pour["participant_id"]
+            if charge is not None and old_participant_id != participant_id:
+                amount = int(charge["amount_cents"])
+                old = connection.execute(
+                    "SELECT balance_cents FROM participants WHERE id=?", (old_participant_id,)
+                ).fetchone()
+                if old is not None:
+                    old_balance = int(old["balance_cents"]) + amount
+                    connection.execute(
+                        "UPDATE participants SET balance_cents=?, updated_at=? WHERE id=?",
+                        (old_balance, now, old_participant_id),
+                    )
+                    connection.execute(
+                        "INSERT INTO account_ledger(id, participant_id, amount_cents, kind, "
+                        "pour_id, reason, balance_after_cents, created_at) "
+                        "VALUES(?, ?, ?, 'refund', ?, ?, ?, ?)",
+                        (
+                            _id(),
+                            old_participant_id,
+                            amount,
+                            pour_id,
+                            "Pour reassigned",
+                            old_balance,
+                            now,
+                        ),
+                    )
+                new = connection.execute(
+                    "SELECT balance_cents FROM participants WHERE id=?", (participant_id,)
+                ).fetchone()
+                new_balance = int(new["balance_cents"]) - amount
+                connection.execute(
+                    "UPDATE participants SET balance_cents=?, updated_at=? WHERE id=?",
+                    (new_balance, now, participant_id),
+                )
+                connection.execute(
+                    "UPDATE pour_charges SET participant_id=? WHERE pour_id=?",
+                    (participant_id, pour_id),
+                )
+                connection.execute(
+                    "INSERT INTO account_ledger(id, participant_id, amount_cents, kind, pour_id, "
+                    "reason, balance_after_cents, created_at) "
+                    "VALUES(?, ?, ?, 'charge', ?, ?, ?, ?)",
+                    (
+                        _id(),
+                        participant_id,
+                        -amount,
+                        pour_id,
+                        "Reassigned beer pour",
+                        new_balance,
+                        now,
+                    ),
+                )
+            elif charge is None and pour["volume_ml"] is not None:
+                self._charge_pour(
+                    connection,
+                    pour_id=pour_id,
+                    participant_id=participant_id,
+                    volume_ml=Decimal(str(pour["volume_ml"])),
+                    now=now,
+                )
+            row = connection.execute(
+                "SELECT p.*, participants.display_name AS participant_name, "
+                "kegs.label AS keg_label, "
+                "calibrations.default_density_g_per_ml AS calibration_density_g_per_ml "
+                "FROM pour_events p "
+                "LEFT JOIN participants ON participants.id=p.participant_id "
+                "LEFT JOIN kegs ON kegs.id=p.keg_id "
+                "LEFT JOIN calibrations ON calibrations.id=p.calibration_id "
+                "WHERE p.id=?",
+                (pour_id,),
+            ).fetchone()
+        return dict(row)
+
+    def activate_provisional_calibration(self, calibration_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.db.transaction() as connection:
+            calibration = connection.execute(
+                "SELECT * FROM calibrations WHERE id=?", (calibration_id,)
+            ).fetchone()
+            if calibration is None:
+                raise NotFoundError("calibration not found")
+            if calibration["status"] != "draft":
+                raise ConflictError("only a draft calibration can be activated")
+            samples = connection.execute(
+                "SELECT * FROM calibration_samples WHERE calibration_id=? "
+                "AND superseded_at IS NULL ORDER BY ordinal",
+                (calibration_id,),
+            ).fetchall()
+            included = [row for row in samples if bool(row["included"])]
+            if not 1 <= len(samples) < 10 or not included:
+                raise ConflictError(
+                    "provisional activation requires a partial run with at least "
+                    "one included sample; complete runs use the reviewed activation"
+                )
+            if connection.execute(
+                "SELECT 1 FROM provisional_sessions WHERE status IN "
+                "('arming', 'armed', 'pouring', 'settling', 'finalizing') LIMIT 1"
+            ).fetchone():
+                raise ConflictError("cannot activate calibration during an active pour")
+            analysis = analyze_calibration(self._samples_from_rows(samples), require_ten=False)
+            factor = analysis.pulses_per_ml
+            noun = "sample" if len(included) == 1 else "samples"
+            marker = (
+                f"[PROVISIONAL: estimate from {len(included)} included {noun}; "
+                "replace with a full calibration run]"
+            )
+            notes = str(calibration["notes"]).strip()
+            notes = f"{notes}\n{marker}" if notes else marker
+            connection.execute("UPDATE calibrations SET status='superseded' WHERE status='active'")
+            connection.execute(
+                "UPDATE calibrations SET status='active', pulses_per_ml=?, notes=?, "
+                "activated_at=? WHERE id=? AND status='draft'",
+                (str(factor), notes, now, calibration_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM calibrations WHERE id=?", (calibration_id,)
+            ).fetchone()
+        return dict(row)
+
+    def set_current_keg_remaining_percent(
+        self, percent_remaining: Decimal | str | int | float, reason: str
+    ) -> dict[str, Any]:
+        percent = finite_decimal(percent_remaining, "percent_remaining")
+        clean_reason = reason.strip()
+        if not Decimal("0") <= percent <= Decimal("100"):
+            raise ValueError("remaining percentage must be between 0 and 100")
+        if not 1 <= len(clean_reason) <= 500:
+            raise ValueError("an inventory correction reason is required")
+        adjustment_id, now = _id(), utc_now()
+        with self.db.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM provisional_sessions WHERE status IN "
+                "('arming', 'armed', 'pouring', 'settling', 'finalizing') LIMIT 1"
+            ).fetchone():
+                raise ConflictError("cannot change remaining inventory during an active pour")
+            keg = connection.execute("SELECT * FROM kegs WHERE closed_at IS NULL").fetchone()
+            if keg is None:
+                raise NotFoundError("no current keg is installed")
+            poured_rows = connection.execute(
+                "SELECT volume_ml FROM pour_events WHERE keg_id=? AND volume_ml IS NOT NULL",
+                (keg["id"],),
+            ).fetchall()
+            adjustment_rows = connection.execute(
+                "SELECT amount_ml FROM inventory_adjustments WHERE keg_id=?",
+                (keg["id"],),
+            ).fetchall()
+            starting = Decimal(str(keg["starting_volume_ml"]))
+            poured = sum((Decimal(str(row["volume_ml"])) for row in poured_rows), Decimal(0))
+            adjustments = sum(
+                (Decimal(str(row["amount_ml"])) for row in adjustment_rows), Decimal(0)
+            )
+            current = starting - poured + adjustments
+            target = starting * percent / Decimal("100")
+            delta = target - current
+            if delta == 0:
+                raise ConflictError("keg inventory is already at that percentage")
+            connection.execute(
+                "INSERT INTO inventory_adjustments(id, keg_id, amount_ml, reason, created_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (adjustment_id, keg["id"], str(delta), clean_reason, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM inventory_adjustments WHERE id=?", (adjustment_id,)
+            ).fetchone()
+        return dict(row)
+
+    def add_pour_photo(
+        self, session_id: str, relative_path: str, size_bytes: int, sha256: str
+    ) -> dict[str, Any]:
+        canonical = _canonical_session(session_id)
+        with self.db.transaction() as connection:
+            session = connection.execute(
+                "SELECT * FROM provisional_sessions WHERE session_id=?", (canonical,)
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("pour session not found")
+            if session["purpose"] != "pour" or session["status"] not in {"pouring", "settling"}:
+                raise ConflictError("photos are only accepted while a pour is active")
+            photo_id, now = _id(), utc_now()
+            connection.execute(
+                "INSERT INTO pour_photos(id, session_id, captured_at, relative_path, size_bytes, "
+                "sha256) VALUES(?, ?, ?, ?, ?, ?)",
+                (photo_id, canonical, now, relative_path, size_bytes, sha256),
+            )
+            row = connection.execute(
+                "SELECT id, session_id, captured_at, size_bytes, sha256 "
+                "FROM pour_photos WHERE id=?",
+                (photo_id,),
+            ).fetchone()
+        return dict(row)
+
+    def get_pour_photo(self, photo_id: str) -> dict[str, Any]:
+        with self.db.read() as connection:
+            row = connection.execute("SELECT * FROM pour_photos WHERE id=?", (photo_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("pour photo not found")
         return dict(row)
 
     # Settings and diagnostics

@@ -6,6 +6,9 @@
 namespace kegpulse {
 
 constexpr size_t kMaxFrameBytes = 256;
+// Every defined KP1 host command fits in 113 bytes. The Nano keeps a smaller
+// inbound buffer while responses retain the full protocol frame allowance.
+constexpr size_t kMaxInboundFrameBytes = 128;
 constexpr uint8_t kMaxFields = 12;
 
 constexpr bool upper_hex_digit(char value) {
@@ -70,7 +73,7 @@ class FrameParser {
   bool push(char byte, ParsedFrame* output, ParseError* error);
 
  private:
-  char buffer_[kMaxFrameBytes + 1];
+  char buffer_[kMaxInboundFrameBytes + 1];
   size_t length_;
   bool discarding_;
 };

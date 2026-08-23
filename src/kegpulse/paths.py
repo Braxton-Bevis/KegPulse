@@ -14,10 +14,11 @@ class AppPaths:
     logs: Path
     backups: Path
     exports: Path
+    photos: Path
     config: Path
 
     def ensure(self) -> None:
-        for directory in (self.root, self.logs, self.backups, self.exports):
+        for directory in (self.root, self.logs, self.backups, self.exports, self.photos):
             directory.mkdir(parents=True, exist_ok=True)
             if os.name != "nt":
                 directory.chmod(0o700)
@@ -36,5 +37,6 @@ def get_app_paths(override: str | Path | None = None) -> AppPaths:
         logs=root / "logs",
         backups=root / "backups",
         exports=root / "exports",
+        photos=root / "pour-photos",
         config=root / "config.json",
     )

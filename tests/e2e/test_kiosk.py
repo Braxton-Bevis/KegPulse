@@ -55,6 +55,70 @@ def add_demo_pulses(page: Page, *, batches: int = 10) -> None:
 
 
 @pytest.mark.e2e
+def test_management_is_pin_protected_and_updates_participant_funds(
+    page: Page, live_app: LiveApp
+) -> None:
+    live_app.app.state.security.set_pin("123456")
+    live_app.app.state.repository.create_participant("Morgan")
+    live_app.app.state.repository.replace_keg("Partial keg", 1000)
+    page.goto(f"{live_app.url}/#/management")
+    expect(page.get_by_role("heading", name="Management")).to_be_visible()
+    expect(page.get_by_label("Unlock with PIN")).to_be_visible()
+    page.get_by_label("Unlock with PIN").fill("123456")
+    page.get_by_role("button", name="Unlock administrator").click()
+    expect(page.get_by_role("heading", name="Participant funds")).to_be_visible(timeout=5000)
+    expect(page.get_by_role("img", name="Keg 100% remaining by volume")).to_be_visible()
+    page.get_by_label("Set remaining volume (%)").fill("90")
+    page.locator("#keg-remaining-form").get_by_role("button", name="Update keg level").click()
+    page.locator("#confirm-dialog").get_by_role("button", name="Update keg level").click()
+    expect(page.get_by_role("img", name="Keg 90% remaining by volume")).to_be_visible()
+    assert live_app.app.state.repository.inventory().remaining_ml == Decimal("900")
+    account = page.locator(".account-row", has_text="Morgan")
+    expect(account.get_by_text("$0.00")).to_be_visible()
+    account.get_by_label("Funds change ($)").fill("25.00")
+    account.get_by_label("Reason").fill("Opening balance")
+    account.get_by_role("button", name="Record funds").click()
+    expect(page.locator(".account-row", has_text="Morgan").get_by_text("$25.00")).to_be_visible()
+    assert (
+        live_app.app.state.repository.management_summary()["participants"][0]["balance_cents"]
+        == 2500
+    )
+    page.evaluate("window.scrollTo(0, 0)")
+    page.screenshot(path=str(live_app.artifacts / "management.png"))
+    page.evaluate(
+        """() => {
+          const canvas = document.createElement('canvas');
+          canvas.width = 640; canvas.height = 480;
+          const context = canvas.getContext('2d');
+          context.fillStyle = '#d79a25'; context.fillRect(0, 0, 640, 480);
+          context.fillStyle = '#111315'; context.font = '48px sans-serif';
+          context.fillText('KegPulse camera', 105, 250);
+          window.__kegPulseTestCamera = canvas.captureStream(5);
+          Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
+            configurable: true,
+            value: async () => window.__kegPulseTestCamera,
+          });
+        }"""
+    )
+    page.get_by_role("button", name="Enable camera").click()
+    expect(page.get_by_role("button", name="Camera armed")).to_be_visible()
+    page.get_by_role("link", name="Home", exact=True).click()
+    page.get_by_role("button", name="Morgan").click()
+    camera_status = page.get_by_role("complementary", name="Pour camera status")
+    expect(camera_status.get_by_text("Camera ready; recording starts with flow")).to_be_visible()
+    expect(camera_status.locator("video")).to_be_visible()
+    live_app.simulator.inject_pulses(25)
+    expect(camera_status.get_by_text("Recording pour evidence")).to_be_visible(timeout=5000)
+    for _ in range(20):
+        if live_app.app.state.repository.management_summary()["photos"]:
+            break
+        page.wait_for_timeout(100)
+    assert live_app.app.state.repository.management_summary()["photos"]
+    page.screenshot(path=str(live_app.artifacts / "pour-camera-preview.png"))
+    live_app.simulator.finish_pour()
+
+
+@pytest.mark.e2e
 @pytest.mark.parametrize("viewport", [(800, 480), (1024, 600), (1440, 900)])
 def test_required_viewports_are_touch_safe_and_local_only(
     browser, live_app: LiveApp, viewport: tuple[int, int]
@@ -89,7 +153,6 @@ def test_required_viewports_are_touch_safe_and_local_only(
         assert all(url.startswith(live_app.url) for url in requests)
         page.screenshot(
             path=live_app.artifacts / f"home-{viewport[0]}x{viewport[1]}.png",
-            full_page=True,
         )
     finally:
         context.close()
@@ -410,7 +473,9 @@ def test_participant_pour_refresh_completion_history_and_disconnect(
     live_app.simulator.finish_pour()
     expect(page).to_have_url(re.compile(r"#/complete$"), timeout=5000)
     expect(page.get_by_role("heading", name="Pour recorded")).to_be_visible()
-    expect(page.get_by_text("3.4 fl oz", exact=False)).to_be_visible()
+    expect(
+        page.get_by_label("3.4 US fluid ounces, 100.0 milliliters, approximately 100.0 grams")
+    ).to_be_visible()
     page.screenshot(path=live_app.artifacts / "pour-complete.png", full_page=True)
     page.get_by_role("button", name="Stay here").click()
     page.goto(f"{live_app.url}/#/history")
@@ -424,6 +489,48 @@ def test_participant_pour_refresh_completion_history_and_disconnect(
     live_app.simulator.reconnect_device()
     expect(page.locator("#connection-badge")).to_contain_text("connected", timeout=10_000)
     assert repo.inventory().remaining_ml == Decimal(4900)
+
+
+@pytest.mark.e2e
+def test_home_flow_dock_stays_below_header_and_animates_live_flow(
+    page: Page, live_app: LiveApp
+) -> None:
+    configure_measurement(live_app.app.state.repository)
+    wait_connected(page, live_app)
+
+    flow_dock = page.locator(".flow-dock")
+    expect(flow_dock).to_be_visible()
+    page.evaluate("window.scrollTo(0, 900)")
+    page.wait_for_timeout(200)
+    geometry = page.evaluate(
+        """() => ({
+          headerBottom: document.querySelector('.app-header').getBoundingClientRect().bottom,
+          flowTop: document.querySelector('.flow-dock').getBoundingClientRect().top
+        })"""
+    )
+    assert geometry["flowTop"] >= geometry["headerBottom"]
+
+    page.evaluate("window.scrollTo(0, 0)")
+    page.set_viewport_size({"width": 390, "height": 844})
+    live_app.simulator.inject_pulses(25)
+    expect(flow_dock).to_have_class(re.compile(r"\bflowing\b"), timeout=5000)
+    page.wait_for_function(
+        "Number(document.querySelector('.flow-rate strong').textContent) > 0",
+        timeout=5000,
+    )
+    live_total = flow_dock.locator(".flow-total strong")
+    expect(live_total).to_contain_text("fl oz")
+    expect(live_total).to_contain_text("mL")
+    expect(live_total).to_contain_text("g")
+    clipping = live_total.evaluate(
+        """element => ({
+          horizontal: element.scrollWidth > element.clientWidth + 1,
+          vertical: element.scrollHeight > element.clientHeight + 1
+        })"""
+    )
+    assert clipping == {"horizontal": False, "vertical": False}
+    stream = page.locator(".beer-stream").evaluate("element => getComputedStyle(element).opacity")
+    assert stream == "1"
 
 
 @pytest.mark.e2e

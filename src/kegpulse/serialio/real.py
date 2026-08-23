@@ -6,6 +6,7 @@ import importlib
 import os
 import shlex
 import threading
+import time
 from collections.abc import Callable
 from typing import Protocol, cast
 
@@ -77,6 +78,8 @@ def enumerate_ports() -> list[dict[str, str | int | None]]:
 
 
 class SerialTransport(FlowTransport):
+    _OPEN_SETTLE_SECONDS = 2.0
+
     def __init__(self, port: str, *, baudrate: int = 115200) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -100,6 +103,10 @@ class SerialTransport(FlowTransport):
                 write_timeout=1,
                 exclusive=True if os.name == "posix" else None,
             )
+            # Nano-compatible boards reset when the USB serial port opens. Wait for
+            # the bootloader to release the UART before sending the KP1 handshake.
+            time.sleep(self._OPEN_SETTLE_SECONDS)
+            self._serial.reset_input_buffer()
         except (serial.SerialException, OSError) as exc:
             permission_denied = getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM} or (
                 "permission denied" in str(exc).lower()

@@ -64,6 +64,14 @@ MachineError SessionMachine::allocate_sequence(uint32_t* sequence) {
   return MachineError::NONE;
 }
 
+void SessionMachine::add_recovery_pulses(uint32_t count) {
+  if (UINT64_MAX - recovery_pulses_ < count) {
+    recovery_pulses_ = UINT64_MAX;
+  } else {
+    recovery_pulses_ += count;
+  }
+}
+
 MachineError SessionMachine::arm(const char* session_id, uint32_t sequence,
                                  uint32_t now_ms, uint32_t ttl_ms,
                                  bool* duplicate) {
@@ -78,7 +86,7 @@ MachineError SessionMachine::arm(const char* session_id, uint32_t sequence,
     *duplicate = true;
     return MachineError::NONE;
   }
-  for (uint8_t index = 0; index < result_count_; ++index) {
+  for (uint8_t index = 0; index < result_count(); ++index) {
     if (results_[index].sequence == sequence &&
         strcmp(results_[index].session_id, session_id) == 0) {
       *duplicate = true;
@@ -115,7 +123,7 @@ MachineError SessionMachine::cancel(const char* session_id, uint32_t sequence,
   *produced_result = false;
   bool ignored = false;
   tick(now_ms, &ignored);
-  for (uint8_t index = 0; index < result_count_; ++index) {
+  for (uint8_t index = 0; index < result_count(); ++index) {
     if (results_[index].sequence == sequence &&
         strcmp(results_[index].session_id, session_id) == 0) {
       *duplicate = true;
@@ -162,18 +170,14 @@ MachineError SessionMachine::add_pulses(uint32_t count, uint32_t captured_ms,
   lifetime_pulses_ += count;
   if (!active_present_) {
     if (result_count_ >= kResultCapacity) {
-      if (UINT64_MAX - recovery_pulses_ < count) {
-        recovery_pulses_ = UINT64_MAX;
-      } else {
-        recovery_pulses_ += count;
-      }
+      add_recovery_pulses(count);
       fault_ = "result_store_full";
       return MachineError::BUSY;
     }
     uint32_t sequence = 0;
     const MachineError allocation = allocate_sequence(&sequence);
     if (allocation != MachineError::NONE) {
-      recovery_pulses_ += count;
+      add_recovery_pulses(count);
       return allocation;
     }
     active_present_ = true;
@@ -304,6 +308,7 @@ MachineError SessionMachine::finalize(DeviceState status, uint32_t ended_ms,
 
 MachineError SessionMachine::acknowledge(uint32_t sequence, bool* already) {
   *already = true;
+  result_count_ = result_count();
   for (uint8_t index = 0; index < result_count_; ++index) {
     if (results_[index].sequence == sequence) {
       for (uint8_t move = index; move + 1 < result_count_; ++move) {
@@ -324,6 +329,7 @@ MachineError SessionMachine::acknowledge(uint32_t sequence, bool* already) {
 
 Snapshot SessionMachine::snapshot(uint32_t now_ms) const {
   Snapshot output{};
+  output.session_id = "";
   output.state = state_;
   output.lifetime_pulses = lifetime_pulses_;
   if (active_present_ && active_.state == DeviceState::ARMED &&
@@ -331,18 +337,19 @@ Snapshot SessionMachine::snapshot(uint32_t now_ms) const {
     output.arm_remaining_ms = active_.arm_deadline_ms - now_ms;
   }
   output.next_sequence = next_sequence_;
-  output.retained_results = result_count_;
+  const uint8_t retained = result_count();
+  output.retained_results = retained;
   output.recovery_pulses = recovery_pulses_;
   output.fault = fault_;
   if (active_present_) {
     output.sequence = active_.sequence;
-    memcpy(output.session_id, active_.session_id, sizeof(output.session_id));
+    output.session_id = active_.session_id;
     output.attributed = active_.attributed;
     output.session_pulses = active_.pulses;
-  } else if (result_count_ > 0) {
-    const Result& latest = results_[result_count_ - 1];
+  } else if (retained > 0) {
+    const Result& latest = results_[retained - 1];
     output.sequence = latest.sequence;
-    memcpy(output.session_id, latest.session_id, sizeof(output.session_id));
+    output.session_id = latest.session_id;
     output.attributed = latest.attributed;
     output.session_pulses = latest.pulses;
   }
@@ -350,7 +357,8 @@ Snapshot SessionMachine::snapshot(uint32_t now_ms) const {
 }
 
 const Result* SessionMachine::result_at(uint8_t index) const {
-  return index < result_count_ ? &results_[index] : nullptr;
+  return index < kResultCapacity && index < result_count_ ? &results_[index]
+                                                           : nullptr;
 }
 
 const char* state_name(DeviceState state) {

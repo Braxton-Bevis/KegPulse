@@ -39,6 +39,8 @@ static_assert(kegpulse::valid_upper_hex_identity(kDeviceId),
 static_assert(sizeof(uint32_t) == 4, "KegPulse requires 32-bit uint32_t counters");
 static_assert(sizeof(uint64_t) == 8, "KegPulse requires 64-bit uint64_t counters");
 static_assert(kegpulse::kMaxFrameBytes == 256, "KP1 wire limit must remain 256 bytes");
+static_assert(kegpulse::kMaxInboundFrameBytes == 128,
+              "Nano request buffer must remain within the SRAM budget");
 static_assert(kegpulse::kMaxFields == 12, "KP1 parser field bound must remain 12");
 constexpr char kFirmwareVersion[] = "1.0.0";
 constexpr uint16_t kBootMagic = 0x4B50;
@@ -125,20 +127,20 @@ void pulse_isr() {
   g_last_pulse_ms = captured_ms;
 }
 
-void u64_to_ascii(uint64_t value, char output[24]) {
-  char reverse[24];
-  uint8_t length = 0;
+void u64_to_ascii(uint64_t value, char output[21]) {
+  char* cursor = output + 20;
+  *cursor = '\0';
   do {
-    reverse[length++] = static_cast<char>('0' + value % 10U);
+    *--cursor = static_cast<char>('0' + value % 10U);
     value /= 10U;
-  } while (value > 0 && length < sizeof(reverse));
-  for (uint8_t index = 0; index < length; ++index) {
-    output[index] = reverse[length - index - 1];
+  } while (value > 0);
+
+  char* destination = output;
+  while ((*destination++ = *cursor++) != '\0') {
   }
-  output[length] = '\0';
 }
 
-void u32_to_ascii(uint32_t value, char output[16]) { ultoa(value, output, 10); }
+void u32_to_ascii(uint32_t value, char output[11]) { ultoa(value, output, 10); }
 
 void hex64_to_ascii(uint64_t value, char output[17]) {
   static constexpr char digits[] = "0123456789ABCDEF";
@@ -258,7 +260,7 @@ void send_error(const char* request_id, const char* operation,
 
 void emit_result(const kegpulse::Result& result) {
   kegpulse::Field fields[11]{};
-  char boot[17], sequence[16], pulses[24], lifetime[24], started[16], ended[16];
+  char boot[17], sequence[11], pulses[21], lifetime[21], started[11], ended[11];
   hex64_to_ascii(g_boot_counter, boot);
   u32_to_ascii(result.sequence, sequence);
   u64_to_ascii(result.pulses, pulses);
@@ -289,18 +291,14 @@ void emit_new_results() {
   }
 }
 
-void send_status(const char* request_id, uint32_t now_ms) {
-  bool produced = false;
-  g_machine.tick(now_ms, &produced);
-  if (produced) {
-    emit_new_results();
-  }
+__attribute__((noinline)) void send_status(const char* request_id,
+                                           uint32_t now_ms) {
   const kegpulse::Snapshot status = g_machine.snapshot(now_ms);
   // Recovery/fault diagnostics live in COUNTERS so a worst-case STATUS frame
   // (active 32-byte SID plus maximum-width counters) stays below 256 bytes.
   kegpulse::Field fields[11]{};
-  char boot[17], sequence[16], pulses[24], lifetime[24], uptime[16], next[16],
-      retained[8], arm_left[16];
+  char boot[17], sequence[11], pulses[21], lifetime[21], uptime[11], next[11],
+      retained[4], arm_left[11];
   hex64_to_ascii(g_boot_counter, boot);
   u32_to_ascii(status.sequence, sequence);
   u64_to_ascii(status.session_pulses, pulses);
@@ -325,7 +323,27 @@ void send_status(const char* request_id, uint32_t now_ms) {
   send_fields('R', request_id, "STATUS", fields, 11);
 }
 
-void handle_request(const kegpulse::ParsedFrame& frame, uint32_t boundary_ms) {
+__attribute__((noinline)) void send_counters(const char* request_id,
+                                             uint32_t boundary_ms) {
+  uint32_t rejected = 0;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rejected = g_rejected_pulses; }
+  const kegpulse::Snapshot status = g_machine.snapshot(boundary_ms);
+  kegpulse::Field fields[5]{};
+  char accepted[21], rejected_text[11], gate[11], recovery[21];
+  u64_to_ascii(status.lifetime_pulses, accepted);
+  u32_to_ascii(rejected, rejected_text);
+  u32_to_ascii(static_cast<uint32_t>(KEGPULSE_NOISE_GATE_US), gate);
+  u64_to_ascii(status.recovery_pulses, recovery);
+  set_field(&fields[0], "accepted", accepted);
+  set_field(&fields[1], "rejected", rejected_text);
+  set_field(&fields[2], "noise_gate_us", gate);
+  set_field(&fields[3], "recovery", recovery);
+  set_field(&fields[4], "fault", status.fault);
+  send_fields('R', request_id, "COUNTERS", fields, 5);
+}
+
+__attribute__((noinline)) void handle_request(
+    const kegpulse::ParsedFrame& frame, uint32_t boundary_ms) {
   if (frame.kind != 'Q') {
     send_error(frame.request_id, frame.operation, "MALFORMED");
     return;
@@ -365,28 +383,6 @@ void handle_request(const kegpulse::ParsedFrame& frame, uint32_t boundary_ms) {
     send_fields('R', frame.request_id, "PING", &field, 1);
     return;
   }
-  if (strcmp(frame.operation, "STATUS") == 0) {
-    send_status(frame.request_id, boundary_ms);
-    return;
-  }
-  if (strcmp(frame.operation, "COUNTERS") == 0) {
-    uint32_t rejected = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rejected = g_rejected_pulses; }
-    const kegpulse::Snapshot status = g_machine.snapshot(boundary_ms);
-    kegpulse::Field fields[5]{};
-    char accepted[24], rejected_text[16], gate[16], recovery[24];
-    u64_to_ascii(status.lifetime_pulses, accepted);
-    u32_to_ascii(rejected, rejected_text);
-    u32_to_ascii(static_cast<uint32_t>(KEGPULSE_NOISE_GATE_US), gate);
-    u64_to_ascii(status.recovery_pulses, recovery);
-    set_field(&fields[0], "accepted", accepted);
-    set_field(&fields[1], "rejected", rejected_text);
-    set_field(&fields[2], "noise_gate_us", gate);
-    set_field(&fields[3], "recovery", recovery);
-    set_field(&fields[4], "fault", status.fault);
-    send_fields('R', frame.request_id, "COUNTERS", fields, 5);
-    return;
-  }
   if (strcmp(frame.operation, "RESULTS") == 0) {
     for (uint8_t index = 0; index < g_machine.result_count(); ++index) {
       const kegpulse::Result* result = g_machine.result_at(index);
@@ -395,7 +391,7 @@ void handle_request(const kegpulse::ParsedFrame& frame, uint32_t boundary_ms) {
       }
     }
     kegpulse::Field field{};
-    char count[8];
+    char count[4];
     u32_to_ascii(g_machine.result_count(), count);
     set_field(&field, "count", count);
     send_fields('R', frame.request_id, "RESULTS_END", &field, 1);
@@ -504,20 +500,34 @@ void apply_pending_batch(const PendingPulseBatch& batch) {
 
 void drain_pulses() { apply_pending_batch(capture_pending_batch()); }
 
-void handle_request_linearized(const kegpulse::ParsedFrame& frame) {
+void advance_machine(uint32_t now_ms) {
+  bool produced = false;
+  g_machine.tick(now_ms, &produced);
+  if (produced) {
+    emit_new_results();
+  }
+}
+
+__attribute__((noinline)) void handle_request_linearized(
+    const kegpulse::ParsedFrame& frame) {
   const PendingPulseBatch batch = capture_pending_batch();
   apply_pending_batch(batch);
+  if (frame.kind == 'Q' && strcmp(frame.operation, "STATUS") == 0) {
+    advance_machine(batch.boundary_ms);
+    send_status(frame.request_id, batch.boundary_ms);
+    return;
+  }
+  if (frame.kind == 'Q' && strcmp(frame.operation, "COUNTERS") == 0) {
+    send_counters(frame.request_id, batch.boundary_ms);
+    return;
+  }
   handle_request(frame, batch.boundary_ms);
 }
 
 void tick_linearized() {
   const PendingPulseBatch batch = capture_pending_batch();
   apply_pending_batch(batch);
-  bool produced = false;
-  g_machine.tick(batch.boundary_ms, &produced);
-  if (produced) {
-    emit_new_results();
-  }
+  advance_machine(batch.boundary_ms);
 }
 
 }  // namespace

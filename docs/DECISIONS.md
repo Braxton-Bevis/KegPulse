@@ -24,7 +24,12 @@ Default arm timeout is 15 seconds, flow-gap transition is 750 ms, and settling c
 
 ## ADR-006: Protocol
 
-Serial is 115200 8-N-1. KP1 frames are ASCII/LF, at most 256 bytes including LF, and protected by CRC-16/CCITT-FALSE. Device and boot identities use exactly 16 uppercase hexadecimal digits. Request IDs correlate replies; semantic idempotency uses device/boot/event/session identity. Partial and concatenated frames are handled by newlines; an oversized frame is discarded through its newline and parsing then resumes. Full grammar is in `docs/PROTOCOL.md`.
+Serial is 115200 8-N-1. KP1 frames are ASCII/LF and protected by CRC-16/CCITT-FALSE. Device responses
+are at most 256 bytes including LF; Nano-bound host requests are at most 128 bytes, with every defined
+request fitting in 113 bytes. Device and boot identities use exactly 16 uppercase hexadecimal digits.
+Request IDs correlate replies; semantic idempotency uses device/boot/event/session identity. Partial
+and concatenated frames are handled by newlines; an oversized frame is discarded through its newline
+and parsing then resumes. Full grammar is in `docs/PROTOCOL.md`.
 
 ## ADR-007: Bounded recovery
 

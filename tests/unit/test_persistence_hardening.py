@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from kegpulse.domain.errors import ConflictError
+from kegpulse.domain.errors import ConflictError, MeasurementRejectedError
 from kegpulse.domain.models import DeviceResult, DeviceState
 from kegpulse.persistence import Database, Repository
 from kegpulse.persistence import repository as repository_module
@@ -313,6 +313,30 @@ def test_recovery_checkpoint_eventizes_only_new_delta(repository: Repository) ->
     with pytest.raises(ConflictError, match="cannot decrease"):
         repository.checkpoint_recovery_pulses(
             device_id="device", boot_id="boot", recovery_pulses=39, device_uptime_ms=111
+        )
+
+
+def test_recovery_checkpoint_rejects_impossible_counter_relationships(
+    repository: Repository,
+) -> None:
+    repository.replace_keg("Recovery keg", 1000)
+    active_calibration(repository)
+
+    with pytest.raises(MeasurementRejectedError, match="exceed accepted"):
+        repository.checkpoint_recovery_pulses(
+            device_id="device",
+            boot_id="corrupt-boot",
+            accepted_pulses=18,
+            recovery_pulses=3_688_509_900_321_862_200,
+            device_uptime_ms=10_675,
+        )
+
+    assert repository.list_pours() == []
+    assert repository.inventory().remaining_ml == 1000  # type: ignore[union-attr]
+    with repository.db.read() as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM device_recovery_checkpoints").fetchone()[0]
+            == 0
         )
 
 

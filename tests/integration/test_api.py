@@ -204,6 +204,9 @@ def test_unattributed_flow_reassignment_and_cancel_partial(client: TestClient) -
         json={"participant_id": participant["id"], "reason": "Confirmed"},
     )
     assert assigned.json()["volume_ml"] == pours[0]["volume_ml"]
+    assert (
+        assigned.json()["calibration_density_g_per_ml"] == pours[0]["calibration_density_g_per_ml"]
+    )
 
     client.post(
         "/api/v1/sessions/arm",

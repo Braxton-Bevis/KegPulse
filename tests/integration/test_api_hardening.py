@@ -39,6 +39,58 @@ def csrf(client: TestClient) -> dict[str, str]:
     return {"Origin": "http://testserver", "X-KegPulse-CSRF": token}
 
 
+def unlock_management(client: TestClient) -> dict[str, str]:
+    headers = csrf(client)
+    configured = client.put("/api/v1/security/pin", headers=headers, json={"pin": "123456"})
+    assert configured.status_code == 200
+    context = client.get("/api/v1/security/context").json()
+    headers = {"Origin": "http://testserver", "X-KegPulse-CSRF": context["csrf_token"]}
+    response = client.post("/api/v1/security/login", headers=headers, json={"pin": "123456"})
+    assert response.status_code == 200
+    return {"Origin": "http://testserver", "X-KegPulse-CSRF": response.json()["csrf_token"]}
+
+
+def test_management_requires_pin_and_stores_funds_and_pour_photos(client: TestClient) -> None:
+    assert client.get("/api/v1/management").status_code == 409
+    headers = unlock_management(client)
+    participant = client.post(
+        "/api/v1/participants", headers=headers, json={"display_name": "Taylor"}
+    ).json()
+    funds = client.post(
+        f"/api/v1/management/participants/{participant['id']}/funds",
+        headers=headers,
+        json={"amount_dollars": "20.25", "reason": "Cash deposit"},
+    )
+    assert funds.status_code == 200
+    assert funds.json()["balance_cents"] == 2025
+    session, _ = client.app.state.repository.create_provisional(
+        participant["id"], "photo-evidence-session"
+    )
+    disabled = client.post(
+        f"/api/v1/sessions/{session['session_id']}/photos",
+        headers=headers | {"Content-Type": "image/jpeg"},
+        content=b"\xff\xd8\xff\xd9",
+    )
+    assert disabled.status_code == 409
+    saved = client.patch(
+        "/api/v1/management/settings",
+        headers=headers,
+        json={"price_per_fl_oz": "0.50", "webcam_enabled": True},
+    )
+    assert saved.status_code == 200
+    client.app.state.repository.update_provisional_status(session["session_id"], "pouring")
+    uploaded = client.post(
+        f"/api/v1/sessions/{session['session_id']}/photos",
+        headers=headers | {"Content-Type": "image/jpeg"},
+        content=b"\xff\xd8\xff\xd9",
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    photo = client.get(f"/api/v1/management/photos/{uploaded.json()['id']}")
+    assert photo.status_code == 200
+    assert photo.content == b"\xff\xd8\xff\xd9"
+    assert client.get("/api/v1/management").json()["price_cents_per_fl_oz"] == "50.00"
+
+
 def create_pours(repository: Repository, count: int) -> None:
     repository.replace_keg("=Formula keg", 100000)
     calibration = repository.create_calibration("water", 1)

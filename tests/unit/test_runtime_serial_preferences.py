@@ -190,6 +190,29 @@ def test_serial_open_permission_error_surfaces_posix_guidance(
         SerialTransport("/dev/ttyACM0").open()
 
 
+def test_serial_open_waits_for_board_reset_before_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSerial:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.reset_calls = 0
+
+        def reset_input_buffer(self) -> None:
+            self.reset_calls += 1
+
+    fake = FakeSerial()
+    sleeps: list[float] = []
+    monkeypatch.setattr(real_serial.serial, "Serial", lambda **_kwargs: fake)
+    monkeypatch.setattr(real_serial.time, "sleep", sleeps.append)
+
+    transport = SerialTransport("COM3")
+    transport.open()
+
+    assert sleeps == [SerialTransport._OPEN_SETTLE_SECONDS]
+    assert fake.reset_calls == 1
+
+
 class _ConfirmingProvider:
     def __init__(self, transport: SimulatorTransport) -> None:
         self.transport = transport
