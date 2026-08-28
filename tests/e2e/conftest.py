@@ -123,6 +123,36 @@ def browser(playwright_instance: Playwright) -> Iterator[Browser]:
         instance.close()
 
 
+@pytest.fixture(scope="session")
+def camera_browser(playwright_instance: Playwright) -> Iterator[Browser]:
+    """Chromium with a synthetic webcam so MediaRecorder paths run for real."""
+    instance = playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+        ],
+    )
+    try:
+        yield instance
+    finally:
+        instance.close()
+
+
+@pytest.fixture
+def camera_page(camera_browser: Browser, live_app: LiveApp) -> Iterator[Page]:
+    del live_app  # Dependency guarantees the browser closes before the app server.
+    context = camera_browser.new_context(
+        viewport={"width": 1024, "height": 600},
+        permissions=["camera"],
+    )
+    page = context.new_page()
+    try:
+        yield page
+    finally:
+        context.close()
+
+
 @pytest.fixture
 def page(browser: Browser, live_app: LiveApp) -> Iterator[Page]:
     del live_app  # Dependency guarantees the browser closes before the app server.

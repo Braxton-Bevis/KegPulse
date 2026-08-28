@@ -37,6 +37,7 @@ const state = {
   videoRecorder: null,
   videoChunks: [],
   videoSessionId: null,
+  videoSawFlow: false,
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
@@ -1293,8 +1294,9 @@ async function capturePourPhoto(sessionId) {
 function syncPourVideo(snapshot) {
   const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
   const session = snapshot?.session;
-  const activePour = (session?.purpose === "pour" && ["pouring", "settling"].includes(phase))
+  const activePour = (session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase))
     || (!session && ["pouring", "settling"].includes(phase));
+  if (["pouring", "settling"].includes(phase)) state.videoSawFlow = true;
   if (
     activePour
     && state.cameraStream
@@ -1308,15 +1310,20 @@ function syncPourVideo(snapshot) {
       const chunks = [];
       const recordingSession = session ? session.session_id : "unattributed";
       state.videoSessionId = recordingSession;
+      state.videoSawFlow = ["pouring", "settling"].includes(phase);
       recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+      const sawFlowRef = () => state.videoSawFlow;
       recorder.onstop = () => {
+        const keep = sawFlowRef();
         if (state.videoRecorder === recorder) {
           state.videoRecorder = null;
           state.videoSessionId = null;
+          state.videoSawFlow = false;
         }
-        void uploadPourVideo(recordingSession, chunks);
+        // An arm that timed out without flow produces no evidence worth keeping.
+        if (keep) void uploadPourVideo(recordingSession, chunks);
       };
-      recorder.start(1000);
+      recorder.start(500);
       state.videoRecorder = recorder;
       setTimeout(() => {
         if (state.videoRecorder === recorder && recorder.state !== "inactive") recorder.stop();
@@ -1324,10 +1331,15 @@ function syncPourVideo(snapshot) {
     } catch { /* video recording unsupported on this browser */ }
   } else if (state.videoRecorder && (!activePour || (session ? session.session_id : "unattributed") !== state.videoSessionId)) {
     const recorder = state.videoRecorder;
-    if (recorder.state !== "inactive") recorder.stop();
-    else {
+    if (recorder.state !== "inactive") {
+      // requestData flushes the in-progress chunk so very short pours are not
+      // finalized as an empty clip.
+      try { recorder.requestData(); } catch { /* not all browsers expose this */ }
+      recorder.stop();
+    } else {
       state.videoRecorder = null;
       state.videoSessionId = null;
+      state.videoSawFlow = false;
     }
   }
 }
