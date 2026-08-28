@@ -177,11 +177,16 @@ def create_app(
         overrides=(
             (r"/api/v1/sessions/[0-9a-fA-F-]{32,36}/videos", 33_554_432),
             (r"/api/v1/evidence/videos", 33_554_432),
+            (r"/api/v1/evidence/test-video", 33_554_432),
         ),
     )
 
     def access(request: Request) -> None:
         security.require_access(request)
+
+    def display_access(request: Request) -> None:
+        """Read-only wall-display surfaces: live status, people, photos, history."""
+        security.require_display_access(request)
 
     def operational(request: Request) -> None:
         security.require_operational(request)
@@ -237,7 +242,7 @@ def create_app(
 
     @app.get("/api/v1/status", response_model=StatusResponse)
     async def status(request: Request) -> dict[str, Any]:
-        access(request)
+        display_access(request)
         return coordinator.snapshot()
 
     @app.get("/api/v1/security/context", response_model=SecurityContextResponse)
@@ -276,7 +281,7 @@ def create_app(
     async def participants(
         request: Request, include_inactive: bool = False
     ) -> list[dict[str, Any]]:
-        access(request)
+        display_access(request)
         return repository.list_participants(active_only=not include_inactive)
 
     @app.post("/api/v1/participants", status_code=201, response_model=ParticipantResponse)
@@ -500,7 +505,7 @@ def create_app(
         participant_id: str | None = None,
         unattributed_only: bool = False,
     ) -> list[dict[str, Any]]:
-        access(request)
+        display_access(request)
         return repository.list_pours(
             limit=limit, participant_id=participant_id, unattributed_only=unattributed_only
         )
@@ -649,23 +654,34 @@ def create_app(
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
-        stale_temp = (*paths.videos.glob("pour_*.tmp"), *paths.videos.glob("unattributed_*.tmp"))
-        for leftover in stale_temp:
+        for leftover in paths.videos.glob("*.tmp"):
             leftover.unlink(missing_ok=True)
-        kept = sorted(
-            (*paths.videos.glob("pour_*.webm"), *paths.videos.glob("unattributed_*.webm")),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
+        # Camera checks keep a small budget of their own so a round of testing
+        # cannot evict real pour evidence.
+        pools = (
+            ((*paths.videos.glob("pour_*.webm"), *paths.videos.glob("unattributed_*.webm")), 5),
+            (tuple(paths.videos.glob("cameratest_*.webm")), 2),
         )
         removed = 0
-        for stale in kept[5:]:
-            stale.unlink(missing_ok=True)
-            removed += 1
+        for pool, keep in pools:
+            ordered = sorted(pool, key=lambda item: item.stat().st_mtime, reverse=True)
+            for stale in ordered[keep:]:
+                stale.unlink(missing_ok=True)
+                removed += 1
         return {
             "file": video_name,
             "size_bytes": len(body),
             "pruned": removed,
         }
+
+    @app.post("/api/v1/evidence/test-video", status_code=201, response_model=PourVideoResponse)
+    async def upload_camera_test_video(request: Request) -> dict[str, Any]:
+        """Store a short camera check so framing can be verified without pouring."""
+        admin(request)
+        if not request.headers.get("content-type", "").lower().startswith("video/webm"):
+            raise HTTPException(status_code=415, detail="pour videos must be WebM")
+        body = await request.body()
+        return await asyncio.to_thread(_store_pour_video, body, "cameratest")
 
     @app.post("/api/v1/evidence/videos", status_code=201, response_model=PourVideoResponse)
     async def upload_unattributed_video(request: Request) -> dict[str, Any]:
@@ -805,7 +821,7 @@ def create_app(
 
     @app.get("/api/v1/participants/{participant_id}/avatar", include_in_schema=False)
     async def participant_avatar(participant_id: str, request: Request) -> FileResponse:
-        access(request)
+        display_access(request)
         canonical = _canonical_participant(participant_id)
         path = _avatar_path(canonical)
         if not path.is_file():

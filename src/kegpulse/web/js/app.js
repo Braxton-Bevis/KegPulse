@@ -38,6 +38,7 @@ const state = {
   videoChunks: [],
   videoSessionId: null,
   videoSawFlow: false,
+  cameraTesting: false,
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
@@ -1212,7 +1213,7 @@ function managementView() {
     : '<section class="card"><h2>Keg level</h2><p class="empty">Install a keg before setting its remaining level.</p></section>';
   return page("Management", "Protected pricing, participant funds, and local pour evidence.", `
     <div class="grid two management-grid"><section class="card"><h2>Beer price</h2><form id="management-settings-form" class="stack"><label>Price per US fl oz ($)<input name="price_per_fl_oz" type="number" min="0" max="1000" step="0.01" value="${escapeHtml((Number(m.price_cents_per_fl_oz) / 100).toFixed(2))}" required></label><button>Save price</button></form><p class="field-help">Each completed attributed pour stores the price used at that moment.</p></section>
-    ${kegControl}<section class="card"><h2>Pour camera</h2><div class="camera-preview"><video id="camera-preview" autoplay muted playsinline></video><span>${escapeHtml(state.cameraStatus)}</span></div><p>Photos stay on this computer and are taken once per second only while beer is flowing.</p><div class="button-row"><button data-action="camera-enable">${state.cameraStream ? "Camera armed" : "Enable camera"}</button><button class="secondary" data-action="camera-disable" ${!m.webcam_enabled && !state.cameraStream ? "disabled" : ""}>Disable</button></div></section></div>
+    ${kegControl}<section class="card"><h2>Pour camera</h2><div class="camera-preview"><video id="camera-preview" autoplay muted playsinline></video><span>${escapeHtml(state.cameraStatus)}</span></div><p>Photos stay on this computer and are taken once per second only while beer is flowing.</p><div class="button-row"><button data-action="camera-enable">${state.cameraStream ? "Camera armed" : "Enable camera"}</button><button class="secondary" data-action="camera-disable" ${!m.webcam_enabled && !state.cameraStream ? "disabled" : ""}>Disable</button></div><p class="field-help">Check framing without pouring: this records a five-second clip into your KegPulse videos folder.</p><div class="button-row"><button class="secondary" data-action="camera-test" ${state.cameraStream ? "" : "disabled"}>${state.cameraTesting ? "Recording test clip\u2026" : "Record 5-second test clip"}</button></div></section></div>
     <section class="management-band"><h2>Participant funds</h2><div class="account-list">${people}</div></section>
     <section class="management-band"><h2>Account ledger</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Person</th><th>Type</th><th>Amount</th><th>Reason</th></tr></thead><tbody>${ledger}</tbody></table></div></section>
     <section class="management-band"><h2>Pour evidence</h2><div class="evidence-grid">${photos}</div></section>`);
@@ -1253,6 +1254,35 @@ async function disableCamera() {
     if (disabled) state.management = disabled;
     render();
   } catch (error) { showError(error); }
+}
+
+async function recordCameraTestClip() {
+  if (state.cameraTesting) return;
+  if (!state.cameraStream) { showError("Enable the camera first."); return; }
+  if (typeof MediaRecorder === "undefined") { showError("This browser cannot record video."); return; }
+  state.cameraTesting = true;
+  render();
+  try {
+    const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
+    const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
+    const chunks = [];
+    const finished = new Promise((resolve) => { recorder.onstop = resolve; });
+    recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+    recorder.start(500);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    try { recorder.requestData(); } catch { /* not every browser exposes this */ }
+    recorder.stop();
+    await finished;
+    const blob = new Blob(chunks, { type: "video/webm" });
+    if (!blob.size) throw new Error("The camera produced no video data.");
+    const stored = await api("/api/v1/evidence/test-video", { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
+    showToast(`Test clip saved: ${stored.file}`);
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.cameraTesting = false;
+    render();
+  }
 }
 
 async function capturePourPhoto(sessionId) {
@@ -1641,6 +1671,47 @@ function calibrationView() {
   `);
 }
 
+function displayView() {
+  const s = state.snapshot;
+  const inventory = s.inventory;
+  const keg = s.keg;
+  const percent = inventory ? Math.max(0, Math.min(100, decimal(inventory.percent_remaining))) : 0;
+  const phase = String(s.device?.status?.state || "").toLowerCase();
+  const pouring = ["pouring", "settling"].includes(phase);
+  const people = [...(s.participants || [])]
+    .map((person) => ({ ...person, spend: Math.max(0, -Number(person.balance_cents || 0)) }))
+    .sort((a, b) => b.spend - a.spend)
+    .slice(0, 8);
+  const roster = people.length
+    ? people.map((person) => `<li class="display-person"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(person)}</span><span class="display-person-name">${escapeHtml(person.display_name)}</span><span class="display-person-stat ${Number(person.balance_cents || 0) < 0 ? "negative" : ""}">${formatMoney(person.balance_cents || 0)}</span></li>`).join("")
+    : '<li class="empty">No profiles yet.</li>';
+  const last = s.last_pour;
+  return `<section class="display-board ${pouring ? "flowing" : ""}">
+    <header class="display-header">
+      <h1 tabindex="-1">${escapeHtml(keg?.label || "KegPulse")}</h1>
+      <p class="display-status">${pouring ? "Pouring now" : s.connection?.state === "connected" ? "On tap" : "Tap offline"}</p>
+    </header>
+    <div class="display-grid">
+      <section class="display-keg">
+        <p class="display-metric">${percent.toFixed(0)}<span class="display-unit">%</span></p>
+        <progress class="progress display-progress" max="100" value="${percent}" aria-label="Keg percent remaining">${percent}%</progress>
+        <p class="display-sub">${inventory ? `${formatVolume(inventory.remaining_ml)} left \u00b7 \u2248${beersLeft(inventory.remaining_ml)} beers` : "No keg installed"}</p>
+      </section>
+      <section class="display-live">
+        <p class="display-kicker">${pouring ? "Live pour" : "Last pour"}</p>
+        <p class="display-live-amount">${pouring && s.live_volume_ml !== null && s.live_volume_ml !== undefined
+          ? escapeHtml(pourMeasurementText(s.live_volume_ml, s.active_calibration?.default_density_g_per_ml))
+          : last ? escapeHtml(pourMeasurementText(last.volume_ml, last.calibration_density_g_per_ml)) : "\u2014"}</p>
+        <p class="display-sub">${last ? `${escapeHtml(last.participant_name || "Guest")} \u00b7 ${formatTime(last.ended_at)}` : "No pours recorded yet."}</p>
+      </section>
+    </div>
+    <section class="display-roster">
+      <p class="display-kicker">Tab</p>
+      <ul class="display-people">${roster}</ul>
+    </section>
+  </section>`;
+}
+
 function participantsView() {
   if (state.security?.pin_configured && !state.security?.authenticated) {
     return page("Participants", "Editing profiles requires the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
@@ -1733,6 +1804,7 @@ function render() {
         void loadCalibrations().finally(() => state.pending.delete("load-calibrations"));
       }
     }
+    else if (current === "/display") main.innerHTML = displayView();
     else if (current === "/participants") main.innerHTML = participantsView();
     else if (current === "/management") main.innerHTML = managementView();
     else if (current === "/settings") main.innerHTML = settingsView();
@@ -1958,6 +2030,7 @@ main.addEventListener("click", async (event) => {
   }
   if (action === "open-keypad") { openKeypad(button.closest("form")); return; }
   if (action === "arm") return arm(button.dataset.participant);
+  if (action === "camera-test") return recordCameraTestClip();
   if (action === "avatar-remove") {
     const accepted = await confirmAction("Remove this profile photo? A new one is captured automatically the next time they pour.", "Remove photo");
     if (accepted) {

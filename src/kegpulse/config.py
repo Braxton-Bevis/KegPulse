@@ -22,6 +22,9 @@ class AppConfig(BaseModel):
     display_units: str = "us_fl_oz"
     verification_warning_pct: float = Field(default=5.0, ge=0.1, le=100)
     lan_mode: bool = False
+    # Read-only wall display: LAN clients may watch live status, people, and
+    # history without a PIN. Every mutation still requires administrator login.
+    lan_display: bool = False
     allow_test_shutdown: bool = False
     allowed_hosts: list[str] = Field(default_factory=list, max_length=16)
     allowed_origins: list[str] = Field(default_factory=list, max_length=16)
@@ -50,6 +53,8 @@ class AppConfig(BaseModel):
             raise ValueError("demo mode cannot be exposed in LAN mode")
         if self.lan_mode and (not self.allowed_hosts or not self.allowed_origins):
             raise ValueError("LAN mode requires explicit host and origin allowlists")
+        if self.lan_display and not self.lan_mode:
+            raise ValueError("read-only LAN display requires LAN mode")
         return self
 
 

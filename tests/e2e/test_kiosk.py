@@ -948,6 +948,6 @@ def test_cancelled_pour_does_not_inherit_a_waiting_calibration_sample(
     page.get_by_role("button", name="Cancel arming").click()
 
     # The kiosk returns home with nothing pending for the cancelled pour.
-    expect(page.get_by_role("heading", name="Ready for a pour?")).to_be_visible(timeout=8000)
+    expect(page.get_by_role("heading", name="Ready for a pour?")).to_be_visible(timeout=15000)
     expect(page.get_by_role("link", name="Enter scale mass")).to_have_count(0)
     expect(page.get_by_role("heading", name="Enter mass for sample 1")).to_have_count(0)

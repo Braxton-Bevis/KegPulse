@@ -226,6 +226,19 @@ class SecurityManager:
             raise HTTPException(status_code=401, detail="administrator login required in LAN mode")
         return session
 
+    def require_display_access(self, request: Request) -> SecuritySession | None:
+        """Read-only surfaces a wall display may show without a PIN.
+
+        Only reachable without administrator login when the operator explicitly
+        enabled the read-only display; it never authorizes a mutation.
+        """
+        session = self.get_session(request.cookies.get(SESSION_COOKIE))
+        if not self.config.lan_mode or self.config.lan_display:
+            return session
+        if session is None or not session.admin:
+            raise HTTPException(status_code=401, detail="administrator login required in LAN mode")
+        return session
+
     def require_operational(self, request: Request) -> SecuritySession:
         session = self.require_csrf(request)
         if self.config.lan_mode and not session.admin:
@@ -239,7 +252,7 @@ class SecurityManager:
         return session
 
     def websocket_allowed(self, websocket: WebSocket) -> bool:
-        if not self.config.lan_mode:
+        if not self.config.lan_mode or self.config.lan_display:
             return True
         session = self.get_session(websocket.cookies.get(SESSION_COOKIE))
         return bool(session and session.admin)

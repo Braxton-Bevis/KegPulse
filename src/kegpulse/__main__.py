@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly enable trusted-LAN mode",
     )
     parser.add_argument(
+        "--lan-display",
+        action="store_true",
+        help="allow read-only LAN viewing of status, people, and history without a PIN",
+    )
+    parser.add_argument(
         "--allowed-host", action="append", default=[], help="exact LAN Host allowlist entry"
     )
     parser.add_argument(
@@ -70,6 +75,7 @@ def _config_overrides(arguments: argparse.Namespace) -> dict[str, object]:
         "no_browser": arguments.no_browser,
         "serial_port": arguments.serial_port,
         "lan_mode": arguments.lan,
+        "lan_display": arguments.lan_display,
         "allow_test_shutdown": arguments.allow_test_shutdown,
     }
     if arguments.host:
