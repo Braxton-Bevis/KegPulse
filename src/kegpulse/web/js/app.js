@@ -1500,7 +1500,8 @@ function sampleReview(detail) {
     const a = analysis?.samples?.[index];
     const flagged = a?.suspected_outlier || sample.suspected_outlier;
     const consistency = consistencyLabel(sample, flagged);
-    const predicted = a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—";
+    const density = Number(detail.default_density_g_per_ml) || 1;
+    const predicted = a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL · ≈${(Number(a.predicted_volume_ml) * density).toFixed(1)} g` : "—";
     const residual = a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—";
     const action = editable
       ? `<td><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></td>`
@@ -1517,7 +1518,7 @@ function sampleReview(detail) {
     const action = editable
       ? `<div><button class="secondary" data-action="toggle-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${sample.ordinal}" data-included="${sample.included ? "0" : "1"}">${sample.included ? "Exclude" : "Include"}</button></div>`
       : "";
-    return `<article class="sample-card ${flagged ? "outlier" : !sample.included ? "excluded" : ""}"><strong>Sample ${sample.ordinal}</strong><p>${sample.raw_pulses} pulses · ${sample.mass_g} g</p><dl class="sample-metrics"><dt>Actual scale volume</dt><dd>${Number(sample.derived_volume_ml).toFixed(2)} mL</dd><dt>Predicted volume</dt><dd>${a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—"}</dd><dt>Residual / error</dt><dd>${a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—"}</dd></dl><p class="${consistencyClass}">${consistency}</p>${action}</article>`;
+    return `<article class="sample-card ${flagged ? "outlier" : !sample.included ? "excluded" : ""}"><strong>Sample ${sample.ordinal}</strong><p>${sample.raw_pulses} pulses · ${sample.mass_g} g</p><dl class="sample-metrics"><dt>Actual scale volume</dt><dd>${Number(sample.derived_volume_ml).toFixed(2)} mL</dd><dt>Predicted volume</dt><dd>${a ? `${Number(a.predicted_volume_ml).toFixed(2)} mL` : "—"}</dd><dt>Predicted weight</dt><dd>${a ? `≈${(Number(a.predicted_volume_ml) * (Number(detail.default_density_g_per_ml) || 1)).toFixed(1)} g` : "—"}</dd><dt>Residual / error</dt><dd>${a ? `${Number(a.residual_ml).toFixed(2)} mL (${Number(a.percentage_error).toFixed(2)}%)` : "—"}</dd></dl><p class="${consistencyClass}">${consistency}</p>${action}</article>`;
   }).join("");
   const guidance = editable
     ? "Suspected outliers remain included until you decide."
@@ -1548,12 +1549,12 @@ function calibrationView() {
     || state.calibrationDetails?.find((item) => item.id === capture?.calibration_id)?.default_density_g_per_ml
     || "1.000";
   return page("Calibration & verification", "Use a tared scale. Mass ÷ density gives volume; KegPulse uses total pulses ÷ total volume.", `
-    <section class="card setup-callout"><h2>Ten-pour procedure</h2><ol class="step-list"><li>Tare an empty glass on the scale.</li><li>Use water at 1.000 g/mL first, then repeat with the installed keg and known/approximate beer density.</li><li>Capture ten varied-size pours; enter the scale mass after each.</li><li>Review residuals and explicitly include or exclude suspected outliers.</li><li>Activate only after reviewing the aggregate factor.</li></ol><p class="warning-text">Density directly affects volume. KegPulse is not a legal-for-trade meter.</p></section>
+    <section class="card setup-callout"><h2>Quick calibration — three pours</h2><ol class="step-list"><li>Start a run below (water at 1.000 g/mL is easiest).</li><li>Capture a pour, weigh the glass on a scale, and enter the grams.</li><li>Repeat for three varied pour sizes — agreeing samples show as Consistent, and each shows the weight the current estimate would have predicted.</li><li>Tap “Use 3-sample estimate for now” to activate it.</li></ol><p>For the best accuracy, keep adding samples to the same run whenever convenient — at ten you can activate the fully reviewed factor.</p><p class="warning-text">Density directly affects volume. KegPulse is not a legal-for-trade meter.</p></section>
     ${capture?.status === "complete" ? `<section class="card"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>` : ""}
     ${verification ? `<section class="card ${verification.warning ? "outlier" : ""}"><h2>Latest verification</h2><dl class="status-list"><dt>Predicted</dt><dd>${formatVolume(verification.predicted_volume_ml)}</dd><dt>Scale volume</dt><dd>${formatVolume(verification.actual_volume_ml)}</dd><dt>Absolute error</dt><dd>${formatVolume(verification.absolute_error_ml)}</dd><dt>Percentage error</dt><dd>${Number(verification.percentage_error).toFixed(2)}%</dd></dl><p class="${verification.warning ? "warning-text" : "good-text"}">${verification.warning ? "Drift warning: investigate sensor, flow conditions, tubing, or calibration. The factor was not changed." : "Verification is within the configured warning threshold."}</p></section>` : ""}
     <div class="grid two">
       <section class="card"><h2>Active calibration</h2>${active ? `${String(active.notes || "").includes("[PROVISIONAL:") ? '<p class="warning-text">Provisional estimate from a partial sample run. Volumes and charges may be inaccurate until the full calibration is completed.</p>' : ""}<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active. Complete a run below.</p>'}</section>
-      <section class="card"><h2>New calibration run</h2><form id="calibration-form" class="stack"><label>Liquid<input name="liquid" maxlength="80" value="water" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.000" required></label><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Create ten-pour run</button></form></section>
+      <section class="card"><h2>New calibration run</h2><form id="calibration-form" class="stack"><label>Liquid<input name="liquid" maxlength="80" value="water" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.000" required></label><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Start calibration run</button></form></section>
     </div>
     <section id="calibration-runs" class="stack">${state.calibrationDetails
       ? calibrationRuns(state.calibrationDetails)
@@ -1646,7 +1647,13 @@ function render() {
     else if (current === "/complete") main.innerHTML = completionView();
     else if (current === "/history") main.innerHTML = historyView();
     else if (current === "/keg") main.innerHTML = kegView();
-    else if (current === "/calibration") main.innerHTML = calibrationView();
+    else if (current === "/calibration") {
+      main.innerHTML = calibrationView();
+      if (state.calibrationDetails === null && !state.pending.has("load-calibrations")) {
+        state.pending.add("load-calibrations");
+        void loadCalibrations().finally(() => state.pending.delete("load-calibrations"));
+      }
+    }
     else if (current === "/participants") main.innerHTML = participantsView();
     else if (current === "/management") main.innerHTML = managementView();
     else if (current === "/settings") main.innerHTML = settingsView();
@@ -1710,7 +1717,7 @@ async function loadCalibrations() {
     const runs = await api("/api/v1/calibrations");
     const details = await Promise.all(runs.map((run) => api(`/api/v1/calibrations/${run.id}`)));
     state.calibrationDetails = details;
-    render();
+    if (route() === "/calibration") render();
   } catch (error) { showError(error); }
 }
 

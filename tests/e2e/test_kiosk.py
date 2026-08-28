@@ -227,7 +227,6 @@ def test_demo_tutorial_covers_every_screen_and_captures_walkthrough(
     for guide_title, filename, next_label in guides:
         assert_guide(guide_title)
         if guide_title == "Teach KegPulse the pulse-to-volume factor":
-            page.get_by_role("button", name="Load calibration runs").click()
             expect(page.locator('[data-calibration-status="active"]')).to_be_visible()
         elif guide_title == "Add people without changing history":
             page.get_by_role("button", name="Load all profiles").click()
@@ -338,7 +337,6 @@ def test_demo_tutorial_tracks_calibration_verification_and_interruption_states(
     wait_connected(page, live_app)
 
     page.goto(f"{live_app.url}/#/calibration")
-    page.get_by_role("button", name="Load calibration runs").click()
     draft_run = page.locator('[data-calibration-status="draft"]:has-text("demo-water")')
     draft_run.get_by_role("button", name="Capture sample 1").click()
     expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
@@ -619,7 +617,7 @@ def test_ten_capture_calibration_outlier_activation_and_verification(
     page.goto(f"{live_app.url}/#/calibration")
     page.get_by_label("Liquid").fill("water")
     page.get_by_label("Density (g/mL)").first.fill("1.000")
-    page.get_by_role("button", name="Create ten-pour run").click()
+    page.get_by_role("button", name="Start calibration run").click()
     expect(page.get_by_role("button", name="Capture sample 1")).to_be_visible(timeout=5000)
 
     for ordinal in range(1, 11):
@@ -689,7 +687,6 @@ def test_only_draft_calibration_reviews_offer_mutation_controls(
 
     wait_connected(page, live_app)
     page.goto(f"{live_app.url}/#/calibration")
-    page.get_by_role("button", name="Load calibration runs").click()
 
     for status in ("active", "superseded"):
         review = page.locator(f'[data-calibration-status="{status}"]')
@@ -781,7 +778,6 @@ def test_arm_countdown_timeout_and_calibration_density_are_visible(
     assert repo.list_pours() == []
 
     page.goto(f"{live_app.url}/#/calibration")
-    page.get_by_role("button", name="Load calibration runs").click()
     page.get_by_role("button", name="Capture sample 1").click()
     expect(page.get_by_text("armed", exact=True)).to_be_visible(timeout=5000)
     live_app.simulator.inject_pulses(250)

@@ -354,7 +354,7 @@ def create_app(
 
     @app.post("/api/v1/calibrations", status_code=201, response_model=CalibrationResponse)
     async def create_calibration(request: Request, payload: CalibrationCreate) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         result = repository.create_calibration(
             payload.liquid, payload.density_g_per_ml, payload.notes
         )
@@ -374,7 +374,7 @@ def create_app(
     async def add_calibration_sample(
         calibration_id: str, request: Request, payload: CalibrationSampleRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         result = repository.add_calibration_sample(
             calibration_id,
             payload.ordinal,
@@ -393,7 +393,7 @@ def create_app(
     async def arm_calibration_capture(
         calibration_id: str, request: Request, payload: CaptureArmRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         if payload.ordinal is None:
             raise HTTPException(status_code=422, detail="sample ordinal is required")
         return await coordinator.arm_for_purpose(
@@ -411,7 +411,7 @@ def create_app(
     async def commit_calibration_capture(
         calibration_id: str, request: Request, payload: CapturedMeasurementRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         session = repository.get_session(payload.session_id)
         if session["calibration_id"] != calibration_id:
             raise HTTPException(status_code=409, detail="capture belongs to another calibration")
@@ -431,7 +431,7 @@ def create_app(
     async def include_calibration_sample(
         calibration_id: str, ordinal: int, request: Request, payload: InclusionRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         result = repository.set_sample_included(calibration_id, ordinal, payload.included)
         await coordinator.publish()
         return result
@@ -441,14 +441,14 @@ def create_app(
         response_model=CalibrationResponse,
     )
     async def activate_calibration(calibration_id: str, request: Request) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         result = repository.activate_calibration(calibration_id)
         await coordinator.publish()
         return result
 
     @app.post("/api/v1/verifications", status_code=201, response_model=VerificationResponse)
     async def verification(request: Request, payload: VerificationRequest) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         threshold = repository.get_setting(
             "verification_warning_pct", config.verification_warning_pct
         )
@@ -465,7 +465,7 @@ def create_app(
     async def arm_verification_capture(
         request: Request, payload: CaptureArmRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         calibration = repository.active_calibration()
         if calibration is None:
             raise HTTPException(status_code=409, detail="active calibration required")
@@ -480,7 +480,7 @@ def create_app(
     async def commit_verification_capture(
         request: Request, payload: CapturedMeasurementRequest
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         threshold = repository.get_setting(
             "verification_warning_pct", config.verification_warning_pct
         )
@@ -521,7 +521,7 @@ def create_app(
     async def activate_provisional_calibration(
         calibration_id: str, request: Request
     ) -> dict[str, Any]:
-        admin(request)
+        operational(request)
         result = repository.activate_provisional_calibration(calibration_id)
         await coordinator.publish()
         return result
