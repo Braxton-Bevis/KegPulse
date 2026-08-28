@@ -1594,6 +1594,9 @@ function calibrationRunCard(detail, { hero = false } = {}) {
 }
 
 function calibrationView() {
+  if (state.security?.pin_configured && !state.security?.authenticated) {
+    return page("Calibration locked", "Calibration changes the pulse-to-volume factor behind every pour, so it requires the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
   const active = state.snapshot.active_calibration;
   const capture = state.snapshot.pending_capture;
   const verification = state.snapshot.last_verification;
@@ -1770,7 +1773,11 @@ async function cancelPour() {
     const accepted = await confirmAction("Counted pulses will be retained and saved as an interrupted partial pour. End now?", "End and save partial");
     if (!accepted) return;
   }
-  try { await mutation("cancel", "/api/v1/sessions/cancel"); } catch (error) { showError(error); }
+  try {
+    await mutation("cancel", "/api/v1/sessions/cancel");
+    // A pending calibration sample must not hijack the screen after a cancel.
+    navigate("/");
+  } catch (error) { showError(error); }
 }
 
 async function loadHistory() {
@@ -2107,7 +2114,10 @@ function relockAdminOnLeave() {
     .catch(() => {})
     .finally(() => { state.pendingRelock = null; });
 }
-const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants"]);
+const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants", "/calibration"]);
+// Transient pour screens: a calibration capture routes through them, so they
+// neither require nor drop administrator access.
+const NEUTRAL_ROUTES = new Set(["/pour", "/complete"]);
 state.currentRoute = route();
 window.addEventListener("hashchange", () => {
   const previousRoute = state.currentRoute;
@@ -2117,7 +2127,11 @@ window.addEventListener("hashchange", () => {
     window.clearTimeout(state.completionTimer);
     state.completionTimer = null;
   }
-  if (ADMIN_ROUTES.has(previousRoute) && !ADMIN_ROUTES.has(state.currentRoute)) {
+  if (
+    ADMIN_ROUTES.has(previousRoute)
+    && !ADMIN_ROUTES.has(state.currentRoute)
+    && !NEUTRAL_ROUTES.has(state.currentRoute)
+  ) {
     relockAdminOnLeave();
   }
   render();

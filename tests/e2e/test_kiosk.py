@@ -912,3 +912,42 @@ def test_hardware_settings_port_timeout_reconnect_diagnostics_and_dark_contrast(
         }"""
     )
     assert contrast >= 4.5
+
+
+@pytest.mark.e2e
+def test_cancelled_pour_does_not_inherit_a_waiting_calibration_sample(
+    page: Page, live_app: LiveApp
+) -> None:
+    """Cancelling a pour must end quietly, not hand over someone else's sample.
+
+    Regression: a calibration sample still awaiting its scale mass kept the
+    kiosk on the pour screen after a cancel, which then rendered that sample's
+    "Enter scale mass" prompt as if it belonged to the cancelled pour.
+    """
+    repo = live_app.app.state.repository
+    configure_measurement(repo)
+    participant = repo.create_participant("Cancel tester")
+    draft = repo.create_calibration("water", 1)
+    wait_connected(page, live_app)
+
+    # Leave a calibration sample captured but unweighed.
+    page.goto(f"{live_app.url}/#/calibration")
+    draft_run = page.locator(f'[data-calibration-status="draft"]:has-text("{draft["liquid"]}")')
+    draft_run.get_by_role("button", name="Capture sample 1").click()
+    expect(page.get_by_role("heading", name="Calibration sample 1")).to_be_visible(timeout=5000)
+    live_app.simulator.inject_pulses(250)
+    live_app.simulator.finish_pour()
+    expect(page.get_by_role("link", name="Enter scale mass")).to_be_visible(timeout=5000)
+
+    # Now arm a normal pour for a person and cancel it without any flow.
+    page.goto(f"{live_app.url}/#/")
+    page.locator(f'button[data-action="arm"][data-participant="{participant["id"]}"]').click()
+    expect(
+        page.get_by_role("heading", name=str(participant["display_name"]), exact=True)
+    ).to_be_visible(timeout=5000)
+    page.get_by_role("button", name="Cancel arming").click()
+
+    # The kiosk returns home with nothing pending for the cancelled pour.
+    expect(page.get_by_role("heading", name="Ready for a pour?")).to_be_visible(timeout=8000)
+    expect(page.get_by_role("link", name="Enter scale mass")).to_have_count(0)
+    expect(page.get_by_role("heading", name="Enter mass for sample 1")).to_have_count(0)

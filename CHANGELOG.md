@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Put calibration and verification back behind the administrator PIN, including
+  the page itself; the pour and completion screens stay neutral so a capture
+  can route through them without dropping the session.
+- Fixed a cancelled pour inheriting a calibration sample that was still waiting
+  for its scale mass, which wrongly prompted for a weight instead of ending
+  quietly.
 - Hardened the whole stack after a four-agent audit: restored the administrator
   PIN on calibration/verification activation and encrypted-DB backup download,
   bound automatic avatars to the participant currently pouring, and made the
