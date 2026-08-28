@@ -98,6 +98,43 @@ class Repository:
             ).fetchone()
         return dict(row)
 
+    def mark_participant_avatar(
+        self, participant_id: str, *, only_if_missing: bool = False
+    ) -> dict[str, Any] | None:
+        """Stamp avatar_updated_at; returns None when only_if_missing finds one already set."""
+        with self.db.transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("participant not found")
+            if only_if_missing and current["avatar_updated_at"] is not None:
+                return None
+            connection.execute(
+                "UPDATE participants SET avatar_updated_at=?, updated_at=? WHERE id=?",
+                (utc_now(), utc_now(), participant_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+        return dict(row)
+
+    def clear_participant_avatar(self, participant_id: str) -> dict[str, Any]:
+        with self.db.transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("participant not found")
+            connection.execute(
+                "UPDATE participants SET avatar_updated_at=NULL, updated_at=? WHERE id=?",
+                (utc_now(), participant_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM participants WHERE id=?", (participant_id,)
+            ).fetchone()
+        return dict(row)
+
     def adjust_participant_balance(
         self, participant_id: str, amount_cents: int, reason: str
     ) -> dict[str, Any]:

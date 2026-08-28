@@ -183,6 +183,7 @@ class ParticipantResponse(ResponseModel):
     created_at: str
     updated_at: str
     balance_cents: int = 0
+    avatar_updated_at: str | None = None
 
 
 class AccountLedgerResponse(ResponseModel):
@@ -195,6 +196,13 @@ class AccountLedgerResponse(ResponseModel):
     reason: str
     balance_after_cents: int
     created_at: str
+
+
+class PourVideoResponse(ResponseModel):
+    file: str
+    directory: str
+    size_bytes: int
+    pruned: int
 
 
 class PourPhotoResponse(ResponseModel):

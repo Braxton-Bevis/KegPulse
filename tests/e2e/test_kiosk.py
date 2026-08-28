@@ -55,6 +55,14 @@ def add_demo_pulses(page: Page, *, batches: int = 10) -> None:
 
 
 @pytest.mark.e2e
+def enter_keypad_pin(page: Page, pin: str) -> None:
+    """Type a PIN on the on-screen keypad; OK submits the owning form."""
+    expect(page.locator("#keypad-dialog")).to_be_visible()
+    for digit in pin:
+        page.locator(f'#keypad-dialog [data-key="{digit}"]').click()
+    page.locator('#keypad-dialog [data-key="ok"]').click()
+
+
 def test_management_is_pin_protected_and_updates_participant_funds(
     page: Page, live_app: LiveApp
 ) -> None:
@@ -64,8 +72,8 @@ def test_management_is_pin_protected_and_updates_participant_funds(
     page.goto(f"{live_app.url}/#/management")
     expect(page.get_by_role("heading", name="Management")).to_be_visible()
     expect(page.get_by_label("Unlock with PIN")).to_be_visible()
-    page.get_by_label("Unlock with PIN").fill("123456")
-    page.get_by_role("button", name="Unlock administrator").click()
+    page.get_by_label("Unlock with PIN").click()
+    enter_keypad_pin(page, "123456")
     expect(page.get_by_role("heading", name="Participant funds")).to_be_visible(timeout=5000)
     expect(page.get_by_role("img", name="Keg 100% remaining by volume")).to_be_visible()
     page.get_by_label("Set remaining volume (%)").fill("90")
@@ -788,11 +796,11 @@ def test_arm_countdown_timeout_and_calibration_density_are_visible(
 def test_pin_protection_and_service_worker_never_cache_api(page: Page, live_app: LiveApp) -> None:
     wait_connected(page, live_app)
     page.goto(f"{live_app.url}/#/settings")
-    page.get_by_label("PIN", exact=True).fill("246810")
-    page.get_by_role("button", name="Set PIN").click()
-    expect(page.get_by_text("Administrator locked")).to_be_visible(timeout=5000)
-    page.get_by_label("Unlock with PIN").fill("246810")
-    page.get_by_role("button", name="Unlock administrator").click()
+    page.get_by_label("PIN", exact=True).click()
+    enter_keypad_pin(page, "246810")
+    expect(page.get_by_role("heading", name="Settings locked")).to_be_visible(timeout=5000)
+    page.get_by_label("Unlock with PIN").click()
+    enter_keypad_pin(page, "246810")
     expect(page.get_by_text("Administrator unlocked", exact=True)).to_be_visible(timeout=5000)
     expect(page.get_by_text("Administrator unlocked for this session.", exact=True)).to_be_visible()
     expect(page.get_by_label("Unlock with PIN")).to_have_count(0)
@@ -806,13 +814,16 @@ def test_pin_protection_and_service_worker_never_cache_api(page: Page, live_app:
     expect(page.get_by_label("Unlock with PIN")).to_be_visible()
     expect(completion).to_have_value("17")
 
-    page.get_by_label("Unlock with PIN").fill("246810")
-    page.get_by_role("button", name="Unlock administrator").click()
+    page.get_by_label("Unlock with PIN").click()
+    enter_keypad_pin(page, "246810")
     expect(page.get_by_text("Administrator unlocked for this session.", exact=True)).to_be_visible(
         timeout=5000
     )
 
     page.goto(f"{live_app.url}/#/participants")
+    expect(page.get_by_label("Unlock with PIN")).to_be_visible(timeout=5000)
+    page.get_by_label("Unlock with PIN").click()
+    enter_keypad_pin(page, "246810")
     page.get_by_label("Display name").fill("Keyboard user")
     page.get_by_role("button", name="Add participant").click()
     page.get_by_role("button", name="Load all profiles").click()

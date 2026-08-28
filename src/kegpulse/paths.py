@@ -15,6 +15,7 @@ class AppPaths:
     backups: Path
     exports: Path
     photos: Path
+    videos: Path
     config: Path
 
     def ensure(self) -> None:
@@ -31,6 +32,12 @@ def get_app_paths(override: str | Path | None = None) -> AppPaths:
         if configured
         else user_data_path("KegPulse", "KegPulse", roaming=False, ensure_exists=False)
     )
+    configured_videos = os.environ.get("KEGPULSE_VIDEO_DIR")
+    videos = (
+        Path(configured_videos).expanduser().resolve()
+        if configured_videos
+        else Path.home() / "Videos" / "KegPulse"
+    )
     return AppPaths(
         root=root,
         database=root / "kegpulse.db",
@@ -38,5 +45,6 @@ def get_app_paths(override: str | Path | None = None) -> AppPaths:
         backups=root / "backups",
         exports=root / "exports",
         photos=root / "pour-photos",
+        videos=videos,
         config=root / "config.json",
     )

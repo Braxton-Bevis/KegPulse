@@ -34,6 +34,9 @@ const state = {
   cameraLastCapture: 0,
   cameraUploadActive: false,
   cameraStatus: "Camera not armed",
+  videoRecorder: null,
+  videoChunks: [],
+  videoSessionId: null,
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
@@ -527,7 +530,7 @@ function enterLoginMode() {
 function loginFormMarkup(embedded = false) {
   const label = embedded ? "Unlock with PIN" : "Admin PIN";
   const button = embedded ? "Unlock administrator" : "Unlock KegPulse";
-  return `<form id="login-form" class="stack"><label>${label}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="current-password" required></label><button>${button}</button></form>`;
+  return `<form id="login-form" class="stack" data-pin-form><span class="field-label">${label}</span><button type="button" class="pin-display" data-action="open-keypad" aria-label="${label}">Tap to enter PIN</button><input type="hidden" name="pin" autocomplete="off"><button>${button}</button></form>`;
 }
 
 function syncSecurityUi() {
@@ -737,6 +740,7 @@ function applySnapshot(snapshot) {
   updateFlowRate(previous, snapshot);
   state.snapshot = snapshot;
   syncPourCamera(snapshot);
+  syncPourVideo(snapshot);
   reconcileRoute(previous, snapshot);
   updateChrome();
   // A snapshot may arrive between a user's final field edit and the form's
@@ -978,6 +982,82 @@ function armIsAvailable() {
     && !state.snapshot?.pending_capture;
 }
 
+const BEER_ML = 355;
+const beersLeft = (ml) => {
+  const count = Math.floor(decimal(ml) / BEER_ML);
+  return count > 0 ? count : 0;
+};
+
+function participantAvatarMarkup(person) {
+  if (person?.avatar_updated_at) {
+    const src = "/api/v1/participants/" + encodeURIComponent(person.id) + "/avatar?v=" + encodeURIComponent(person.avatar_updated_at);
+    return '<img class="avatar-image" src="' + src + '" alt="">';
+  }
+  const name = String(person?.display_name || "").trim();
+  return escapeHtml(name.charAt(0).toUpperCase() || "?");
+}
+
+async function shrinkToAvatarJpeg(draw, sourceWidth, sourceHeight, sx, sy, size) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 128;
+  canvas.height = 128;
+  canvas.getContext("2d").drawImage(draw, sx, sy, size, size, 0, 0, 128, 128);
+  let quality = 0.85;
+  let blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  while (blob && blob.size > 60_000 && quality > 0.3) {
+    quality -= 0.1;
+    blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  }
+  if (!blob || blob.size > 61_440) return null;
+  return blob;
+}
+
+async function captureAvatarIfMissing(participantId) {
+  try {
+    if (!participantId || !state.cameraStream) return;
+    const person = (state.snapshot?.participants || []).find((item) => item.id === participantId);
+    if (!person || person.avatar_updated_at) return;
+    const video = document.createElement("video");
+    video.srcObject = state.cameraStream;
+    video.muted = true;
+    video.playsInline = true;
+    await video.play();
+    const width = video.videoWidth || 640;
+    const height = video.videoHeight || 480;
+    let sx = null;
+    let sy = null;
+    let size = null;
+    if ("FaceDetector" in window) {
+      try {
+        const faces = await new window.FaceDetector({ maxDetectedFaces: 1, fastMode: true }).detect(video);
+        if (faces.length) {
+          const box = faces[0].boundingBox;
+          size = Math.min(Math.max(box.width, box.height) * 1.7, width, height);
+          sx = Math.min(Math.max(box.x + box.width / 2 - size / 2, 0), width - size);
+          sy = Math.min(Math.max(box.y + box.height / 2 - size / 2, 0), height - size);
+        }
+      } catch { /* face detection unsupported; use center crop */ }
+    }
+    if (size === null) {
+      size = Math.min(width, height);
+      sx = (width - size) / 2;
+      sy = (height - size) / 2;
+    }
+    const blob = await shrinkToAvatarJpeg(video, width, height, sx, sy, size);
+    video.srcObject = null;
+    if (!blob) return;
+    await api("/api/v1/participants/" + encodeURIComponent(participantId) + "/avatar", { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+  } catch { /* avatar capture is best-effort; arming continues regardless */ }
+}
+
+async function jpegFromImageFile(file) {
+  const bitmap = await createImageBitmap(file);
+  const size = Math.min(bitmap.width, bitmap.height);
+  const blob = await shrinkToAvatarJpeg(bitmap, bitmap.width, bitmap.height, (bitmap.width - size) / 2, (bitmap.height - size) / 2, size);
+  if (!blob) throw new Error("That image cannot be shrunk into an avatar; try a smaller photo.");
+  return blob;
+}
+
 function homeView() {
   const s = state.snapshot;
   const onboarding = s.onboarding;
@@ -1021,8 +1101,9 @@ function homeView() {
     : `${activePulses} raw ${activePulses === 1 ? "pulse" : "pulses"}`;
   const buttons = participants.map((participant) => `
     <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" aria-label="${escapeHtml(participant.display_name)}" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>
-      <span class="participant-avatar" aria-hidden="true">${escapeHtml(participant.display_name.trim().charAt(0).toUpperCase() || "?")}</span>
+      <span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(participant)}</span>
       <span>${escapeHtml(participant.display_name)}</span>
+      <span class="participant-balance ${Number(participant.balance_cents || 0) < 0 ? "negative" : ""}">${formatMoney(participant.balance_cents || 0)}</span>
     </button>`).join("");
   return page(title, subtitle, `
     <section class="flow-dock ${flowClass} ${connectionClass}" aria-label="Live tap status">
@@ -1048,7 +1129,7 @@ function homeView() {
       <section class="card" aria-labelledby="keg-title">
         <h2 id="keg-title">${escapeHtml(s.keg?.label || "No current keg")}</h2>
         <div class="metric">${inventory ? formatVolume(inventory.remaining_ml) : "—"}</div>
-        <p>${inventory ? `${percent.toFixed(1)}% remaining` : "Configure a keg in Admin."}</p>
+        <p>${inventory ? `${percent.toFixed(1)}% remaining · ≈${beersLeft(inventory.remaining_ml)} beers left` : "Configure a keg in Admin."}</p>
         <progress class="progress" max="100" value="${percent}" aria-label="Keg percent remaining">${percent}%</progress>
       </section>
       <section class="card" aria-labelledby="last-title">
@@ -1095,7 +1176,7 @@ function managementView() {
   if (!state.security?.pin_configured) {
     return page("Management", "Pricing, balances, and pour evidence require an administrator PIN.", `
       <section class="card narrow-card"><h2>Create administrator PIN</h2>
-      <form id="pin-form" class="stack"><label>New PIN<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>Protect management</button></form></section>`);
+      <form id="pin-form" class="stack" data-pin-form><span class="field-label">New PIN</span><button type="button" class="pin-display" data-action="open-keypad" aria-label="New PIN">Tap to enter PIN</button><input type="hidden" name="pin" autocomplete="off"><button>Protect management</button></form></section>`);
   }
   if (!state.security?.authenticated) {
     return page("Management", "Unlock the protected controls with the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
@@ -1103,7 +1184,8 @@ function managementView() {
   const m = state.management;
   if (!m) return page("Management", "Loading protected account and camera settings.", '<section class="card"><button data-action="load-management">Load management</button></section>');
   const people = m.participants.map((person) => `<article class="account-row">
-    <div><h3>${escapeHtml(person.display_name)}</h3><p class="account-balance">${formatMoney(person.balance_cents)}</p></div>
+    <div class="account-identity"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(person)}</span><div><h3>${escapeHtml(person.display_name)}</h3><p class="account-balance">${formatMoney(person.balance_cents)}</p></div></div>
+    <div class="avatar-actions"><label class="button secondary avatar-upload">Change photo<input type="file" accept="image/*" class="avatar-input" data-participant="${escapeHtml(person.id)}" hidden></label>${person.avatar_updated_at ? `<button type="button" class="secondary" data-action="avatar-remove" data-participant="${escapeHtml(person.id)}">Remove photo</button>` : ""}</div>
     <form class="fund-form stack" data-participant="${escapeHtml(person.id)}">
       <label>Funds change ($)<input name="amount_dollars" type="number" step="0.01" min="-100000" max="100000" placeholder="25.00" required></label>
       <label>Reason<input name="reason" maxlength="500" placeholder="Cash added" required></label>
@@ -1187,6 +1269,45 @@ async function capturePourPhoto(sessionId) {
   } finally {
     state.cameraUploadActive = false;
   }
+}
+
+function syncPourVideo(snapshot) {
+  const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
+  const session = snapshot?.session;
+  const activePour = session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase);
+  if (activePour && state.cameraStream && !state.videoRecorder && typeof MediaRecorder !== "undefined") {
+    try {
+      const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
+      const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
+      state.videoChunks = [];
+      state.videoSessionId = session.session_id;
+      recorder.ondataavailable = (event) => { if (event.data?.size) state.videoChunks.push(event.data); };
+      recorder.onstop = () => { void uploadPourVideo(); };
+      recorder.start(1000);
+      state.videoRecorder = recorder;
+      setTimeout(() => {
+        if (state.videoRecorder === recorder && recorder.state !== "inactive") recorder.stop();
+      }, 120_000);
+    } catch { /* video recording unsupported on this browser */ }
+  } else if (state.videoRecorder && (!activePour || session?.session_id !== state.videoSessionId)) {
+    const recorder = state.videoRecorder;
+    if (recorder.state !== "inactive") recorder.stop();
+    else state.videoRecorder = null;
+  }
+}
+
+async function uploadPourVideo() {
+  const sessionId = state.videoSessionId;
+  const chunks = state.videoChunks;
+  state.videoRecorder = null;
+  state.videoChunks = [];
+  state.videoSessionId = null;
+  if (!sessionId || !chunks.length) return;
+  const blob = new Blob(chunks, { type: "video/webm" });
+  if (blob.size < 4 || blob.size > 33_554_432) return;
+  try {
+    await api("/api/v1/sessions/" + encodeURIComponent(sessionId) + "/videos", { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
+  } catch { /* keep the pour flow quiet if the video cannot be stored */ }
 }
 
 function syncPourCamera(snapshot) {
@@ -1337,7 +1458,7 @@ function kegView() {
   return page("Keg inventory", "Replacing a keg closes its history. Manual corrections always require a reason.", `
     <div class="grid two">
       <section class="card"><h2>Current keg</h2>${keg ? `
-        <dl class="status-list"><dt>Label</dt><dd>${escapeHtml(keg.label)}</dd><dt>Installed</dt><dd>${formatTime(keg.opened_at)}</dd><dt>Starting</dt><dd>${formatVolume(keg.starting_volume_ml)}</dd><dt>Remaining</dt><dd>${formatVolume(inventory?.remaining_ml)}</dd><dt>Poured</dt><dd>${formatVolume(inventory?.poured_ml)}</dd><dt>Adjustments</dt><dd>${formatVolume(inventory?.adjustments_ml, "ml")}</dd></dl>
+        <dl class="status-list"><dt>Label</dt><dd>${escapeHtml(keg.label)}</dd><dt>Installed</dt><dd>${formatTime(keg.opened_at)}</dd><dt>Starting</dt><dd>${formatVolume(keg.starting_volume_ml)}</dd><dt>Remaining</dt><dd>${formatVolume(inventory?.remaining_ml)}</dd><dt>Beers left</dt><dd>≈${beersLeft(inventory?.remaining_ml)} (12 oz)</dd><dt>Poured</dt><dd>${formatVolume(inventory?.poured_ml)}</dd><dt>Adjustments</dt><dd>${formatVolume(inventory?.adjustments_ml, "ml")}</dd></dl>
         ${decimal(inventory?.remaining_ml) < 0 ? `<p class="danger-text">Overrun: ${formatVolume(Math.abs(decimal(inventory.remaining_ml)))}. Review calibration and adjustments.</p>` : ""}
         ${inventory?.has_unknown_pours ? '<p class="warning-text">Unknown-volume raw pulse evidence exists and is not silently deducted.</p>' : ""}` : '<p class="empty">No keg installed.</p>'}</section>
       <section class="card"><h2>${keg ? "Replace keg" : "Install first keg"}</h2>
@@ -1427,6 +1548,9 @@ function calibrationRuns(details) {
 }
 
 function participantsView() {
+  if (state.security?.pin_configured && !state.security?.authenticated) {
+    return page("Participants", "Editing profiles requires the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
   return page("Participants", "Profiles can be renamed or deactivated; historical pours are never deleted.", `
     <div class="grid two"><section class="card"><h2>Add participant</h2><form id="participant-form" class="stack"><label>Display name<input name="display_name" maxlength="80" autocomplete="off" required></label><button>Add participant</button></form></section>
     <section class="card"><h2>Profiles</h2><div id="participant-list" class="stack">${state.participantDetails ? participantList(state.participantDetails) : '<button class="secondary" data-action="load-participants">Load all profiles</button>'}</div></section></div>`);
@@ -1438,6 +1562,9 @@ function participantList(items) {
 }
 
 function settingsView() {
+  if (state.security?.pin_configured && !state.security?.authenticated) {
+    return page("Settings locked", "Device settings require the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
   const s = state.snapshot;
   const device = s.device;
   const portOptions = (state.serialPorts || []).map((port) => `<option value="${escapeHtml(port.device)}">${escapeHtml(port.description)}</option>`).join("");
@@ -1454,7 +1581,7 @@ function settingsView() {
     ${s.mode === "demo" ? demoPanel() : ""}
     <div class="grid two"><section class="card"><h2>Flow device</h2><dl class="status-list"><dt>Connection</dt><dd>${escapeHtml(s.connection.state)} — ${escapeHtml(s.connection.detail)}</dd><dt>Protocol</dt><dd>${escapeHtml(device.identity.proto || "—")}</dd><dt>Firmware</dt><dd>${escapeHtml(device.identity.fw || "—")}</dd><dt>Device ID</dt><dd>${escapeHtml(device.identity.device || "—")}</dd><dt>Boot ID</dt><dd>${escapeHtml(device.identity.boot || "—")}</dd><dt>State</dt><dd>${escapeHtml(device.status.state || "—")}</dd><dt>Lifetime pulses</dt><dd>${escapeHtml(device.status.lifetime || "0")}</dd><dt>Recovered pulses</dt><dd>${escapeHtml(device.counters?.recovery || "0")}</dd><dt>Device fault</dt><dd>${escapeHtml(device.counters?.fault || "none")}</dd><dt>Rejected noise edges</dt><dd>${escapeHtml(device.counters?.rejected || "0")}</dd><dt>Noise gate</dt><dd>${escapeHtml(device.counters?.noise_gate_us || "0")} µs</dd><dt>Host flow-gap default</dt><dd>${escapeHtml(s.settings.flow_gap_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Host settling default</dt><dd>${escapeHtml(s.settings.settling_ms || "—")} ms (${escapeHtml(timingSource)})</dd><dt>Queue overflows</dt><dd>${escapeHtml(s.connection.queue_overflows)}</dd></dl><div class="button-row"><button data-action="load-ports" class="secondary">Scan serial ports</button>${s.mode === "hardware" ? '<button data-action="serial-reconnect" class="secondary">Reconnect device</button>' : ""}</div><div id="port-results">${state.serialPorts === null ? "" : state.serialPorts.length ? `<ul>${state.serialPorts.map((p) => `<li>${escapeHtml(p.device)} — ${escapeHtml(p.description)}</li>`).join("")}</ul>` : '<p class="empty">No serial ports detected.</p>'}</div></section>
     <section class="card"><h2>Display & timing</h2><form id="settings-form" class="stack"><label>Units<select name="display_units"><option value="us_fl_oz" ${s.settings.display_units === "us_fl_oz" ? "selected" : ""}>US fl oz</option><option value="ml" ${s.settings.display_units === "ml" ? "selected" : ""}>mL</option><option value="l" ${s.settings.display_units === "l" ? "selected" : ""}>Liters</option></select></label><label>Completion display (seconds)<input name="completion_seconds" type="number" min="0" max="60" value="${escapeHtml(s.settings.completion_seconds)}"></label><label>Arming timeout (milliseconds)<input name="arm_timeout_ms" type="number" min="1000" max="120000" step="100" value="${escapeHtml(s.settings.arm_timeout_ms)}"></label><label>Verification warning (%)<input name="verification_warning_pct" type="number" min="0.1" max="100" step="0.1" value="${escapeHtml(s.settings.verification_warning_pct)}"></label>${s.mode === "hardware" ? `<label>Preferred serial port<input name="serial_port" list="serial-port-options" maxlength="260" value="${escapeHtml(s.settings.serial_port || "")}" placeholder="Auto-detect after handshake"><span class="field-help">Choose a scanned port or enter a COM or /dev path. Save, then reconnect.</span></label><datalist id="serial-port-options">${portOptions}</datalist>` : ""}<button>Save settings</button></form></section></div>
-    <div class="grid two"><section class="card"><h2>Administrator PIN</h2><p>${state.security?.pin_configured ? "A PIN protects administrative actions." : "No PIN is configured. Anyone with physical access to this loopback kiosk can administer it."}</p><p id="admin-auth-status" class="${state.security?.authenticated ? "good-text" : "warning-text"}" role="status">${state.security?.authenticated ? "Administrator unlocked for this session." : "Administrator locked."}</p><form id="pin-form" class="stack"><label>${state.security?.pin_configured ? "New PIN" : "PIN"}<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="20" pattern="[0-9]+" autocomplete="new-password" required></label><button>${state.security?.pin_configured ? "Change PIN" : "Set PIN"}</button></form><div id="admin-login-slot">${state.security?.pin_configured && !state.security?.authenticated ? loginFormMarkup(true) : ""}</div></section>
+    <div class="grid two"><section class="card"><h2>Administrator PIN</h2><p>${state.security?.pin_configured ? "A PIN protects administrative actions." : "No PIN is configured. Anyone with physical access to this loopback kiosk can administer it."}</p><p id="admin-auth-status" class="${state.security?.authenticated ? "good-text" : "warning-text"}" role="status">${state.security?.authenticated ? "Administrator unlocked for this session." : "Administrator locked."}</p><form id="pin-form" class="stack" data-pin-form><span class="field-label">${state.security?.pin_configured ? "New PIN" : "PIN"}</span><button type="button" class="pin-display" data-action="open-keypad" aria-label="${state.security?.pin_configured ? "New PIN" : "PIN"}">Tap to enter PIN</button><input type="hidden" name="pin" autocomplete="off"><button>${state.security?.pin_configured ? "Change PIN" : "Set PIN"}</button></form><div id="admin-login-slot">${state.security?.pin_configured && !state.security?.authenticated ? loginFormMarkup(true) : ""}</div></section>
     <section class="card"><h2>Data & privacy</h2><p>Database, rotating logs, backups, and exports remain on this device. Backups are not encrypted; store them securely.</p><button data-action="backup">Create atomic backup</button><a class="button secondary" href="/api-docs">Local API schema</a><p>Network mode: <strong>${s.settings?.lan_mode ? "trusted LAN" : "loopback only"}</strong>. No telemetry or cloud dependency.</p></section></div>
     <section class="card"><h2>Recent device diagnostics</h2><p>Bounded local recovery and protocol events; routine personal pour history is not logged here.</p>${diagnosticRows}</section>
   `);
@@ -1592,10 +1719,15 @@ async function demo(action, values = {}) {
 function bindLoginForm() {
   document.querySelector("#login-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
+    const pin = String(form.get("pin") || "");
+    event.currentTarget.querySelector("input[name=pin]").value = "";
+    if (!pin) { openKeypad(event.currentTarget); return; }
+    if (state.pendingRelock) { try { await state.pendingRelock; } catch { /* relock already settled */ } }
     try {
-      state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin: form.get("pin") }) });
+      state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
       await refresh();
       syncSecurityUi();
+      render();
       if (!state.socket) connectSocket();
       showToast("Administrator unlocked");
       if (route() === "/management") await loadManagement();
@@ -1641,7 +1773,10 @@ function bindForms() {
   });
   document.querySelector("#pin-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    try { await mutation("pin", "/api/v1/security/pin", { pin: form.get("pin") }, "PUT"); state.security = await api("/api/v1/security/context"); showToast("Administrator PIN updated; unlock again with the new PIN"); render(); } catch (error) { showError(error); }
+    const newPin = String(form.get("pin") || "");
+    event.currentTarget.querySelector("input[name=pin]").value = "";
+    if (!newPin) { openKeypad(event.currentTarget); return; }
+    try { await mutation("pin", "/api/v1/security/pin", { pin: newPin }, "PUT"); state.security = await api("/api/v1/security/context"); showToast("Administrator PIN updated; unlock again with the new PIN"); render(); } catch (error) { showError(error); }
   });
   document.querySelector("#management-settings-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
@@ -1707,7 +1842,20 @@ main.addEventListener("click", async (event) => {
     state.dismissedTerminalId = state.snapshot?.terminal_notice?.session_id || "dismissed";
     return navigate("/");
   }
-  if (action === "arm") return arm(button.dataset.participant);
+  if (action === "open-keypad") { openKeypad(button.closest("form")); return; }
+  if (action === "arm") { void captureAvatarIfMissing(button.dataset.participant); return arm(button.dataset.participant); }
+  if (action === "avatar-remove") {
+    const accepted = await confirmAction("Remove this profile photo? A new one is captured automatically the next time they pour.", "Remove photo");
+    if (accepted) {
+      try {
+        await mutation("avatar-remove", `/api/v1/participants/${button.dataset.participant}/avatar`, {}, "DELETE");
+        showToast("Profile photo removed");
+        await loadManagement();
+        render();
+      } catch (error) { showError(error); }
+    }
+    return;
+  }
   if (action === "cancel") return cancelPour();
   if (action === "home-now") { state.completionPaused = false; return navigate("/"); }
   if (action === "stay") { pauseCompletionReturn(); return; }
@@ -1753,8 +1901,81 @@ menuButton.addEventListener("click", () => {
   menuButton.setAttribute("aria-expanded", String(open));
 });
 nav.addEventListener("click", () => { nav.classList.remove("open"); menuButton.setAttribute("aria-expanded", "false"); });
+document.addEventListener("change", async (event) => {
+  const input = event.target?.classList?.contains("avatar-input") ? event.target : null;
+  if (!input || !input.files?.length) return;
+  const participantId = input.dataset.participant;
+  const file = input.files[0];
+  input.value = "";
+  try {
+    const blob = await jpegFromImageFile(file);
+    await api("/api/v1/participants/" + encodeURIComponent(participantId) + "/avatar", { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: blob });
+    showToast("Profile photo updated");
+    await loadManagement();
+    render();
+  } catch (error) { showError(error); }
+});
+
+const keypadEntry = { value: "", form: null };
+const keypadDialog = document.querySelector("#keypad-dialog");
+function keypadDots() {
+  const el = document.querySelector("#keypad-dots");
+  if (!el) return;
+  el.textContent = keypadEntry.value ? "\u25cf".repeat(keypadEntry.value.length) : "Enter 6\u201320 digits";
+  el.classList.toggle("empty", !keypadEntry.value);
+}
+function openKeypad(form) {
+  keypadEntry.value = "";
+  keypadEntry.form = form;
+  keypadDots();
+  if (!keypadDialog.open) keypadDialog.showModal();
+}
+function keypadPress(key) {
+  if (key === "cancel") { keypadEntry.value = ""; keypadEntry.form = null; keypadDialog.close(); return; }
+  if (key === "clear") { keypadEntry.value = ""; keypadDots(); return; }
+  if (key === "back") { keypadEntry.value = keypadEntry.value.slice(0, -1); keypadDots(); return; }
+  if (key === "ok") {
+    if (keypadEntry.value.length < 6 || keypadEntry.value.length > 20) {
+      const el = document.querySelector("#keypad-dots");
+      el.textContent = "PIN must be 6\u201320 digits";
+      el.classList.add("empty");
+      return;
+    }
+    const form = keypadEntry.form;
+    const pin = keypadEntry.value;
+    keypadEntry.value = "";
+    keypadEntry.form = null;
+    keypadDialog.close();
+    if (form?.isConnected) {
+      const hidden = form.querySelector("input[name=pin]");
+      if (hidden) { hidden.value = pin; form.requestSubmit(); }
+    }
+    return;
+  }
+  if (/^[0-9]$/.test(key) && keypadEntry.value.length < 20) { keypadEntry.value += key; keypadDots(); }
+}
+keypadDialog.addEventListener("click", (event) => {
+  const key = event.target.closest("[data-key]")?.dataset.key;
+  if (key) keypadPress(key);
+});
+keypadDialog.addEventListener("keydown", (event) => {
+  if (/^[0-9]$/.test(event.key)) { event.preventDefault(); keypadPress(event.key); }
+  else if (event.key === "Backspace") { event.preventDefault(); keypadPress("back"); }
+  else if (event.key === "Enter") { event.preventDefault(); keypadPress("ok"); }
+});
+keypadDialog.addEventListener("cancel", () => { keypadEntry.value = ""; keypadEntry.form = null; });
+function relockAdminOnLeave() {
+  if (!state.security?.pin_configured || !state.security?.authenticated) return;
+  state.security = { ...state.security, authenticated: false };
+  state.pendingRelock = api("/api/v1/security/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+    .catch(() => {})
+    .then(() => refreshSecurityContext())
+    .catch(() => {})
+    .finally(() => { state.pendingRelock = null; });
+}
 window.addEventListener("hashchange", () => {
   state.completionPaused = false;
+  relockAdminOnLeave();
   render();
   updateChrome();
   if (route() === "/history") void loadHistory();

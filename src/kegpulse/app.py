@@ -53,6 +53,7 @@ from .api.models import (
     PinRequest,
     PourPhotoResponse,
     PourResponse,
+    PourVideoResponse,
     ReassignmentRequest,
     SecurityContextResponse,
     SerialActionResponse,
@@ -170,7 +171,11 @@ def create_app(
     websocket_admission_lock = asyncio.Lock()
     websocket_subscribers = 0
     app.add_middleware(RequestPolicyMiddleware, config=config, testing=testing)
-    app.add_middleware(BodyLimitMiddleware, maximum_bytes=65_536)
+    app.add_middleware(
+        BodyLimitMiddleware,
+        maximum_bytes=65_536,
+        overrides=((r"/api/v1/sessions/[0-9a-f-]{36}/videos", 33_554_432),),
+    )
 
     def access(request: Request) -> None:
         security.require_access(request)
@@ -603,6 +608,142 @@ def create_app(
             temporary.unlink(missing_ok=True)
             final_path.unlink(missing_ok=True)
             raise
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/videos",
+        status_code=201,
+        response_model=PourVideoResponse,
+    )
+    async def upload_pour_video(session_id: str, request: Request) -> dict[str, Any]:
+        operational(request)
+        if not repository.get_setting("webcam_enabled", False):
+            raise HTTPException(status_code=409, detail="pour camera is disabled")
+        if not request.headers.get("content-type", "").lower().startswith("video/webm"):
+            raise HTTPException(status_code=415, detail="pour videos must be WebM")
+        try:
+            canonical_session = str(uuid.UUID(session_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="pour session not found") from exc
+        body = await request.body()
+        if not 4 <= len(body) <= 33_554_432 or not body.startswith(b"\x1a\x45\xdf\xa3"):
+            raise HTTPException(status_code=422, detail="invalid or oversized WebM video")
+        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        video_name = f"pour_{stamp}_{canonical_session[:8]}.webm"
+        paths.videos.mkdir(parents=True, exist_ok=True)
+        final_path = paths.videos / video_name
+        temporary = final_path.with_suffix(".tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, final_path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        kept = sorted(
+            paths.videos.glob("pour_*.webm"), key=lambda item: item.stat().st_mtime, reverse=True
+        )
+        removed = 0
+        for stale in kept[5:]:
+            stale.unlink(missing_ok=True)
+            removed += 1
+        return {
+            "file": video_name,
+            "directory": str(paths.videos),
+            "size_bytes": len(body),
+            "pruned": removed,
+        }
+
+    def _canonical_participant(participant_id: str) -> str:
+        try:
+            return str(uuid.UUID(participant_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="participant not found") from exc
+
+    def _avatar_path(participant_id: str) -> Path:
+        return paths.photos / "avatars" / f"{participant_id}.jpg"
+
+    async def _validated_avatar_body(request: Request) -> bytes:
+        if not request.headers.get("content-type", "").lower().startswith("image/jpeg"):
+            raise HTTPException(status_code=415, detail="avatars must be JPEG images")
+        body = await request.body()
+        if (
+            not 4 <= len(body) <= 61_440
+            or not body.startswith(b"\xff\xd8")
+            or not body.endswith(b"\xff\xd9")
+        ):
+            raise HTTPException(status_code=422, detail="invalid or oversized JPEG avatar")
+        return body
+
+    def _write_avatar(participant_id: str, body: bytes) -> None:
+        final_path = _avatar_path(participant_id)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = final_path.with_suffix(".tmp")
+        try:
+            with temporary.open("wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, final_path)
+            if os.name != "nt":
+                final_path.chmod(0o600)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @app.post(
+        "/api/v1/participants/{participant_id}/avatar",
+        status_code=201,
+        response_model=ParticipantResponse,
+    )
+    async def set_participant_avatar_if_missing(
+        participant_id: str, request: Request
+    ) -> dict[str, Any]:
+        operational(request)
+        canonical = _canonical_participant(participant_id)
+        body = await _validated_avatar_body(request)
+        marked = repository.mark_participant_avatar(canonical, only_if_missing=True)
+        if marked is None:
+            raise HTTPException(status_code=409, detail="participant already has an avatar")
+        _write_avatar(canonical, body)
+        await coordinator.publish()
+        return marked
+
+    @app.put(
+        "/api/v1/participants/{participant_id}/avatar",
+        response_model=ParticipantResponse,
+    )
+    async def replace_participant_avatar(participant_id: str, request: Request) -> dict[str, Any]:
+        admin(request)
+        canonical = _canonical_participant(participant_id)
+        body = await _validated_avatar_body(request)
+        marked = repository.mark_participant_avatar(canonical)
+        assert marked is not None
+        _write_avatar(canonical, body)
+        await coordinator.publish()
+        return marked
+
+    @app.delete(
+        "/api/v1/participants/{participant_id}/avatar",
+        response_model=ParticipantResponse,
+    )
+    async def delete_participant_avatar(participant_id: str, request: Request) -> dict[str, Any]:
+        admin(request)
+        canonical = _canonical_participant(participant_id)
+        cleared = repository.clear_participant_avatar(canonical)
+        _avatar_path(canonical).unlink(missing_ok=True)
+        await coordinator.publish()
+        return cleared
+
+    @app.get("/api/v1/participants/{participant_id}/avatar", include_in_schema=False)
+    async def participant_avatar(participant_id: str, request: Request) -> FileResponse:
+        access(request)
+        canonical = _canonical_participant(participant_id)
+        path = _avatar_path(canonical)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="participant has no avatar")
+        return FileResponse(path, media_type="image/jpeg")
 
     @app.get("/api/v1/management/photos/{photo_id}", include_in_schema=False)
     async def pour_photo(photo_id: str, request: Request) -> FileResponse:

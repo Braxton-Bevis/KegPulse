@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Replaced browser-savable PIN fields with an on-screen keypad dialog; admin unlock now expires
+  when leaving a tab, and the Settings and Participants tabs require the PIN outright.
+- Showed each person's account balance beside their name on the home screen and added a
+  twelve-ounce "beers left" estimate to the home and keg views.
+- Recorded a WebM video of each pour while the camera is armed, keeping the five most recent in
+  the user's Videos folder (photos continue for every pour).
+- Added automatic face-cropped profile photos captured the first time a person pours, shown
+  beside their name and editable or removable in management.
+
 - Hardened measurement integrity end to end: reduced Nano stack usage so protocol formatting cannot
   overwrite the recovery counter, added host-side counter-relationship and pulse-rate-envelope
   validation, and quarantined semantically invalid RESULT/COUNTERS/status frames as durable

@@ -56,6 +56,31 @@
       </form>
     </dialog>
 
+    <dialog id="keypad-dialog" aria-labelledby="keypad-title">
+      <h2 id="keypad-title">Enter administrator PIN</h2>
+      <p id="keypad-dots" class="keypad-dots empty" aria-live="polite">Enter 6&ndash;20 digits</p>
+      <div class="keypad-grid" role="group" aria-label="PIN keypad">
+        <button type="button" data-key="1">1</button>
+        <button type="button" data-key="2">2</button>
+        <button type="button" data-key="3">3</button>
+        <button type="button" data-key="4">4</button>
+        <button type="button" data-key="5">5</button>
+        <button type="button" data-key="6">6</button>
+        <button type="button" data-key="7">7</button>
+        <button type="button" data-key="8">8</button>
+        <button type="button" data-key="9">9</button>
+        <button type="button" data-key="clear" aria-label="Clear">C</button>
+        <button type="button" data-key="0">0</button>
+        <button type="button" data-key="back" aria-label="Delete last digit">&#9003;</button>
+      </div>
+      <div class="button-row end">
+        <button type="button" class="secondary" data-key="cancel">Cancel</button>
+        <button type="button" id="keypad-ok" data-key="ok">OK</button>
+      </div>
+    </dialog>
+
+    
+
     <script type="module" src="/static/js/app.js"></script>
   </body>
 </html>

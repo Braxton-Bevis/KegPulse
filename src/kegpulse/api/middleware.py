@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -12,14 +13,27 @@ from kegpulse.security import allowed_host, allowed_origin
 
 
 class BodyLimitMiddleware:
-    def __init__(self, app: ASGIApp, maximum_bytes: int = 65_536) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        maximum_bytes: int = 65_536,
+        overrides: tuple[tuple[str, int], ...] = (),
+    ) -> None:
         self.app = app
         self.maximum_bytes = maximum_bytes
+        self.overrides = tuple((re.compile(pattern), limit) for pattern, limit in overrides)
+
+    def _limit_for(self, path: str) -> int:
+        for pattern, limit in self.overrides:
+            if pattern.fullmatch(path):
+                return limit
+        return self.maximum_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        maximum_bytes = self._limit_for(str(scope.get("path", "")))
         headers = Headers(scope=scope)
         declared = headers.get("content-length")
         if declared:
@@ -27,10 +41,9 @@ class BodyLimitMiddleware:
                 declared_bytes = int(declared)
                 if declared_bytes < 0:
                     raise ValueError
-                if declared_bytes > self.maximum_bytes:
-                    await JSONResponse({"detail": "request body exceeds 64 KiB"}, status_code=413)(
-                        scope, receive, send
-                    )
+                if declared_bytes > maximum_bytes:
+                    payload = {"detail": "request body exceeds the allowed size"}
+                    await JSONResponse(payload, status_code=413)(scope, receive, send)
                     return
             except ValueError:
                 await JSONResponse({"detail": "invalid Content-Length"}, status_code=400)(
@@ -56,7 +69,7 @@ class BodyLimitMiddleware:
                 return {"type": "http.disconnect"}
             if message["type"] == "http.request":
                 total += len(message.get("body", b""))
-                if total > self.maximum_bytes:
+                if total > maximum_bytes:
                     exceeded = True
                     return {"type": "http.disconnect"}
             return message
@@ -72,7 +85,7 @@ class BodyLimitMiddleware:
                         "detail": (
                             "request body exceeded 15 second timeout"
                             if timed_out
-                            else "request body exceeds 64 KiB"
+                            else "request body exceeds the allowed size"
                         )
                     },
                     status_code=408 if timed_out else 413,
