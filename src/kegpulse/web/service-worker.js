@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v11-admin-keypad-prompt";
+const CACHE_NAME = "kegpulse-shell-v12-pending-capture-nonblocking";
 const SHELL = [
   "/",
   "/static/styles.css",

@@ -982,11 +982,12 @@ function currentDevicePhase() {
 }
 
 function armIsAvailable() {
+  // A calibration/verification capture awaiting its scale mass must not block
+  // pours: its pulses are already durably captured, so the tap stays usable.
   return state.hostAvailable !== false
     && state.snapshot?.connection?.state === "connected"
     && currentDevicePhase() === "idle"
-    && !state.snapshot?.session
-    && !state.snapshot?.pending_capture;
+    && !state.snapshot?.session;
 }
 
 const BEER_ML = 355;
@@ -1073,6 +1074,7 @@ function homeView() {
   const warnings = [];
   if (onboarding.needs_keg) warnings.push(`<li><a href="#/keg">Install the current keg</a> so pours can be assigned to its history.</li>`);
   if (onboarding.needs_calibration) warnings.push(`<li><a href="#/calibration">Complete a ten-pour scale calibration</a>. Pulses captured first are preserved, but their volume and inventory effect remain unknown.</li>`);
+  if (s.pending_capture) warnings.push(`<li><a href="#/pour">Enter the scale mass for the waiting ${escapeHtml(s.pending_capture.purpose || "calibration")} sample</a>. Pours stay available meanwhile.</li>`);
   if (inventory?.has_unknown_pours) warnings.push("<li>One or more raw-pulse events have unknown volume and need review.</li>");
   if (decimal(inventory?.remaining_ml) < 0) warnings.push(`<li class="danger-text">Inventory overrun: ${formatVolume(Math.abs(decimal(inventory.remaining_ml)))} beyond the configured keg volume.</li>`);
   const participants = s.participants || [];
