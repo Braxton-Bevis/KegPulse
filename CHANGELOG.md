@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed live updates falling back to polling in LAN mode: the WebSocket's
+  per-frame admin revalidation predated the display mode and closed every
+  kiosk and viewer socket. Strict-LAN remote clients still get per-frame
+  revocation; the kiosk and read-only display viewers stream freely.
 - Required the administrator PIN for the keg inventory page: installing,
   replacing, or correcting a keg rewrites inventory. The API already enforced
   this; the page now matches.

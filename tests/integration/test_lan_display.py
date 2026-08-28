@@ -221,3 +221,39 @@ def test_local_kiosk_still_needs_the_pin_for_administrator_actions(
     for path, payload in blocked:
         response = kiosk_client.post(path, headers=headers, json=payload)
         assert response.status_code == 401, (path, response.status_code, response.text)
+
+
+def test_websocket_streams_for_display_viewers_and_the_kiosk(
+    display_client: TestClient,
+) -> None:
+    """The wall display and the kiosk get live pushes, not just polling."""
+    with display_client.websocket_connect(
+        "/api/v1/ws",
+        headers={"Host": LAN_HOST, "Origin": f"http://{LAN_HOST}"},
+    ) as websocket:
+        snapshot = websocket.receive_json()
+        assert "connection" in snapshot
+
+
+def test_websocket_stays_admin_only_in_strict_lan_mode(strict_client: TestClient) -> None:
+    from starlette.websockets import WebSocketDisconnect as ClientDisconnect
+
+    with (
+        pytest.raises(ClientDisconnect),
+        strict_client.websocket_connect(
+            "/api/v1/ws",
+            headers={"Host": LAN_HOST, "Origin": f"http://{LAN_HOST}"},
+        ) as websocket,
+    ):
+        websocket.receive_json()
+
+
+def test_websocket_streams_for_the_kiosk_in_strict_lan_mode(
+    kiosk_client: TestClient,
+) -> None:
+    with kiosk_client.websocket_connect(
+        "/api/v1/ws",
+        headers={"Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765"},
+    ) as websocket:
+        snapshot = websocket.receive_json()
+        assert "connection" in snapshot

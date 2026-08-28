@@ -1051,7 +1051,14 @@ def create_app(
                     with suppress(asyncio.CancelledError):
                         await snapshot_task
                     snapshot = coordinator.snapshot()
-                if config.lan_mode:
+                # Per-frame revocation applies only where admission required an
+                # admin session: strict-LAN remote clients. The kiosk (loopback)
+                # and read-only display viewers stream without one.
+                local_socket = websocket.client is not None and websocket.client.host in {
+                    "127.0.0.1",
+                    "::1",
+                }
+                if config.lan_mode and not config.lan_display and not local_socket:
                     session = security.get_session(token, touch=False)
                     if session is None or not session.admin:
                         await websocket.close(code=1008)
