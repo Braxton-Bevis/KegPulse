@@ -811,10 +811,9 @@ def test_pin_protection_and_service_worker_never_cache_api(page: Page, live_app:
     page.get_by_role("button", name="Save settings").click()
     expect(page.locator("#toast")).to_contain_text("administrator login required")
     expect(page.get_by_text("Administrator locked.", exact=True)).to_be_visible()
-    expect(page.get_by_label("Unlock with PIN")).to_be_visible()
     expect(completion).to_have_value("17")
 
-    page.get_by_label("Unlock with PIN").click()
+    # The admin-required failure auto-opens the keypad; typing the PIN unlocks in place.
     enter_keypad_pin(page, "246810")
     expect(page.get_by_text("Administrator unlocked for this session.", exact=True)).to_be_visible(
         timeout=5000

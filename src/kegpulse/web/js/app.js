@@ -417,6 +417,13 @@ function showError(error) {
   const message = error instanceof Error ? error.message : String(error);
   showToast(message, true);
   announcer.textContent = `Error: ${message}`;
+  if (
+    message.toLowerCase().includes("administrator login required")
+    && state.security?.pin_configured
+    && !state.security?.authenticated
+  ) {
+    openKeypad(null);
+  }
 }
 
 async function api(path, options = {}) {
@@ -1958,6 +1965,8 @@ function keypadPress(key) {
     if (form?.isConnected) {
       const hidden = form.querySelector("input[name=pin]");
       if (hidden) { hidden.value = pin; form.requestSubmit(); }
+    } else if (!form) {
+      void submitKeypadLogin(pin);
     }
     return;
   }
@@ -1973,6 +1982,22 @@ keypadDialog.addEventListener("keydown", (event) => {
   else if (event.key === "Enter") { event.preventDefault(); keypadPress("ok"); }
 });
 keypadDialog.addEventListener("cancel", () => { keypadEntry.value = ""; keypadEntry.form = null; });
+async function submitKeypadLogin(pin) {
+  if (state.pendingRelock) { try { await state.pendingRelock; } catch { /* relock settled */ } }
+  try {
+    state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+    await refresh();
+    syncSecurityUi();
+    render();
+    if (!state.socket) connectSocket();
+    showToast("Administrator unlocked \u2014 tap that action again");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(message, true);
+    announcer.textContent = `Error: ${message}`;
+  }
+}
+
 function relockAdminOnLeave() {
   if (!state.security?.pin_configured || !state.security?.authenticated) return;
   state.security = { ...state.security, authenticated: false };
