@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v19-lan-display";
+const CACHE_NAME = "kegpulse-shell-v21-local-kiosk";
 const SHELL = [
   "/",
   "/static/styles.css",

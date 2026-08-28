@@ -475,7 +475,7 @@ async function mutation(key, path, body = {}, method = "POST") {
       if (!(error instanceof ApiError) || ![401, 403].includes(error.status)) throw error;
       const context = await refreshSecurityContext();
       securityRefreshed = true;
-      if (context.lan_mode && !context.authenticated) {
+      if (lanLoginRequired(context)) {
         enterLoginMode();
         throw new ApiError("Administrator login required", 401);
       }
@@ -581,9 +581,19 @@ function navigate(path) {
   location.hash = `#${path}`;
 }
 
+function lanLoginRequired(context) {
+  // LAN mode guards the network boundary, not this machine. The physical kiosk
+  // (loopback) and read-only display viewers always see the app; only a strict
+  // remote client is sent to the login page.
+  const security = context || state.security;
+  if (!security?.lan_mode || security?.authenticated) return false;
+  if (security?.local_client || security?.lan_display) return false;
+  return true;
+}
+
 function connectionText() {
   if (state.hostAvailable === false) return ["bad", "■ Host unavailable"];
-  if (state.security?.lan_mode && !state.security?.authenticated) {
+  if (lanLoginRequired()) {
     return ["warning", "▲ Admin login required"];
   }
   const connection = state.snapshot?.connection;
@@ -617,7 +627,7 @@ function updateChrome() {
     kegBattery.className = "keg-battery hidden";
     kegBattery.setAttribute("aria-label", "Keg level unavailable");
   }
-  const loginRequired = state.security?.lan_mode && !state.security?.authenticated;
+  const loginRequired = lanLoginRequired();
   const degraded = state.socketFailures > 0 || state.snapshot?.connection?.state !== "connected";
   if (state.hostAvailable === false) {
     banner.className = "banner danger";
@@ -781,7 +791,7 @@ async function refresh() {
   try {
     if (recovering) {
       const context = await refreshSecurityContext();
-      if (context.lan_mode && !context.authenticated) {
+      if (lanLoginRequired(context)) {
         enterLoginMode();
         return false;
       }
@@ -792,7 +802,7 @@ async function refresh() {
     } catch (error) {
       if (!(error instanceof ApiError) || ![401, 403].includes(error.status)) throw error;
       const context = await refreshSecurityContext();
-      if (context.lan_mode && !context.authenticated) {
+      if (lanLoginRequired(context)) {
         enterLoginMode();
         return false;
       }
@@ -825,7 +835,7 @@ function stopPolling() {
 
 function connectSocket() {
   window.clearTimeout(state.reconnectTimer);
-  if (state.security?.lan_mode && !state.security?.authenticated) return;
+  if (lanLoginRequired()) return;
   if (!navigator.onLine) return;
   if (state.socket && state.socket.readyState < WebSocket.CLOSING) state.socket.close();
   const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -1101,7 +1111,10 @@ function homeView() {
   const subtitle = unattributedFlow
     ? "The tap opened without a selected participant. KegPulse is preserving the measurement."
     : readyToArm ? "Select a person before opening the tap, or choose Guest." : "Review the visible device state before opening the tap.";
-  const armDisabled = state.pending.has("arm") || !readyToArm;
+  const remoteViewer = Boolean(state.security?.lan_mode)
+    && !state.security?.local_client
+    && !state.security?.authenticated;
+  const armDisabled = state.pending.has("arm") || !readyToArm || remoteViewer;
   const calibrated = s.live_volume_ml !== null || Boolean(s.active_calibration);
   const rate = formatFlowRate(state.flowRateMlMin);
   const activePulses = decimal(s.device?.status?.pulses);
@@ -1536,6 +1549,9 @@ function reassignmentEditor(row) {
 }
 
 function kegView() {
+  if (state.security?.pin_configured && !state.security?.authenticated) {
+    return page("Keg inventory locked", "Installing, replacing, or correcting a keg rewrites inventory, so it requires the administrator PIN.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
   const keg = state.snapshot.keg;
   const inventory = state.snapshot.inventory;
   return page("Keg inventory", "Replacing a keg closes its history. Manual corrections always require a reason.", `
@@ -1772,7 +1788,7 @@ function render() {
       bindForms();
       main.querySelector("h1")?.focus({ preventScroll: true });
       state.renderedRoute = "__unavailable__";
-    } else if (state.security?.lan_mode && !state.security?.authenticated) {
+    } else if (lanLoginRequired()) {
       main.innerHTML = loginView();
       bindForms();
       main.querySelector("h1")?.focus({ preventScroll: true });
@@ -1781,7 +1797,7 @@ function render() {
     syncHostControls();
     return;
   }
-  const loginRequired = state.snapshot.settings?.lan_mode && !state.security?.authenticated;
+  const loginRequired = lanLoginRequired();
   const renderKey = loginRequired ? "__login__" : route();
   const shouldFocus = state.renderedRoute !== renderKey;
   if (loginRequired) {
@@ -2187,7 +2203,7 @@ function relockAdminOnLeave() {
     .catch(() => {})
     .finally(() => { state.pendingRelock = null; });
 }
-const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants", "/calibration"]);
+const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants", "/calibration", "/keg"]);
 // Transient pour screens: a calibration capture routes through them, so they
 // neither require nor drop administrator access.
 const NEUTRAL_ROUTES = new Set(["/pour", "/complete"]);
@@ -2222,7 +2238,7 @@ window.addEventListener("online", () => { void refresh(); });
 async function initialize() {
   try {
     state.security = await refreshSecurityContext();
-    if (state.security.lan_mode && !state.security.authenticated) {
+    if (lanLoginRequired(state.security)) {
       enterLoginMode();
     } else {
       const ready = await refresh();

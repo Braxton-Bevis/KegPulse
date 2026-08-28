@@ -154,6 +154,8 @@ class SecurityManager:
             "pin_configured": self.pin_configured,
             "authenticated": session.admin,
             "lan_mode": self.config.lan_mode,
+            "lan_display": self.config.lan_display,
+            "local_client": self._is_local_client(request),
         }
 
     def _throttle(self, client: str) -> None:
@@ -204,6 +206,8 @@ class SecurityManager:
             "pin_configured": True,
             "authenticated": True,
             "lan_mode": self.config.lan_mode,
+            "lan_display": self.config.lan_display,
+            "local_client": self._is_local_client(request),
         }
 
     def logout(self, request: Request, response: Response) -> None:
@@ -220,9 +224,24 @@ class SecurityManager:
             raise HTTPException(status_code=403, detail="valid CSRF token required")
         return session
 
+    @staticmethod
+    def _is_local_client(request: Request) -> bool:
+        """True for the physical kiosk: requests arriving over loopback.
+
+        LAN mode protects the network boundary, not the machine itself. Someone
+        at the kiosk already has physical access to the tap, so the local
+        browser keeps working as a kiosk without a PIN.
+        """
+        client = request.client
+        return client is not None and client.host in {"127.0.0.1", "::1"}
+
     def require_access(self, request: Request) -> SecuritySession | None:
         session = self.get_session(request.cookies.get(SESSION_COOKIE))
-        if self.config.lan_mode and (session is None or not session.admin):
+        if (
+            self.config.lan_mode
+            and not self._is_local_client(request)
+            and (session is None or not session.admin)
+        ):
             raise HTTPException(status_code=401, detail="administrator login required in LAN mode")
         return session
 
@@ -235,13 +254,15 @@ class SecurityManager:
         session = self.get_session(request.cookies.get(SESSION_COOKIE))
         if not self.config.lan_mode or self.config.lan_display:
             return session
+        if self._is_local_client(request):
+            return session
         if session is None or not session.admin:
             raise HTTPException(status_code=401, detail="administrator login required in LAN mode")
         return session
 
     def require_operational(self, request: Request) -> SecuritySession:
         session = self.require_csrf(request)
-        if self.config.lan_mode and not session.admin:
+        if self.config.lan_mode and not session.admin and not self._is_local_client(request):
             raise HTTPException(status_code=401, detail="administrator login required in LAN mode")
         return session
 
@@ -253,6 +274,8 @@ class SecurityManager:
 
     def websocket_allowed(self, websocket: WebSocket) -> bool:
         if not self.config.lan_mode or self.config.lan_display:
+            return True
+        if websocket.client and websocket.client.host in {"127.0.0.1", "::1"}:
             return True
         session = self.get_session(websocket.cookies.get(SESSION_COOKIE))
         return bool(session and session.admin)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Required the administrator PIN for the keg inventory page: installing,
+  replacing, or correcting a keg rewrites inventory. The API already enforced
+  this; the page now matches.
+- Stopped LAN mode from locking the kiosk out of its own home screen. LAN mode
+  guards the network boundary, not the machine at the tap: loopback requests
+  keep full kiosk behaviour, remote viewers stay read-only, and administrator
+  actions still require the PIN everywhere.
 - Put calibration and verification back behind the administrator PIN, including
   the page itself; the pour and completion screens stay neutral so a capture
   can route through them without dropping the session.

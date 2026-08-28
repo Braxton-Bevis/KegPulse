@@ -162,6 +162,8 @@ class SecurityContextResponse(ResponseModel):
     pin_configured: bool
     authenticated: bool
     lan_mode: bool
+    lan_display: bool = False
+    local_client: bool = True
 
 
 class OkResponse(ResponseModel):
