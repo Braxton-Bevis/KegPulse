@@ -15,6 +15,10 @@ MAX_MASS_G = Decimal("10000")
 MIN_DENSITY = Decimal("0.5")
 MAX_DENSITY = Decimal("2.0")
 MAX_PULSES = 2**63 - 1
+# Any plausible drink flow sensor falls well inside this range; a factor outside
+# it means a mistyped sample, and activating it would mis-meter volume and money.
+PLAUSIBLE_FACTOR_MIN = Decimal("0.1")
+PLAUSIBLE_FACTOR_MAX = Decimal("100")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +50,15 @@ class CalibrationAnalysis:
     pulses_per_ml: Decimal
     samples: tuple[SampleAnalysis, ...]
     included_count: int
-    coefficient_of_variation_pct: Decimal
+    coefficient_of_variation_pct: Decimal | None
+
+
+def ensure_plausible_factor(factor: Decimal) -> None:
+    if not PLAUSIBLE_FACTOR_MIN <= factor <= PLAUSIBLE_FACTOR_MAX:
+        raise DomainError(
+            "calibration factor is outside the plausible range for a flow sensor; "
+            "check the sample masses and pulse counts"
+        )
 
 
 def make_sample(
@@ -76,7 +88,11 @@ def _outlier_flags(ratios: list[Decimal]) -> list[bool]:
     deviations = [abs(value - center) for value in ratios]
     mad = Decimal(str(median(deviations)))
     if mad == 0:
-        return [value != center for value in ratios]
+        # With most samples identical, tiny scale jitter is normal; flag only
+        # deviations beyond five percent of the center value.
+        if center == 0:
+            return [value != center for value in ratios]
+        return [abs(value - center) / abs(center) > Decimal("0.05") for value in ratios]
     return [(Decimal("0.6745") * abs(value - center) / mad) > Decimal("3.5") for value in ratios]
 
 
@@ -115,10 +131,13 @@ def analyze_calibration(
             flagged = next(flag_iter) if sample.included else False
             analyses.append(SampleAnalysis(predicted, residual, percentage, flagged))
 
-        mean = sum(included_ratios, Decimal(0)) / Decimal(len(included_ratios))
-        variance = sum(((ratio - mean) ** 2 for ratio in included_ratios), Decimal(0))
-        variance /= Decimal(len(included_ratios))
-        coefficient = variance.sqrt() / mean * Decimal(100) if mean else Decimal(0)
+        if len(included_ratios) < 2:
+            coefficient = None
+        else:
+            mean = sum(included_ratios, Decimal(0)) / Decimal(len(included_ratios))
+            variance = sum(((ratio - mean) ** 2 for ratio in included_ratios), Decimal(0))
+            variance /= Decimal(len(included_ratios))
+            coefficient = variance.sqrt() / mean * Decimal(100) if mean else Decimal(0)
         return CalibrationAnalysis(factor, tuple(analyses), len(included), coefficient)
 
 

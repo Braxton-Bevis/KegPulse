@@ -12,6 +12,7 @@ from kegpulse.domain.calibration import (
     CalibrationAnalysis,
     CalibrationSample,
     analyze_calibration,
+    ensure_plausible_factor,
     make_sample,
     pulses_to_ml,
     verification_error,
@@ -448,6 +449,11 @@ class Repository:
         self, connection: sqlite3.Connection, rows: list[sqlite3.Row]
     ) -> None:
         if sum(bool(row["included"]) for row in rows) < 3:
+            if rows:
+                connection.execute(
+                    "UPDATE calibration_samples SET suspected_outlier=0 WHERE calibration_id=?",
+                    (rows[0]["calibration_id"],),
+                )
             return
         analysis = analyze_calibration(self._samples_from_rows(rows), require_ten=False)
         for row, item in zip(rows, analysis.samples, strict=True):
@@ -513,7 +519,11 @@ class Repository:
         return {
             "pulses_per_ml": str(analysis.pulses_per_ml),
             "included_count": analysis.included_count,
-            "coefficient_of_variation_pct": str(analysis.coefficient_of_variation_pct),
+            "coefficient_of_variation_pct": (
+                str(analysis.coefficient_of_variation_pct)
+                if analysis.coefficient_of_variation_pct is not None
+                else None
+            ),
             "samples": [
                 {
                     "predicted_volume_ml": str(item.predicted_volume_ml),
@@ -568,6 +578,7 @@ class Repository:
             if len(samples) != 10 or sum(bool(row["included"]) for row in samples) < 7:
                 raise ConflictError("calibration needs ten samples and at least seven included")
             analysis = analyze_calibration(self._samples_from_rows(samples))
+            ensure_plausible_factor(analysis.pulses_per_ml)
             active = connection.execute(
                 "SELECT 1 FROM provisional_sessions WHERE status IN "
                 "('arming', 'armed', 'pouring', 'settling', 'finalizing') LIMIT 1"
@@ -592,16 +603,20 @@ class Repository:
         density_g_per_ml: Decimal | str | int | float,
         warning_threshold_pct: Decimal | str | int | float,
     ) -> dict[str, Any]:
-        calibration = self.active_calibration()
-        if calibration is None or calibration["pulses_per_ml"] is None:
-            raise ConflictError("an active calibration is required")
-        predicted, actual, absolute, percentage = verification_error(
-            raw_pulses, mass_g, density_g_per_ml, calibration["pulses_per_ml"]
-        )
         threshold = finite_decimal(warning_threshold_pct, "warning_threshold_pct")
         verification_id, now = _id(), utc_now()
-        keg = self.current_keg()
         with self.db.transaction() as connection:
+            calibration = connection.execute(
+                "SELECT * FROM calibrations WHERE status='active' LIMIT 1"
+            ).fetchone()
+            if calibration is None or calibration["pulses_per_ml"] is None:
+                raise ConflictError("an active calibration is required")
+            predicted, actual, absolute, percentage = verification_error(
+                raw_pulses, mass_g, density_g_per_ml, calibration["pulses_per_ml"]
+            )
+            keg = connection.execute(
+                "SELECT * FROM kegs WHERE closed_at IS NULL ORDER BY opened_at DESC LIMIT 1"
+            ).fetchone()
             connection.execute(
                 "INSERT INTO verification_checks(id, calibration_id, keg_id, raw_pulses, "
                 "mass_g, density_g_per_ml, predicted_volume_ml, actual_volume_ml, "
@@ -639,6 +654,26 @@ class Repository:
             ]
 
     # Sessions and results
+    def get_provisional(self, session_id: str) -> dict[str, Any] | None:
+        with self.db.read() as connection:
+            return _dict(
+                connection.execute(
+                    "SELECT * FROM provisional_sessions WHERE session_id=?", (session_id,)
+                ).fetchone()
+            )
+
+    def prune_unattributed_photos(self, *, keep: int = 48) -> list[str]:
+        """Drop the oldest sessionless evidence rows beyond keep; returns pruned paths."""
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id, relative_path FROM pour_photos WHERE session_id IS NULL "
+                "ORDER BY captured_at DESC"
+            ).fetchall()
+            stale = rows[keep:]
+            for row in stale:
+                connection.execute("DELETE FROM pour_photos WHERE id=?", (row["id"],))
+        return [str(row["relative_path"]) for row in stale]
+
     def active_provisional(self) -> dict[str, Any] | None:
         with self.db.read() as connection:
             return _dict(
@@ -1623,6 +1658,7 @@ class Repository:
                 raise ConflictError("cannot activate calibration during an active pour")
             analysis = analyze_calibration(self._samples_from_rows(samples), require_ten=False)
             factor = analysis.pulses_per_ml
+            ensure_plausible_factor(factor)
             noun = "sample" if len(included) == 1 else "samples"
             marker = (
                 f"[PROVISIONAL: estimate from {len(included)} included {noun}; "

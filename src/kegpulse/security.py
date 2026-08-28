@@ -157,6 +157,7 @@ class SecurityManager:
         }
 
     def _throttle(self, client: str) -> None:
+        """Reject when too many recent FAILED attempts exist; successes never count."""
         now = time.monotonic()
         cutoff = now - 60
         with self._lock:
@@ -169,14 +170,21 @@ class SecurityManager:
                 raise HTTPException(
                     status_code=429, detail="too many PIN attempts; try again shortly"
                 )
-            local.append(now)
+
+    def _record_failed_attempt(self, client: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._attempts[client].append(now)
             self._global_attempts.append(now)
 
     def login(self, request: Request, response: Response, pin: str) -> dict[str, Any]:
         client = request.client.host if request.client else "unknown"
         self._throttle(client)
         if not self.verify_pin(pin):
+            self._record_failed_attempt(client)
             raise HTTPException(status_code=401, detail="invalid PIN")
+        with self._lock:
+            self._attempts.pop(client, None)
         old = request.cookies.get(SESSION_COOKIE)
         with self._lock:
             if old:

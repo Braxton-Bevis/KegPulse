@@ -200,7 +200,6 @@ class AccountLedgerResponse(ResponseModel):
 
 class PourVideoResponse(ResponseModel):
     file: str
-    directory: str
     size_bytes: int
     pruned: int
 
@@ -283,7 +282,7 @@ class CalibrationAnalysisSampleResponse(ResponseModel):
 class CalibrationAnalysisResponse(ResponseModel):
     pulses_per_ml: str
     included_count: int
-    coefficient_of_variation_pct: str
+    coefficient_of_variation_pct: str | None = None
     samples: list[CalibrationAnalysisSampleResponse]
 
 

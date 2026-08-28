@@ -99,18 +99,23 @@ class SessionMachine {
   void add_recovery_pulses(uint32_t count);
   void copy_session(char destination[33], const char* source) const;
 
+  // Deliberate layout: the recovery counter, fault pointer, and lifetime total
+  // sit at the LOW end of this object. This object is the highest in .bss, so
+  // a stack overrun reaches the last members first; keep expendable scratch
+  // state there instead of billing-critical counters (see the 2026-08 SRAM
+  // corruption incident).
+  uint64_t recovery_pulses_;
+  const char* fault_;
+  uint64_t lifetime_pulses_;
   uint32_t arm_timeout_ms_;
   uint32_t flow_gap_ms_;
   uint32_t settling_ms_;
   DeviceState state_;
-  uint64_t lifetime_pulses_;
   uint32_t next_sequence_;
   bool active_present_;
   Active active_;
   Result results_[kResultCapacity];
   uint8_t result_count_;
-  uint64_t recovery_pulses_;
-  const char* fault_;
 };
 
 const char* state_name(DeviceState state);

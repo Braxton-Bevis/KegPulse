@@ -836,17 +836,19 @@ function connectSocket() {
     updateChrome();
   });
   socket.addEventListener("message", (event) => {
+    let snapshot;
     try {
-      const snapshot = JSON.parse(event.data);
-      if (state.hostAvailable === false || !state.security) {
-        applySnapshot(snapshot);
-        void refresh();
-      } else {
-        setHostAvailability(true);
-        applySnapshot(snapshot);
-      }
+      snapshot = JSON.parse(event.data);
     } catch {
       socket.close(1003, "invalid snapshot");
+      return;
+    }
+    if (state.hostAvailable === false || !state.security) {
+      applySnapshot(snapshot);
+      void refresh();
+    } else {
+      setHostAvailability(true);
+      applySnapshot(snapshot);
     }
   });
   socket.addEventListener("close", () => {
@@ -1222,11 +1224,15 @@ function attachCameraPreview() {
 }
 
 async function enableCamera() {
+  if (state.pending.has("camera-enable")) return;
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not provide camera access.");
-    state.cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    state.cameraStream?.getTracks().forEach((track) => track.stop());
+    state.cameraStream = stream;
     state.cameraStatus = "Camera armed for the next pour";
-    state.management = await mutation("camera-enable", "/api/v1/management/settings", { webcam_enabled: true }, "PATCH");
+    const enabled = await mutation("camera-enable", "/api/v1/management/settings", { webcam_enabled: true }, "PATCH");
+    if (enabled) state.management = enabled;
     render();
   } catch (error) {
     state.cameraStream?.getTracks().forEach((track) => track.stop());
@@ -1242,7 +1248,8 @@ async function disableCamera() {
   state.cameraStream = null;
   state.cameraStatus = "Camera disabled";
   try {
-    state.management = await mutation("camera-disable", "/api/v1/management/settings", { webcam_enabled: false }, "PATCH");
+    const disabled = await mutation("camera-disable", "/api/v1/management/settings", { webcam_enabled: false }, "PATCH");
+    if (disabled) state.management = disabled;
     render();
   } catch (error) { showError(error); }
 }
@@ -1286,16 +1293,29 @@ async function capturePourPhoto(sessionId) {
 function syncPourVideo(snapshot) {
   const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
   const session = snapshot?.session;
-  const activePour = (session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase))
+  const activePour = (session?.purpose === "pour" && ["pouring", "settling"].includes(phase))
     || (!session && ["pouring", "settling"].includes(phase));
-  if (activePour && state.cameraStream && !state.videoRecorder && typeof MediaRecorder !== "undefined") {
+  if (
+    activePour
+    && state.cameraStream
+    && state.management?.webcam_enabled !== false
+    && !state.videoRecorder
+    && typeof MediaRecorder !== "undefined"
+  ) {
     try {
       const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
       const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
-      state.videoChunks = [];
-      state.videoSessionId = session ? session.session_id : "unattributed";
-      recorder.ondataavailable = (event) => { if (event.data?.size) state.videoChunks.push(event.data); };
-      recorder.onstop = () => { void uploadPourVideo(); };
+      const chunks = [];
+      const recordingSession = session ? session.session_id : "unattributed";
+      state.videoSessionId = recordingSession;
+      recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+      recorder.onstop = () => {
+        if (state.videoRecorder === recorder) {
+          state.videoRecorder = null;
+          state.videoSessionId = null;
+        }
+        void uploadPourVideo(recordingSession, chunks);
+      };
       recorder.start(1000);
       state.videoRecorder = recorder;
       setTimeout(() => {
@@ -1305,16 +1325,14 @@ function syncPourVideo(snapshot) {
   } else if (state.videoRecorder && (!activePour || (session ? session.session_id : "unattributed") !== state.videoSessionId)) {
     const recorder = state.videoRecorder;
     if (recorder.state !== "inactive") recorder.stop();
-    else state.videoRecorder = null;
+    else {
+      state.videoRecorder = null;
+      state.videoSessionId = null;
+    }
   }
 }
 
-async function uploadPourVideo() {
-  const sessionId = state.videoSessionId;
-  const chunks = state.videoChunks;
-  state.videoRecorder = null;
-  state.videoChunks = [];
-  state.videoSessionId = null;
+async function uploadPourVideo(sessionId, chunks) {
   if (!sessionId || !chunks.length) return;
   const blob = new Blob(chunks, { type: "video/webm" });
   if (blob.size < 4 || blob.size > 33_554_432) return;
@@ -1410,15 +1428,20 @@ function completionView() {
 }
 
 function scheduleCompletionReturn() {
-  window.clearTimeout(state.completionTimer);
-  if (state.completionPaused) return;
+  if (state.completionPaused || state.completionTimer) return;
   const seconds = Number(state.snapshot?.settings?.completion_seconds ?? 9);
-  if (seconds > 0) state.completionTimer = window.setTimeout(() => navigate("/"), seconds * 1000);
+  if (seconds > 0) {
+    state.completionTimer = window.setTimeout(() => {
+      state.completionTimer = null;
+      navigate("/");
+    }, seconds * 1000);
+  }
 }
 
 function pauseCompletionReturn() {
   state.completionPaused = true;
   window.clearTimeout(state.completionTimer);
+  state.completionTimer = null;
   const message = document.querySelector("#return-countdown");
   if (message) message.textContent = "Auto-return paused.";
 }
@@ -1449,7 +1472,7 @@ function historyRows(rows) {
 }
 
 function pourDetails(row) {
-  return `<details class="pour-details"><summary>Measurement details</summary><dl class="status-list">
+  return `<details class="pour-details" data-pour-details="${escapeHtml(row.id)}" ${state.openPourDetails?.has(row.id) ? "open" : ""}><summary>Measurement details</summary><dl class="status-list">
     <dt>Started</dt><dd>${formatTime(row.started_at)}</dd><dt>Ended</dt><dd>${formatTime(row.ended_at)}</dd>
     <dt>Keg</dt><dd>${escapeHtml(row.keg_label || row.keg_id || "Not assigned")}</dd>
     <dt>Calibration</dt><dd>${escapeHtml(row.calibration_id || "No active calibration")}</dd>
@@ -1525,7 +1548,7 @@ function sampleReview(detail) {
     : `This ${escapeHtml(detail.status)} calibration is read-only; its inclusion decisions are preserved.`;
   const fullyActivatable = detail.samples.length === 10 && includedCount >= 7;
   const analysisSummary = analysis
-    ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%</p>${editable && fullyActivatable ? `<button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : editable ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>' : ""}`
+    ? `<p><strong>Aggregate factor:</strong> ${Number(analysis.pulses_per_ml).toFixed(6)} pulses/mL · variation ${analysis.coefficient_of_variation_pct === null || analysis.coefficient_of_variation_pct === undefined ? "n/a (need 2+ samples)" : `${Number(analysis.coefficient_of_variation_pct).toFixed(2)}%`}</p>${editable && fullyActivatable ? `<button data-action="activate-calibration" data-calibration="${escapeHtml(detail.id)}">Review and activate</button>` : editable ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>' : ""}`
     : editable
       ? '<p class="muted">Capture all ten samples and keep at least seven included to activate.</p>'
       : "";
@@ -1541,29 +1564,66 @@ function sampleReview(detail) {
   </section>`;
 }
 
+function calibrationCaptureCard(capture, captureDensity) {
+  if (capture?.status !== "complete") return "";
+  return `<section class="card quick-cal"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>`;
+}
+
+function calibrationRunCard(detail, { hero = false } = {}) {
+  const editable = detail.status === "draft";
+  const captureButton = editable && detail.samples.length < 10
+    ? `<button class="${hero ? "capture-cta" : ""}" data-action="capture-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${detail.samples.length + 1}">Capture sample ${detail.samples.length + 1}</button>`
+    : "";
+  const kicker = hero ? '<p class="section-kicker">Calibration in progress</p>' : "";
+  const title = hero
+    ? `<h2>${escapeHtml(detail.liquid)} \u00b7 ${escapeHtml(detail.default_density_g_per_ml)} g/mL</h2>`
+    : `<h2>${escapeHtml(detail.liquid)} \u00b7 ${escapeHtml(detail.status)}</h2>`;
+  return `<article class="card ${hero ? "quick-cal" : ""}" data-calibration-status="${escapeHtml(detail.status)}">${kicker}${title}<p>Created ${formatTime(detail.created_at)}</p>${captureButton}${detail.samples.length ? sampleReview(detail) : '<p class="empty">No samples captured yet \u2014 pour one and weigh it.</p>'}</article>`;
+}
+
 function calibrationView() {
   const active = state.snapshot.active_calibration;
   const capture = state.snapshot.pending_capture;
   const verification = state.snapshot.last_verification;
+  const details = state.calibrationDetails;
   const captureDensity = capture?.density_g_per_ml
-    || state.calibrationDetails?.find((item) => item.id === capture?.calibration_id)?.default_density_g_per_ml
-    || "1.000";
-  return page("Calibration & verification", "Use a tared scale. Mass ÷ density gives volume; KegPulse uses total pulses ÷ total volume.", `
-    <section class="card setup-callout"><h2>Quick calibration — three pours</h2><ol class="step-list"><li>Start a run below (water at 1.000 g/mL is easiest).</li><li>Capture a pour, weigh the glass on a scale, and enter the grams.</li><li>Repeat for three varied pour sizes — agreeing samples show as Consistent, and each shows the weight the current estimate would have predicted.</li><li>Tap “Use 3-sample estimate for now” to activate it.</li></ol><p>For the best accuracy, keep adding samples to the same run whenever convenient — at ten you can activate the fully reviewed factor.</p><p class="warning-text">Density directly affects volume. KegPulse is not a legal-for-trade meter.</p></section>
-    ${capture?.status === "complete" ? `<section class="card"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>` : ""}
-    ${verification ? `<section class="card ${verification.warning ? "outlier" : ""}"><h2>Latest verification</h2><dl class="status-list"><dt>Predicted</dt><dd>${formatVolume(verification.predicted_volume_ml)}</dd><dt>Scale volume</dt><dd>${formatVolume(verification.actual_volume_ml)}</dd><dt>Absolute error</dt><dd>${formatVolume(verification.absolute_error_ml)}</dd><dt>Percentage error</dt><dd>${Number(verification.percentage_error).toFixed(2)}%</dd></dl><p class="${verification.warning ? "warning-text" : "good-text"}">${verification.warning ? "Drift warning: investigate sensor, flow conditions, tubing, or calibration. The factor was not changed." : "Verification is within the configured warning threshold."}</p></section>` : ""}
-    <div class="grid two">
-      <section class="card"><h2>Active calibration</h2>${active ? `${String(active.notes || "").includes("[PROVISIONAL:") ? '<p class="warning-text">Provisional estimate from a partial sample run. Volumes and charges may be inaccurate until the full calibration is completed.</p>' : ""}<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active. Complete a run below.</p>'}</section>
-      <section class="card"><h2>New calibration run</h2><form id="calibration-form" class="stack"><label>Liquid<input name="liquid" maxlength="80" value="water" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.000" required></label><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Start calibration run</button></form></section>
-    </div>
-    <section id="calibration-runs" class="stack">${state.calibrationDetails
-      ? calibrationRuns(state.calibrationDetails)
-      : '<button data-action="load-calibrations" class="secondary">Load calibration runs</button>'}</section>
-  `);
-}
+    || details?.find((item) => item.id === capture?.calibration_id)?.default_density_g_per_ml
+    || "1.010";
+  const drafts = (details || []).filter((item) => item.status === "draft")
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  const heroDraft = drafts[0] || null;
+  const pastRuns = (details || []).filter((item) => item !== heroDraft);
 
-function calibrationRuns(details) {
-  return details.map((detail) => `<article class="card" data-calibration-status="${escapeHtml(detail.status)}"><h2>${escapeHtml(detail.liquid)} · ${escapeHtml(detail.status)}</h2><p>Created ${formatTime(detail.created_at)}</p>${detail.status === "draft" && detail.samples.length < 10 ? `<button data-action="capture-sample" data-calibration="${escapeHtml(detail.id)}" data-ordinal="${detail.samples.length + 1}">Capture sample ${detail.samples.length + 1}</button>` : ""}${detail.samples.length ? sampleReview(detail) : '<p class="empty">No samples captured yet.</p>'}</article>`).join("");
+  const heroSection = details === null
+    ? '<section class="card quick-cal"><p class="muted">Loading calibration runs\u2026</p></section>'
+    : heroDraft
+      ? calibrationRunCard(heroDraft, { hero: true })
+      : `<section class="card quick-cal"><p class="section-kicker">Quick calibration</p><h2>Three pours and you're calibrated</h2><ol class="step-list"><li>Start a run \u2014 preset for beer at 1.010 g/mL.</li><li>Capture a pour, weigh the glass, enter the grams.</li><li>Repeat for three varied pour sizes, then tap \u201cUse 3-sample estimate for now\u201d.</li></ol><form id="calibration-form" class="stack"><div class="grid two"><label>Liquid<input name="liquid" maxlength="80" value="beer" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.010" required></label></div><span class="field-help">Most lagers and ales are about 1.010 g/mL; stouts run nearer 1.015. Use 1.000 for water.</span><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Start calibration run</button></form><p class="warning-text">Density directly affects volume. KegPulse is not a legal-for-trade meter.</p></section>`;
+
+  const activeSection = `<section class="card"><h2>Active calibration</h2>${active ? `${String(active.notes || "").includes("[PROVISIONAL:") ? '<p class="warning-text">Provisional estimate from a partial sample run. Add samples to the current run and re-activate whenever you want tighter accuracy.</p>' : ""}<dl class="status-list"><dt>Liquid</dt><dd>${escapeHtml(active.liquid)}</dd><dt>Factor</dt><dd>${Number(active.pulses_per_ml).toFixed(6)} pulses/mL</dd><dt>Activated</dt><dd>${formatTime(active.activated_at)}</dd></dl><button data-action="start-verification">Start weighed verification pour</button>` : '<p class="empty">No calibration is active yet \u2014 finish the quick run above.</p>'}</section>`;
+
+  const verificationSection = verification
+    ? `<section class="card ${verification.warning ? "outlier" : ""}"><h2>Latest verification</h2><dl class="status-list"><dt>Predicted</dt><dd>${formatVolume(verification.predicted_volume_ml)}</dd><dt>Scale volume</dt><dd>${formatVolume(verification.actual_volume_ml)}</dd><dt>Absolute error</dt><dd>${formatVolume(verification.absolute_error_ml)}</dd><dt>Percentage error</dt><dd>${Number(verification.percentage_error).toFixed(2)}%</dd></dl><p class="${verification.warning ? "warning-text" : "good-text"}">${verification.warning ? "Drift warning: investigate sensor, flow conditions, tubing, or calibration. The factor was not changed." : "Verification is within the configured warning threshold."}</p></section>`
+    : "";
+
+  const newRunSection = heroDraft
+    ? `<section class="card"><h2>Start another run</h2><form id="calibration-form" class="stack"><div class="grid two"><label>Liquid<input name="liquid" maxlength="80" value="beer" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="1.010" required></label></div><label>Notes<textarea name="notes" maxlength="1000"></textarea></label><button>Start calibration run</button></form></section>`
+    : "";
+
+  const pastSection = pastRuns.length
+    ? `<section class="stack" id="calibration-runs"><h2 class="section-heading">Past runs</h2>${pastRuns.map((item) => calibrationRunCard(item)).join("")}</section>`
+    : `<section id="calibration-runs" class="stack">${details ? "" : '<button data-action="load-calibrations" class="secondary">Load calibration runs</button>'}</section>`;
+
+  return page("Calibration", "Pour, weigh, enter grams \u2014 three good pours make a working estimate.", `
+    ${calibrationCaptureCard(capture, captureDensity)}
+    ${heroSection}
+    <div class="grid two">
+      ${activeSection}
+      ${verificationSection || newRunSection}
+    </div>
+    ${verificationSection && heroDraft ? newRunSection : ""}
+    ${pastSection}
+  `);
 }
 
 function participantsView() {
@@ -1649,7 +1709,11 @@ function render() {
     else if (current === "/keg") main.innerHTML = kegView();
     else if (current === "/calibration") {
       main.innerHTML = calibrationView();
-      if (state.calibrationDetails === null && !state.pending.has("load-calibrations")) {
+      if (
+        state.calibrationDetails === null
+        && !state.calibrationLoadFailed
+        && !state.pending.has("load-calibrations")
+      ) {
         state.pending.add("load-calibrations");
         void loadCalibrations().finally(() => state.pending.delete("load-calibrations"));
       }
@@ -1683,6 +1747,7 @@ async function arm(participantId) {
   }
   try {
     await mutation("arm", "/api/v1/sessions/arm", { participant_id: participantId || null, idempotency_key: uuidKey() });
+    void captureAvatarIfMissing(participantId);
     navigate("/pour");
   } catch (error) { showError(error); }
 }
@@ -1717,8 +1782,12 @@ async function loadCalibrations() {
     const runs = await api("/api/v1/calibrations");
     const details = await Promise.all(runs.map((run) => api(`/api/v1/calibrations/${run.id}`)));
     state.calibrationDetails = details;
+    state.calibrationLoadFailed = false;
     if (route() === "/calibration") render();
-  } catch (error) { showError(error); }
+  } catch (error) {
+    state.calibrationLoadFailed = true;
+    showError(error);
+  }
 }
 
 async function captureSample(calibrationId, ordinal) {
@@ -1806,7 +1875,8 @@ function bindForms() {
   document.querySelector("#management-settings-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
-      state.management = await mutation("management-settings", "/api/v1/management/settings", { price_per_fl_oz: form.get("price_per_fl_oz") }, "PATCH");
+      const saved = await mutation("management-settings", "/api/v1/management/settings", { price_per_fl_oz: form.get("price_per_fl_oz") }, "PATCH");
+      if (saved) state.management = saved;
       showToast("Beer price saved"); render();
     } catch (error) { showError(error); }
   });
@@ -1868,7 +1938,7 @@ main.addEventListener("click", async (event) => {
     return navigate("/");
   }
   if (action === "open-keypad") { openKeypad(button.closest("form")); return; }
-  if (action === "arm") { void captureAvatarIfMissing(button.dataset.participant); return arm(button.dataset.participant); }
+  if (action === "arm") return arm(button.dataset.participant);
   if (action === "avatar-remove") {
     const accepted = await confirmAction("Remove this profile photo? A new one is captured automatically the next time they pour.", "Remove photo");
     if (accepted) {
@@ -1887,7 +1957,7 @@ main.addEventListener("click", async (event) => {
   if (action === "load-history") return loadHistory();
   if (action === "show-reassign") return showReassign(button.dataset.pour);
   if (action === "cancel-reassign") { state.reassignPourId = null; render(); return; }
-  if (action === "load-calibrations") return loadCalibrations();
+  if (action === "load-calibrations") { state.calibrationLoadFailed = false; return loadCalibrations(); }
   if (action === "capture-sample") return captureSample(button.dataset.calibration, button.dataset.ordinal);
   if (action === "toggle-sample") { try { await mutation(`sample-${button.dataset.ordinal}`, `/api/v1/calibrations/${button.dataset.calibration}/samples/${button.dataset.ordinal}`, { included: button.dataset.included === "1" }, "PATCH"); await loadCalibrations(); } catch (error) { showError(error); } return; }
   if (action === "activate-calibration") { const accepted = await confirmAction("Activate this reviewed factor? Historical pours will keep their original calibration.", "Activate calibration"); if (accepted) { try { await mutation("activate", `/api/v1/calibrations/${button.dataset.calibration}/activate`); showToast("Calibration activated"); await loadCalibrations(); } catch (error) { showError(error); } } return; }
@@ -1941,40 +2011,49 @@ document.addEventListener("change", async (event) => {
   } catch (error) { showError(error); }
 });
 
-const keypadEntry = { value: "", form: null };
+const keypadEntry = { value: "", formId: null };
 const keypadDialog = document.querySelector("#keypad-dialog");
+main.addEventListener("toggle", (event) => {
+  const id = event.target?.dataset?.pourDetails;
+  if (!id) return;
+  state.openPourDetails ||= new Set();
+  if (event.target.open) state.openPourDetails.add(id);
+  else state.openPourDetails.delete(id);
+}, true);
 function keypadDots() {
   const el = document.querySelector("#keypad-dots");
   if (!el) return;
-  el.textContent = keypadEntry.value ? "\u25cf".repeat(keypadEntry.value.length) : "Enter 6\u201320 digits";
+  el.textContent = keypadEntry.value ? "\u25cf".repeat(keypadEntry.value.length) : "Enter 4\u201320 digits";
   el.classList.toggle("empty", !keypadEntry.value);
 }
 function openKeypad(form) {
+  if (keypadDialog.open) return;
   keypadEntry.value = "";
-  keypadEntry.form = form;
+  keypadEntry.formId = form?.id || null;
   keypadDots();
-  if (!keypadDialog.open) keypadDialog.showModal();
+  keypadDialog.showModal();
 }
 function keypadPress(key) {
-  if (key === "cancel") { keypadEntry.value = ""; keypadEntry.form = null; keypadDialog.close(); return; }
+  if (key === "cancel") { keypadEntry.value = ""; keypadEntry.formId = null; keypadDialog.close(); return; }
   if (key === "clear") { keypadEntry.value = ""; keypadDots(); return; }
   if (key === "back") { keypadEntry.value = keypadEntry.value.slice(0, -1); keypadDots(); return; }
   if (key === "ok") {
     if (keypadEntry.value.length < 4 || keypadEntry.value.length > 20) {
       const el = document.querySelector("#keypad-dots");
-      el.textContent = "PIN must be 6\u201320 digits";
+      el.textContent = "PIN must be 4\u201320 digits";
       el.classList.add("empty");
       return;
     }
-    const form = keypadEntry.form;
+    const formId = keypadEntry.formId;
     const pin = keypadEntry.value;
     keypadEntry.value = "";
-    keypadEntry.form = null;
+    keypadEntry.formId = null;
     keypadDialog.close();
-    if (form?.isConnected) {
+    const form = formId ? document.getElementById(formId) : null;
+    if (form) {
       const hidden = form.querySelector("input[name=pin]");
       if (hidden) { hidden.value = pin; form.requestSubmit(); }
-    } else if (!form) {
+    } else {
       void submitKeypadLogin(pin);
     }
     return;
@@ -1990,7 +2069,7 @@ keypadDialog.addEventListener("keydown", (event) => {
   else if (event.key === "Backspace") { event.preventDefault(); keypadPress("back"); }
   else if (event.key === "Enter") { event.preventDefault(); keypadPress("ok"); }
 });
-keypadDialog.addEventListener("cancel", () => { keypadEntry.value = ""; keypadEntry.form = null; });
+keypadDialog.addEventListener("cancel", () => { keypadEntry.value = ""; keypadEntry.formId = null; });
 async function submitKeypadLogin(pin) {
   if (state.pendingRelock) { try { await state.pendingRelock; } catch { /* relock settled */ } }
   try {
@@ -2016,9 +2095,19 @@ function relockAdminOnLeave() {
     .catch(() => {})
     .finally(() => { state.pendingRelock = null; });
 }
+const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants"]);
+state.currentRoute = route();
 window.addEventListener("hashchange", () => {
+  const previousRoute = state.currentRoute;
+  state.currentRoute = route();
   state.completionPaused = false;
-  relockAdminOnLeave();
+  if (state.currentRoute !== "/complete") {
+    window.clearTimeout(state.completionTimer);
+    state.completionTimer = null;
+  }
+  if (ADMIN_ROUTES.has(previousRoute) && !ADMIN_ROUTES.has(state.currentRoute)) {
+    relockAdminOnLeave();
+  }
   render();
   updateChrome();
   if (route() === "/history") void loadHistory();

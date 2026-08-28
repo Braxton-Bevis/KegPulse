@@ -44,14 +44,68 @@ WHERE quality = 'estimated_recovered'
   AND fault = 'device_recovery_counter'
   AND raw_pulses > 1000000;
 
+-- Keep the stored counter watermarks: future legitimate (smaller) counters then
+-- fail the monotonicity check and are quarantined instead of re-materializing
+-- the corrupt reading against a zeroed baseline. Only the pour pointer is
+-- cleared because its row is removed below.
 UPDATE device_recovery_checkpoints
-SET recovery_pulses = '0',
-    accepted_pulses = '0',
-    device_uptime_ms = 0,
-    last_pour_id = NULL
+SET last_pour_id = NULL
 WHERE last_pour_id IN (
     SELECT id
     FROM pour_events
+    WHERE quality = 'estimated_recovered'
+      AND fault = 'device_recovery_counter'
+      AND raw_pulses > 1000000
+);
+
+UPDATE participants
+SET balance_cents = balance_cents + (
+    SELECT COALESCE(SUM(pc.amount_cents), 0)
+    FROM pour_charges pc
+    JOIN pour_events pe ON pe.id = pc.pour_id
+    WHERE pc.participant_id = participants.id
+      AND pe.quality = 'estimated_recovered'
+      AND pe.fault = 'device_recovery_counter'
+      AND pe.raw_pulses > 1000000
+)
+WHERE id IN (
+    SELECT pc.participant_id
+    FROM pour_charges pc
+    JOIN pour_events pe ON pe.id = pc.pour_id
+    WHERE pe.quality = 'estimated_recovered'
+      AND pe.fault = 'device_recovery_counter'
+      AND pe.raw_pulses > 1000000
+);
+
+UPDATE account_ledger
+SET pour_id = NULL
+WHERE pour_id IN (
+    SELECT id FROM pour_events
+    WHERE quality = 'estimated_recovered'
+      AND fault = 'device_recovery_counter'
+      AND raw_pulses > 1000000
+);
+
+DELETE FROM pour_charges
+WHERE pour_id IN (
+    SELECT id FROM pour_events
+    WHERE quality = 'estimated_recovered'
+      AND fault = 'device_recovery_counter'
+      AND raw_pulses > 1000000
+);
+
+DELETE FROM attribution_audit
+WHERE pour_id IN (
+    SELECT id FROM pour_events
+    WHERE quality = 'estimated_recovered'
+      AND fault = 'device_recovery_counter'
+      AND raw_pulses > 1000000
+);
+
+UPDATE device_results
+SET pour_id = NULL
+WHERE pour_id IN (
+    SELECT id FROM pour_events
     WHERE quality = 'estimated_recovered'
       AND fault = 'device_recovery_counter'
       AND raw_pulses > 1000000

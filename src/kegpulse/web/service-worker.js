@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v13-quick-calibration";
+const CACHE_NAME = "kegpulse-shell-v16-audit-fixes";
 const SHELL = [
   "/",
   "/static/styles.css",

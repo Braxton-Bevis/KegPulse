@@ -175,7 +175,7 @@ def create_app(
         BodyLimitMiddleware,
         maximum_bytes=65_536,
         overrides=(
-            (r"/api/v1/sessions/[0-9a-f-]{36}/videos", 33_554_432),
+            (r"/api/v1/sessions/[0-9a-fA-F-]{32,36}/videos", 33_554_432),
             (r"/api/v1/evidence/videos", 33_554_432),
         ),
     )
@@ -441,7 +441,7 @@ def create_app(
         response_model=CalibrationResponse,
     )
     async def activate_calibration(calibration_id: str, request: Request) -> dict[str, Any]:
-        operational(request)
+        admin(request)
         result = repository.activate_calibration(calibration_id)
         await coordinator.publish()
         return result
@@ -521,7 +521,7 @@ def create_app(
     async def activate_provisional_calibration(
         calibration_id: str, request: Request
     ) -> dict[str, Any]:
-        operational(request)
+        admin(request)
         result = repository.activate_provisional_calibration(calibration_id)
         await coordinator.publish()
         return result
@@ -627,8 +627,10 @@ def create_app(
             canonical_session = str(uuid.UUID(session_id))
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="pour session not found") from exc
+        if repository.get_provisional(canonical_session) is None:
+            raise HTTPException(status_code=404, detail="pour session not found")
         body = await request.body()
-        return _store_pour_video(body, f"pour_{canonical_session[:8]}")
+        return await asyncio.to_thread(_store_pour_video, body, f"pour_{canonical_session[:8]}")
 
     def _store_pour_video(body: bytes, label: str) -> dict[str, Any]:
         if not 4 <= len(body) <= 33_554_432 or not body.startswith(b"\x1a\x45\xdf\xa3"):
@@ -647,8 +649,13 @@ def create_app(
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
+        stale_temp = (*paths.videos.glob("pour_*.tmp"), *paths.videos.glob("unattributed_*.tmp"))
+        for leftover in stale_temp:
+            leftover.unlink(missing_ok=True)
         kept = sorted(
-            paths.videos.glob("*.webm"), key=lambda item: item.stat().st_mtime, reverse=True
+            (*paths.videos.glob("pour_*.webm"), *paths.videos.glob("unattributed_*.webm")),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
         )
         removed = 0
         for stale in kept[5:]:
@@ -656,7 +663,6 @@ def create_app(
             removed += 1
         return {
             "file": video_name,
-            "directory": str(paths.videos),
             "size_bytes": len(body),
             "pruned": removed,
         }
@@ -669,7 +675,7 @@ def create_app(
         if not request.headers.get("content-type", "").lower().startswith("video/webm"):
             raise HTTPException(status_code=415, detail="pour videos must be WebM")
         body = await request.body()
-        return _store_pour_video(body, "unattributed")
+        return await asyncio.to_thread(_store_pour_video, body, "unattributed")
 
     @app.post("/api/v1/evidence/photos", status_code=201, response_model=PourPhotoResponse)
     async def upload_unattributed_photo(request: Request) -> dict[str, Any]:
@@ -699,13 +705,16 @@ def create_app(
             os.replace(temporary, final_path)
             if os.name != "nt":
                 final_path.chmod(0o600)
-            return repository.add_pour_photo(
+            stored = repository.add_pour_photo(
                 None, relative, len(body), hashlib.sha256(body).hexdigest()
             )
         except Exception:
             temporary.unlink(missing_ok=True)
             final_path.unlink(missing_ok=True)
             raise
+        for pruned_relative in repository.prune_unattributed_photos(keep=48):
+            (paths.photos / pruned_relative).unlink(missing_ok=True)
+        return stored
 
     def _canonical_participant(participant_id: str) -> str:
         try:
@@ -731,7 +740,7 @@ def create_app(
     def _write_avatar(participant_id: str, body: bytes) -> None:
         final_path = _avatar_path(participant_id)
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = final_path.with_suffix(".tmp")
+        temporary = final_path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
         try:
             with temporary.open("wb") as handle:
                 handle.write(body)
@@ -754,11 +763,17 @@ def create_app(
     ) -> dict[str, Any]:
         operational(request)
         canonical = _canonical_participant(participant_id)
+        session = repository.active_provisional()
+        if session is None or session.get("participant_id") != canonical:
+            raise HTTPException(
+                status_code=409,
+                detail="automatic avatars are captured only for the participant pouring now",
+            )
         body = await _validated_avatar_body(request)
+        _write_avatar(canonical, body)
         marked = repository.mark_participant_avatar(canonical, only_if_missing=True)
         if marked is None:
             raise HTTPException(status_code=409, detail="participant already has an avatar")
-        _write_avatar(canonical, body)
         await coordinator.publish()
         return marked
 
@@ -770,9 +785,9 @@ def create_app(
         admin(request)
         canonical = _canonical_participant(participant_id)
         body = await _validated_avatar_body(request)
+        _write_avatar(canonical, body)
         marked = repository.mark_participant_avatar(canonical)
         assert marked is not None
-        _write_avatar(canonical, body)
         await coordinator.publish()
         return marked
 
@@ -859,7 +874,7 @@ def create_app(
 
     @app.get("/api/v1/backup/{filename}")
     async def download_backup(filename: str, request: Request) -> FileResponse:
-        access(request)
+        admin_access(request)
         if not re.fullmatch(r"kegpulse-[0-9TZ]+\.db", filename):
             raise HTTPException(status_code=404, detail="backup not found")
         path = paths.backups / filename

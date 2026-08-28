@@ -239,7 +239,7 @@ class DeviceManager:
                 )
                 delay = 0.25
                 self._connected_loop()
-            except (TransportError, TimeoutError, OSError, ValueError) as exc:
+            except (TransportError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
                 LOGGER.warning(
                     "device connection unavailable: %s: %s",
                     type(exc).__name__,
@@ -307,15 +307,15 @@ class DeviceManager:
                 self._resynchronize_after_overflow()
                 next_resynchronization = now + 0.25
             if now >= next_status:
-                status = self._roundtrip("STATUS", {}, 2)
+                status = self._poll_with_retry("STATUS", {})
                 self._record_status(status)
                 next_status = now + self._status_interval
             if now >= next_counters:
-                counters = self._roundtrip("COUNTERS", {}, 2)
+                counters = self._poll_with_retry("COUNTERS", {})
                 self._record_counters(counters)
                 next_counters = now + self._counter_interval
             if now >= next_results:
-                self._roundtrip("RESULTS", {}, 2, terminal_operation="RESULTS_END")
+                self._poll_with_retry("RESULTS", {}, terminal_operation="RESULTS_END")
                 next_results = now + self._result_interval
             for frame in self._read_available(0.01):
                 if frame.operation == "RESULT":
@@ -427,6 +427,21 @@ class DeviceManager:
             # explicitly captured unknown context rather than a later guess.
             LOGGER.warning("measurement context could not be captured: %s", type(exc).__name__)
             return None, None
+
+    def _poll_with_retry(
+        self,
+        operation: str,
+        fields: dict[str, object],
+        *,
+        terminal_operation: str | None = None,
+    ) -> Frame:
+        """One transient failure on a periodic poll retries in place; a second escalates."""
+        try:
+            return self._roundtrip(operation, fields, 2, terminal_operation=terminal_operation)
+        except (TimeoutError, RuntimeError):
+            if self._stop.is_set():
+                raise
+            return self._roundtrip(operation, fields, 2, terminal_operation=terminal_operation)
 
     def _roundtrip(
         self,

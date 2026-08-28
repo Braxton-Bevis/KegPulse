@@ -134,7 +134,10 @@ class FrameParser:
             self._buffer.append(byte)
             if len(self._buffer) > self.max_bytes:
                 self._buffer.clear()
-                self._discarding = True
+                if byte == 0x0A:
+                    errors.append(FrameError(FrameErrorCode.TOO_LONG, "oversized frame discarded"))
+                else:
+                    self._discarding = True
                 continue
             if byte == 0x0A:
                 candidate = bytes(self._buffer)

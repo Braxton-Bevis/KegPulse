@@ -689,6 +689,11 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
   .flow-dock { position: sticky; top: .5rem; min-height: 130px; }
 }
 
+/* Quick calibration hero */
+.quick-cal { border-color: var(--accent); }
+.quick-cal .capture-cta { font-size: 1.15rem; padding: .9rem 1.5rem; }
+.section-heading { margin: 1.2rem 0 .4rem; }
+
 /* PIN keypad */
 .pin-display {
   width: 100%;

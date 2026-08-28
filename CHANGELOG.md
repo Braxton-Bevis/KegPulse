@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Hardened the whole stack after a four-agent audit: restored the administrator
+  PIN on calibration/verification activation and encrypted-DB backup download,
+  bound automatic avatars to the participant currently pouring, and made the
+  request-size middleware actually return 413/408 instead of a 500.
+- Fixed a migration that could permanently fail to start once a corrupt recovery
+  pour had been reassigned: its ledger, charges, audit rows, and device-result
+  pointer are now cleared and the charge refunded before the pour is removed,
+  and poisoned recovery checkpoints keep their watermark so they fail closed.
+- Bounded the calibration factor to a plausible range so one mistyped sample can
+  no longer mis-meter volume and money; reported variation as n/a below two
+  samples and stopped stale outlier flags from lingering.
+- Fixed the PIN keypad dropping input when its form re-rendered, scoped the admin
+  relock to actually leaving admin tabs, armed the completion auto-return once so
+  it fires on hardware, and stopped pour-video recorders from leaking.
+- Firmware: enabled the 150 us noise gate for the open-collector sensor, moved
+  the recovery counter and fault pointer to the low end of memory so a stack
+  overrun hits scratch state first, and sized number buffers to their contract.
+- Serial: a device-reported command error no longer kills the reader thread, and
+  a single dropped periodic poll retries once before forcing a DTR reset.
 - Captured photo and video evidence for unattributed flow (nobody selected): photos join the
   management evidence grid labeled Unattributed, and videos share the five-slot on-device pool.
 - Relaxed the administrator PIN to 4-20 digits.

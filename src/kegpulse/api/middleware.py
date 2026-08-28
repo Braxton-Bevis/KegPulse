@@ -96,7 +96,19 @@ class BodyLimitMiddleware:
                 return
             await send(message)
 
-        await self.app(scope, limited_receive, guarded_send)
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except Exception:
+            # Reading a cut-off body raises inside the app (ClientDisconnect);
+            # deliver the intended 413/408 instead of surfacing a 500.
+            if not (exceeded or timed_out) or sent:
+                raise
+            sent = True
+            detail = (
+                "request body exceeds the allowed size" if exceeded else "request body timed out"
+            )
+            status = 413 if exceeded else 408
+            await JSONResponse({"detail": detail}, status_code=status)(scope, receive, send)
 
 
 class RequestPolicyMiddleware:

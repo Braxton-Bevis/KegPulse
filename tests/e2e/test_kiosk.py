@@ -616,7 +616,7 @@ def test_ten_capture_calibration_outlier_activation_and_verification(
     wait_connected(page, live_app)
     page.goto(f"{live_app.url}/#/calibration")
     page.get_by_label("Liquid").fill("water")
-    page.get_by_label("Density (g/mL)").first.fill("1.000")
+    page.get_by_label("Density (g/mL)").fill("1.000")
     page.get_by_role("button", name="Start calibration run").click()
     expect(page.get_by_role("button", name="Capture sample 1")).to_be_visible(timeout=5000)
 
@@ -815,6 +815,9 @@ def test_pin_protection_and_service_worker_never_cache_api(page: Page, live_app:
         timeout=5000
     )
 
+    # Moving between two admin tabs keeps the session; leaving to a non-admin
+    # tab (home) relocks, so returning to an admin tab requires the PIN again.
+    page.goto(f"{live_app.url}/#/")
     page.goto(f"{live_app.url}/#/participants")
     expect(page.get_by_label("Unlock with PIN")).to_be_visible(timeout=5000)
     page.get_by_label("Unlock with PIN").click()

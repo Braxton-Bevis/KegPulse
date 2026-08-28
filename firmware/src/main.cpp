@@ -298,7 +298,7 @@ __attribute__((noinline)) void send_status(const char* request_id,
   // (active 32-byte SID plus maximum-width counters) stays below 256 bytes.
   kegpulse::Field fields[11]{};
   char boot[17], sequence[11], pulses[21], lifetime[21], uptime[11], next[11],
-      retained[4], arm_left[11];
+      retained[11], arm_left[11];
   hex64_to_ascii(g_boot_counter, boot);
   u32_to_ascii(status.sequence, sequence);
   u64_to_ascii(status.session_pulses, pulses);
@@ -391,7 +391,7 @@ __attribute__((noinline)) void handle_request(
       }
     }
     kegpulse::Field field{};
-    char count[4];
+    char count[11];
     u32_to_ascii(g_machine.result_count(), count);
     set_field(&field, "count", count);
     send_fields('R', frame.request_id, "RESULTS_END", &field, 1);
