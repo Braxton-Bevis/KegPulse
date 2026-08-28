@@ -9,7 +9,7 @@ from importlib.resources import files
 from pathlib import Path
 
 APPLICATION_ID = 0x4B50554C
-CURRENT_SCHEMA = 5
+CURRENT_SCHEMA = 6
 REQUIRED_TABLES = {
     "participants",
     "kegs",

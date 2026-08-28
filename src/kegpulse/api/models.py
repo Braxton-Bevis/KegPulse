@@ -106,7 +106,7 @@ class SerialPreferenceRequest(ApiModel):
 
 
 class PinRequest(ApiModel):
-    pin: str = Field(min_length=6, max_length=20, pattern=r"^[0-9]+$")
+    pin: str = Field(min_length=4, max_length=20, pattern=r"^[0-9]+$")
 
 
 class ManagementSettingsUpdate(ApiModel):
@@ -207,7 +207,7 @@ class PourVideoResponse(ResponseModel):
 
 class PourPhotoResponse(ResponseModel):
     id: str
-    session_id: str
+    session_id: str | None = None
     captured_at: str
     size_bytes: int
     sha256: str | None = None

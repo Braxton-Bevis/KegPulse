@@ -174,7 +174,10 @@ def create_app(
     app.add_middleware(
         BodyLimitMiddleware,
         maximum_bytes=65_536,
-        overrides=((r"/api/v1/sessions/[0-9a-f-]{36}/videos", 33_554_432),),
+        overrides=(
+            (r"/api/v1/sessions/[0-9a-f-]{36}/videos", 33_554_432),
+            (r"/api/v1/evidence/videos", 33_554_432),
+        ),
     )
 
     def access(request: Request) -> None:
@@ -625,10 +628,13 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="pour session not found") from exc
         body = await request.body()
+        return _store_pour_video(body, f"pour_{canonical_session[:8]}")
+
+    def _store_pour_video(body: bytes, label: str) -> dict[str, Any]:
         if not 4 <= len(body) <= 33_554_432 or not body.startswith(b"\x1a\x45\xdf\xa3"):
             raise HTTPException(status_code=422, detail="invalid or oversized WebM video")
         stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        video_name = f"pour_{stamp}_{canonical_session[:8]}.webm"
+        video_name = f"{label}_{stamp}_{uuid.uuid4().hex[:6]}.webm"
         paths.videos.mkdir(parents=True, exist_ok=True)
         final_path = paths.videos / video_name
         temporary = final_path.with_suffix(".tmp")
@@ -642,7 +648,7 @@ def create_app(
             temporary.unlink(missing_ok=True)
             raise
         kept = sorted(
-            paths.videos.glob("pour_*.webm"), key=lambda item: item.stat().st_mtime, reverse=True
+            paths.videos.glob("*.webm"), key=lambda item: item.stat().st_mtime, reverse=True
         )
         removed = 0
         for stale in kept[5:]:
@@ -654,6 +660,52 @@ def create_app(
             "size_bytes": len(body),
             "pruned": removed,
         }
+
+    @app.post("/api/v1/evidence/videos", status_code=201, response_model=PourVideoResponse)
+    async def upload_unattributed_video(request: Request) -> dict[str, Any]:
+        operational(request)
+        if not repository.get_setting("webcam_enabled", False):
+            raise HTTPException(status_code=409, detail="pour camera is disabled")
+        if not request.headers.get("content-type", "").lower().startswith("video/webm"):
+            raise HTTPException(status_code=415, detail="pour videos must be WebM")
+        body = await request.body()
+        return _store_pour_video(body, "unattributed")
+
+    @app.post("/api/v1/evidence/photos", status_code=201, response_model=PourPhotoResponse)
+    async def upload_unattributed_photo(request: Request) -> dict[str, Any]:
+        operational(request)
+        if not repository.get_setting("webcam_enabled", False):
+            raise HTTPException(status_code=409, detail="pour camera is disabled")
+        if not request.headers.get("content-type", "").lower().startswith("image/jpeg"):
+            raise HTTPException(status_code=415, detail="pour photos must be JPEG images")
+        body = await request.body()
+        if (
+            not 4 <= len(body) <= 61_440
+            or not body.startswith(b"\xff\xd8")
+            or not body.endswith(b"\xff\xd9")
+        ):
+            raise HTTPException(status_code=422, detail="invalid or oversized JPEG photo")
+        photo_name = f"{uuid.uuid4()}.jpg"
+        directory = paths.photos / "unattributed"
+        directory.mkdir(parents=True, exist_ok=True)
+        relative = f"unattributed/{photo_name}"
+        final_path = directory / photo_name
+        temporary = final_path.with_suffix(".tmp")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, final_path)
+            if os.name != "nt":
+                final_path.chmod(0o600)
+            return repository.add_pour_photo(
+                None, relative, len(body), hashlib.sha256(body).hexdigest()
+            )
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            raise
 
     def _canonical_participant(participant_id: str) -> str:
         try:

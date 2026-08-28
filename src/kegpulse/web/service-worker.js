@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v9-keypad-avatars-videos";
+const CACHE_NAME = "kegpulse-shell-v10-unattributed-evidence";
 const SHELL = [
   "/",
   "/static/styles.css",

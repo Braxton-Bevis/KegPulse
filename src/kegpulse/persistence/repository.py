@@ -1689,17 +1689,21 @@ class Repository:
         return dict(row)
 
     def add_pour_photo(
-        self, session_id: str, relative_path: str, size_bytes: int, sha256: str
+        self, session_id: str | None, relative_path: str, size_bytes: int, sha256: str
     ) -> dict[str, Any]:
-        canonical = _canonical_session(session_id)
+        canonical = _canonical_session(session_id) if session_id is not None else None
         with self.db.transaction() as connection:
-            session = connection.execute(
-                "SELECT * FROM provisional_sessions WHERE session_id=?", (canonical,)
-            ).fetchone()
-            if session is None:
-                raise NotFoundError("pour session not found")
-            if session["purpose"] != "pour" or session["status"] not in {"pouring", "settling"}:
-                raise ConflictError("photos are only accepted while a pour is active")
+            if canonical is not None:
+                session = connection.execute(
+                    "SELECT * FROM provisional_sessions WHERE session_id=?", (canonical,)
+                ).fetchone()
+                if session is None:
+                    raise NotFoundError("pour session not found")
+                if session["purpose"] != "pour" or session["status"] not in {
+                    "pouring",
+                    "settling",
+                }:
+                    raise ConflictError("photos are only accepted while a pour is active")
             photo_id, now = _id(), utc_now()
             connection.execute(
                 "INSERT INTO pour_photos(id, session_id, captured_at, relative_path, size_bytes, "

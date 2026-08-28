@@ -54,8 +54,8 @@ class SecurityManager:
         return hashlib.scrypt(pin.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=SCRYPT_LENGTH)
 
     def set_pin(self, pin: str) -> None:
-        if not pin.isascii() or not pin.isdigit() or not 6 <= len(pin) <= 20:
-            raise ValueError("admin PIN must contain 6 to 20 ASCII digits")
+        if not pin.isascii() or not pin.isdigit() or not 4 <= len(pin) <= 20:
+            raise ValueError("admin PIN must contain 4 to 20 ASCII digits")
         salt = secrets.token_bytes(16)
         digest = self._derive(pin, salt)
         verifier = {

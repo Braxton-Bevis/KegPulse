@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Captured photo and video evidence for unattributed flow (nobody selected): photos join the
+  management evidence grid labeled Unattributed, and videos share the five-slot on-device pool.
+- Relaxed the administrator PIN to 4-20 digits.
 - Replaced browser-savable PIN fields with an on-screen keypad dialog; admin unlock now expires
   when leaving a tab, and the Settings and Participants tabs require the PIN outright.
 - Showed each person's account balance beside their name on the home screen and added a

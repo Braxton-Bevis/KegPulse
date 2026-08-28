@@ -154,3 +154,56 @@ def test_avatar_editing_requires_admin_when_pin_is_set(
         f"/api/v1/participants/{person['id']}/avatar", headers=locked, content=TINY_JPEG
     )
     assert auto.status_code == 201
+
+
+def test_unattributed_evidence_photo_and_video(
+    media_client: tuple[TestClient, Path],
+) -> None:
+    client, video_dir = media_client
+    client.app.state.repository.set_setting("webcam_enabled", True)
+    headers = csrf(client)
+
+    photo = client.post(
+        "/api/v1/evidence/photos",
+        headers=headers | {"Content-Type": "image/jpeg"},
+        content=TINY_JPEG,
+    )
+    assert photo.status_code == 201, photo.text
+    assert photo.json()["session_id"] is None
+
+    video = client.post(
+        "/api/v1/evidence/videos",
+        headers=headers | {"Content-Type": "video/webm"},
+        content=TINY_WEBM,
+    )
+    assert video.status_code == 201, video.text
+    assert video.json()["file"].startswith("unattributed_")
+    assert (video_dir / video.json()["file"]).is_file()
+
+
+def test_unattributed_and_session_videos_share_one_five_slot_pool(
+    media_client: tuple[TestClient, Path],
+) -> None:
+    import os
+
+    client, video_dir = media_client
+    client.app.state.repository.set_setting("webcam_enabled", True)
+    headers = csrf(client) | {"Content-Type": "video/webm"}
+
+    stored = []
+    for _ in range(3):
+        response = client.post(
+            f"/api/v1/sessions/{uuid.uuid4()}/videos", headers=headers, content=TINY_WEBM
+        )
+        assert response.status_code == 201
+        stored.append(response.json()["file"])
+    for _ in range(3):
+        response = client.post("/api/v1/evidence/videos", headers=headers, content=TINY_WEBM)
+        assert response.status_code == 201
+        stored.append(response.json()["file"])
+    for index, name in enumerate(stored):
+        target = video_dir / name
+        if target.exists():
+            os.utime(target, (1_000_000 + index, 1_000_000 + index))
+
+    assert len(list(video_dir.glob("*.webm"))) == 5

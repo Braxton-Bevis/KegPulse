@@ -1264,8 +1264,11 @@ async function capturePourPhoto(sessionId) {
   if (!blob || blob.size > 61_440) throw new Error("Camera frame is too large to store safely.");
   state.cameraUploadActive = true;
   try {
-    await api(`/api/v1/sessions/${encodeURIComponent(sessionId)}/photos`, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
-    state.cameraStatus = "Capturing this pour";
+    const target = sessionId
+      ? `/api/v1/sessions/${encodeURIComponent(sessionId)}/photos`
+      : "/api/v1/evidence/photos";
+    await api(target, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+    state.cameraStatus = sessionId ? "Capturing this pour" : "Capturing unattributed flow";
   } finally {
     state.cameraUploadActive = false;
   }
@@ -1274,13 +1277,14 @@ async function capturePourPhoto(sessionId) {
 function syncPourVideo(snapshot) {
   const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
   const session = snapshot?.session;
-  const activePour = session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase);
+  const activePour = (session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase))
+    || (!session && ["pouring", "settling"].includes(phase));
   if (activePour && state.cameraStream && !state.videoRecorder && typeof MediaRecorder !== "undefined") {
     try {
       const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
       const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
       state.videoChunks = [];
-      state.videoSessionId = session.session_id;
+      state.videoSessionId = session ? session.session_id : "unattributed";
       recorder.ondataavailable = (event) => { if (event.data?.size) state.videoChunks.push(event.data); };
       recorder.onstop = () => { void uploadPourVideo(); };
       recorder.start(1000);
@@ -1289,7 +1293,7 @@ function syncPourVideo(snapshot) {
         if (state.videoRecorder === recorder && recorder.state !== "inactive") recorder.stop();
       }, 120_000);
     } catch { /* video recording unsupported on this browser */ }
-  } else if (state.videoRecorder && (!activePour || session?.session_id !== state.videoSessionId)) {
+  } else if (state.videoRecorder && (!activePour || (session ? session.session_id : "unattributed") !== state.videoSessionId)) {
     const recorder = state.videoRecorder;
     if (recorder.state !== "inactive") recorder.stop();
     else state.videoRecorder = null;
@@ -1305,19 +1309,24 @@ async function uploadPourVideo() {
   if (!sessionId || !chunks.length) return;
   const blob = new Blob(chunks, { type: "video/webm" });
   if (blob.size < 4 || blob.size > 33_554_432) return;
+  const target = sessionId === "unattributed"
+    ? "/api/v1/evidence/videos"
+    : "/api/v1/sessions/" + encodeURIComponent(sessionId) + "/videos";
   try {
-    await api("/api/v1/sessions/" + encodeURIComponent(sessionId) + "/videos", { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
+    await api(target, { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
   } catch { /* keep the pour flow quiet if the video cannot be stored */ }
 }
 
 function syncPourCamera(snapshot) {
   const phase = String(snapshot?.device?.status?.state || "").toLowerCase();
   const session = snapshot?.session;
-  if (!state.cameraStream || !state.management?.webcam_enabled || phase !== "pouring" || session?.purpose !== "pour") return;
+  const attributedPour = session?.purpose === "pour";
+  const unattributedFlow = !session;
+  if (!state.cameraStream || !state.management?.webcam_enabled || phase !== "pouring" || (!attributedPour && !unattributedFlow)) return;
   const now = performance.now();
   if (now - state.cameraLastCapture < 1000) return;
   state.cameraLastCapture = now;
-  void capturePourPhoto(session.session_id).catch((error) => {
+  void capturePourPhoto(attributedPour ? session.session_id : null).catch((error) => {
     state.cameraStatus = "Camera capture failed";
     showError(error);
   });
@@ -1935,7 +1944,7 @@ function keypadPress(key) {
   if (key === "clear") { keypadEntry.value = ""; keypadDots(); return; }
   if (key === "back") { keypadEntry.value = keypadEntry.value.slice(0, -1); keypadDots(); return; }
   if (key === "ok") {
-    if (keypadEntry.value.length < 6 || keypadEntry.value.length > 20) {
+    if (keypadEntry.value.length < 4 || keypadEntry.value.length > 20) {
       const el = document.querySelector("#keypad-dots");
       el.textContent = "PIN must be 6\u201320 digits";
       el.classList.add("empty");
