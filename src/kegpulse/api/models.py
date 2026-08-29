@@ -412,6 +412,7 @@ class SnapshotSettingsResponse(ResponseModel):
     serial_port: str | None = None
     lan_mode: bool
     ui_build: str | None = None
+    webcam_enabled: bool = False
 
 
 class UnattributedPourNotice(ResponseModel):

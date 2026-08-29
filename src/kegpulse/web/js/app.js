@@ -39,6 +39,8 @@ const state = {
   videoSessionId: null,
   videoSawFlow: false,
   cameraTesting: false,
+  cameraAutoArmAt: 0,
+  cameraAutoArming: false,
   cancelledSessionId: null,
   boardTab: "keg",
   boardPours: null,
@@ -759,6 +761,7 @@ function updateFlowRate(previous, next) {
 
 function applySnapshot(snapshot) {
   maybeReloadForNewBuild(snapshot);
+  queueMicrotask(() => { void autoArmCamera(); });
   if (state.snapshot && Number(snapshot.revision) < Number(state.snapshot.revision)) return;
   const previousGuideTitle = route() === "/settings" && state.snapshot?.mode === "demo"
     ? demoGuideContext("/settings").guide?.title
@@ -1193,6 +1196,7 @@ function homeView() {
       ${participants.length === 0 ? '<p class="muted">No profiles yet. “Start pour” records an unattributed event; you can assign it later.</p>' : ""}
     </section>
     ${unattributedStrip}
+    <p class="kiosk-refresh-row"><button type="button" class="nav-refresh" data-action="reload-page" aria-label="Refresh the screen">↻ Refresh screen</button></p>
   `, "home-page");
 }
 
@@ -1260,14 +1264,53 @@ function attachCameraPreview() {
   }
 }
 
+function cameraShouldRun() {
+  const fromSnapshot = state.snapshot?.settings?.webcam_enabled;
+  if (fromSnapshot !== undefined && fromSnapshot !== null) return Boolean(fromSnapshot);
+  return Boolean(state.management?.webcam_enabled);
+}
+
+async function armCameraStream() {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not provide camera access.");
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  state.cameraStream?.getTracks().forEach((track) => track.stop());
+  state.cameraStream = stream;
+  state.cameraStatus = "Camera armed for the next pour";
+  document.body.dataset.camera = "armed";
+  stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+    if (state.cameraStream === stream) {
+      state.cameraStream = null;
+      state.cameraStatus = "Camera disconnected";
+      delete document.body.dataset.camera;
+      state.cameraAutoArmAt = 0; // allow a fresh auto-arm attempt
+    }
+  });
+}
+
+// Kiosks (re)open the camera on every load when it is enabled, so a refresh
+// or reboot never silently loses pour evidence. Retries with backoff while the
+// device is missing or permission is pending.
+async function autoArmCamera() {
+  if (state.cameraStream || !cameraShouldRun() || state.cameraAutoArming) return;
+  if (state.security?.lan_mode && state.security?.local_client === false) return; // remote viewers never own the camera
+  const now = performance.now();
+  if (now - (state.cameraAutoArmAt || 0) < 15_000) return;
+  state.cameraAutoArmAt = now;
+  state.cameraAutoArming = true;
+  try {
+    await armCameraStream();
+    render();
+  } catch (error) {
+    state.cameraStatus = `Camera unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    state.cameraAutoArming = false;
+  }
+}
+
 async function enableCamera() {
   if (state.pending.has("camera-enable")) return;
   try {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not provide camera access.");
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
-    state.cameraStream?.getTracks().forEach((track) => track.stop());
-    state.cameraStream = stream;
-    state.cameraStatus = "Camera armed for the next pour";
+    await armCameraStream();
     const enabled = await mutation("camera-enable", "/api/v1/management/settings", { webcam_enabled: true }, "PATCH");
     if (enabled) state.management = enabled;
     render();
@@ -1283,6 +1326,7 @@ async function enableCamera() {
 async function disableCamera() {
   state.cameraStream?.getTracks().forEach((track) => track.stop());
   state.cameraStream = null;
+  delete document.body.dataset.camera;
   state.cameraStatus = "Camera disabled";
   try {
     const disabled = await mutation("camera-disable", "/api/v1/management/settings", { webcam_enabled: false }, "PATCH");
@@ -1365,7 +1409,7 @@ function syncPourVideo(snapshot) {
   if (
     activePour
     && state.cameraStream
-    && state.management?.webcam_enabled !== false
+    && cameraShouldRun()
     && !state.videoRecorder
     && typeof MediaRecorder !== "undefined"
   ) {
@@ -1426,7 +1470,7 @@ function syncPourCamera(snapshot) {
   const session = snapshot?.session;
   const attributedPour = session?.purpose === "pour";
   const unattributedFlow = !session;
-  if (!state.cameraStream || !state.management?.webcam_enabled || phase !== "pouring" || (!attributedPour && !unattributedFlow)) return;
+  if (!state.cameraStream || !cameraShouldRun() || phase !== "pouring" || (!attributedPour && !unattributedFlow)) return;
   const now = performance.now();
   if (now - state.cameraLastCapture < 1000) return;
   state.cameraLastCapture = now;
@@ -1465,7 +1509,7 @@ function pourView() {
     status === "timed_out" ? "No pulse arrived before the deadline, so no pour was recorded." :
     status === "interrupted_uncertain" ? "The device became unavailable before the host could confirm the outcome. No pulses were invented or discarded; review diagnostics and history after reconnecting." :
     "Waiting for the authoritative device state.";
-  const cameraEnabled = Boolean(state.management?.webcam_enabled);
+  const cameraEnabled = cameraShouldRun();
   const cameraReady = cameraEnabled && Boolean(state.cameraStream);
   const cameraCapturing = cameraReady && status === "pouring";
   const cameraLabel = cameraCapturing
@@ -2211,6 +2255,7 @@ main.addEventListener("click", async (event) => {
     render();
     return;
   }
+  if (action === "reload-page") { location.reload(); return; }
   if (action === "camera-test") return recordCameraTestClip();
   if (action === "discard-capture") {
     const accepted = await confirmAction("Discard this captured sample? Nothing is recorded and the calibration stays as it is.", "Discard sample");
@@ -2295,7 +2340,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-29.2";
+const UI_BUILD = "2026-08-29.3";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;

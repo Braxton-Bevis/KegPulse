@@ -966,6 +966,7 @@ class KegPulseCoordinator:
                 "serial_port": self.repository.get_setting("serial_port", self.config.serial_port),
                 "lan_mode": self.config.lan_mode,
                 "ui_build": self.ui_build,
+                "webcam_enabled": bool(self.repository.get_setting("webcam_enabled", False)),
             },
         }
 
