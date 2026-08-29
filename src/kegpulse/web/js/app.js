@@ -40,6 +40,11 @@ const state = {
   videoSawFlow: false,
   cameraTesting: false,
   cancelledSessionId: null,
+  boardTab: "keg",
+  boardPours: null,
+  boardPoursAt: 0,
+  boardPoursForLastPour: null,
+  boardLastInteraction: 0,
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
@@ -1704,6 +1709,109 @@ function calibrationView() {
   `);
 }
 
+const BOARD_TABS = [
+  ["keg", "Keg"],
+  ["pours", "Pours"],
+  ["people", "People"],
+  ["unrecorded", "Unrecorded"],
+];
+const ML_PER_FL_OZ = 29.5735;
+const flOz = (ml) => decimal(ml) / ML_PER_FL_OZ;
+
+function boardPoursStale() {
+  const lastId = state.snapshot?.last_pour?.id || null;
+  return state.boardPours === null
+    || lastId !== state.boardPoursForLastPour
+    || Date.now() - state.boardPoursAt > 60_000;
+}
+
+async function loadBoardPours() {
+  try {
+    const pours = await api("/api/v1/history?limit=500");
+    state.boardPours = Array.isArray(pours) ? pours : [];
+    state.boardPoursAt = Date.now();
+    state.boardPoursForLastPour = state.snapshot?.last_pour?.id || null;
+    if (route() === "/display") render();
+  } catch (error) {
+    state.boardPoursAt = Date.now(); // back off; the next snapshot retries
+    showError(error);
+  }
+}
+
+function boardDailySeries(pours, days = 14) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const buckets = [];
+  for (let offset = days - 1; offset >= 0; offset -= 1) {
+    const day = new Date(today);
+    day.setDate(today.getDate() - offset);
+    buckets.push({ key: day.toDateString(), label: day.toLocaleDateString(undefined, { month: "short", day: "numeric" }), oz: 0, count: 0 });
+  }
+  const byKey = new Map(buckets.map((bucket) => [bucket.key, bucket]));
+  for (const pour of pours) {
+    if (pour.volume_ml === null || pour.volume_ml === undefined) continue;
+    const bucket = byKey.get(new Date(pour.ended_at).toDateString());
+    if (!bucket) continue;
+    bucket.oz += flOz(pour.volume_ml);
+    bucket.count += 1;
+  }
+  return buckets;
+}
+
+function niceCeiling(value) {
+  if (value <= 0) return 10;
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  for (const step of [1, 2, 2.5, 5, 10]) {
+    if (value <= step * magnitude) return step * magnitude;
+  }
+  return 10 * magnitude;
+}
+
+function boardColumnChart(series) {
+  const width = 720; const height = 240;
+  const pad = { top: 22, right: 12, bottom: 30, left: 44 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const max = niceCeiling(Math.max(...series.map((item) => item.oz), 0));
+  const band = plotW / series.length;
+  const barW = Math.min(24, Math.max(6, band - 8));
+  const yFor = (oz) => pad.top + plotH - (oz / max) * plotH;
+  const ticks = [0, max / 2, max];
+  const grid = ticks.map((tick) => `<line class="board-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${yFor(tick).toFixed(1)}" y2="${yFor(tick).toFixed(1)}"></line><text class="board-tick" x="${pad.left - 8}" y="${(yFor(tick) + 4).toFixed(1)}" text-anchor="end">${tick % 1 === 0 ? tick : tick.toFixed(1)}</text>`).join("");
+  const peak = Math.max(...series.map((item) => item.oz), 0);
+  const bars = series.map((item, index) => {
+    const x = pad.left + band * index + (band - barW) / 2;
+    const y = yFor(item.oz);
+    const barH = Math.max(0, pad.top + plotH - y);
+    const r = Math.min(4, barH / 2, barW / 2);
+    const path = barH <= 0
+      ? ""
+      : `M${x} ${(pad.top + plotH).toFixed(1)} V${(y + r).toFixed(1)} Q${x} ${y.toFixed(1)} ${(x + r).toFixed(1)} ${y.toFixed(1)} H${(x + barW - r).toFixed(1)} Q${(x + barW).toFixed(1)} ${y.toFixed(1)} ${(x + barW).toFixed(1)} ${(y + r).toFixed(1)} V${(pad.top + plotH).toFixed(1)} Z`;
+    const label = item.oz > 0 && item.oz === peak ? `<text class="board-value" x="${(x + barW / 2).toFixed(1)}" y="${(y - 6).toFixed(1)}" text-anchor="middle">${item.oz.toFixed(1)}</text>` : "";
+    const detail = `${item.label}: ${item.oz.toFixed(1)} fl oz over ${item.count} ${item.count === 1 ? "pour" : "pours"}`;
+    return `<g class="board-bar-group"><rect class="board-hit" data-board-bar="${escapeHtml(detail)}" tabindex="0" role="img" aria-label="${escapeHtml(detail)}" x="${(pad.left + band * index).toFixed(1)}" y="${pad.top}" width="${band.toFixed(1)}" height="${plotH}"></rect><path class="board-bar" d="${path}"></path>${label}${index % 2 === (series.length % 2 === 0 ? 1 : 0) ? `<text class="board-tick" x="${(x + barW / 2).toFixed(1)}" y="${height - 10}" text-anchor="middle">${escapeHtml(item.label)}</text>` : ""}</g>`;
+  }).join("");
+  return `<svg class="board-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Fluid ounces poured per day, last ${series.length} days"><text class="board-axis-title" x="${pad.left}" y="12">fl oz per day</text>${grid}${bars}<line class="board-axis" x1="${pad.left}" x2="${width - pad.right}" y1="${pad.top + plotH}" y2="${pad.top + plotH}"></line></svg>`;
+}
+
+function boardPeopleRows(pours, participants) {
+  const totals = new Map();
+  for (const pour of pours) {
+    if (!pour.participant_id) continue;
+    const entry = totals.get(pour.participant_id) || { oz: 0, count: 0, last: null };
+    entry.oz += pour.volume_ml === null || pour.volume_ml === undefined ? 0 : flOz(pour.volume_ml);
+    entry.count += 1;
+    if (!entry.last || pour.ended_at > entry.last) entry.last = pour.ended_at;
+    totals.set(pour.participant_id, entry);
+  }
+  return participants.map((person) => {
+    const stats = totals.get(person.id) || { oz: 0, count: 0, last: null };
+    const balance = Number(person.balance_cents || 0);
+    const standing = balance < 0 ? "owes" : balance > 0 ? "credit" : "even";
+    return { ...person, ...stats, balance, standing };
+  }).sort((a, b) => a.balance - b.balance || b.oz - a.oz);
+}
+
 function displayView() {
   const s = state.snapshot;
   const inventory = s.inventory;
@@ -1711,37 +1819,61 @@ function displayView() {
   const percent = inventory ? Math.max(0, Math.min(100, decimal(inventory.percent_remaining))) : 0;
   const phase = String(s.device?.status?.state || "").toLowerCase();
   const pouring = ["pouring", "settling"].includes(phase);
-  const people = [...(s.participants || [])]
-    .map((person) => ({ ...person, spend: Math.max(0, -Number(person.balance_cents || 0)) }))
-    .sort((a, b) => b.spend - a.spend)
-    .slice(0, 8);
-  const roster = people.length
-    ? people.map((person) => `<li class="display-person"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(person)}</span><span class="display-person-name">${escapeHtml(person.display_name)}</span><span class="display-person-stat ${Number(person.balance_cents || 0) < 0 ? "negative" : ""}">${formatMoney(person.balance_cents || 0)}</span></li>`).join("")
-    : '<li class="empty">No profiles yet.</li>';
   const last = s.last_pour;
-  return `<section class="display-board ${pouring ? "flowing" : ""}">
-    <header class="display-header">
-      <h1 tabindex="-1">${escapeHtml(keg?.label || "KegPulse")}</h1>
-      <p class="display-status">${pouring ? "Pouring now" : s.connection?.state === "connected" ? "On tap" : "Tap offline"}</p>
-    </header>
-    <div class="display-grid">
+  const pours = state.boardPours || [];
+  const tab = BOARD_TABS.some(([key]) => key === state.boardTab) ? state.boardTab : "keg";
+  const tabs = BOARD_TABS.map(([key, label]) => `<button class="board-tab ${tab === key ? "active" : ""}" role="tab" aria-selected="${tab === key}" data-action="board-tab" data-tab="${key}">${label}</button>`).join("");
+
+  let panel = "";
+  if (tab === "keg") {
+    panel = `<div class="display-grid">
       <section class="display-keg">
+        <p class="display-kicker">${escapeHtml(keg?.label || "No keg")}</p>
         <p class="display-metric">${percent.toFixed(0)}<span class="display-unit">%</span></p>
         <progress class="progress display-progress" max="100" value="${percent}" aria-label="Keg percent remaining">${percent}%</progress>
-        <p class="display-sub">${inventory ? `${formatVolume(inventory.remaining_ml)} left \u00b7 \u2248${beersLeft(inventory.remaining_ml)} beers` : "No keg installed"}</p>
+        <p class="display-sub">${inventory ? `${formatVolume(inventory.remaining_ml)} left \u00b7 \u2248${beersLeft(inventory.remaining_ml)} beers \u00b7 ${formatVolume(inventory.poured_ml)} poured` : "No keg installed"}</p>
       </section>
       <section class="display-live">
         <p class="display-kicker">${pouring ? "Live pour" : "Last pour"}</p>
         <p class="display-live-amount">${pouring && s.live_volume_ml !== null && s.live_volume_ml !== undefined
           ? escapeHtml(pourMeasurementText(s.live_volume_ml, s.active_calibration?.default_density_g_per_ml))
           : last ? escapeHtml(pourMeasurementText(last.volume_ml, last.calibration_density_g_per_ml)) : "\u2014"}</p>
-        <p class="display-sub">${last ? `${escapeHtml(last.participant_name || "Guest")} \u00b7 ${formatTime(last.ended_at)}` : "No pours recorded yet."}</p>
+        <p class="display-sub">${pouring
+          ? `${escapeHtml(s.session?.participant_id ? (s.participants.find((item) => item.id === s.session.participant_id)?.display_name || "Someone") : "Guest")} is pouring`
+          : last ? `${escapeHtml(last.participant_name || "Guest")} \u00b7 ${formatTime(last.ended_at)}` : "No pours recorded yet."}</p>
       </section>
-    </div>
-    <section class="display-roster">
-      <p class="display-kicker">Tab</p>
-      <ul class="display-people">${roster}</ul>
-    </section>
+    </div>`;
+  } else if (tab === "pours") {
+    const series = boardDailySeries(pours);
+    const recent = pours.slice(0, 12);
+    panel = `<section class="display-panel">
+      <p class="display-kicker">Last 14 days</p>
+      ${state.boardPours === null ? '<p class="muted">Loading pours\u2026</p>' : boardColumnChart(series)}
+      <table class="board-table"><caption class="visually-hidden">Recent pours</caption><thead><tr><th>When</th><th>Who</th><th>Amount</th></tr></thead><tbody>${recent.length ? recent.map((pour) => `<tr><td>${formatTime(pour.ended_at)}</td><td>${escapeHtml(pour.participant_name || "Unrecorded")}</td><td class="num">${pour.volume_ml === null || pour.volume_ml === undefined ? `${escapeHtml(pour.raw_pulses)} pulses` : escapeHtml(pourMeasurementText(pour.volume_ml, pour.calibration_density_g_per_ml))}</td></tr>`).join("") : '<tr><td colspan="3">No pours yet.</td></tr>'}</tbody></table>
+    </section>`;
+  } else if (tab === "people") {
+    const rows = boardPeopleRows(pours, s.participants || []);
+    const maxOz = Math.max(...rows.map((row) => row.oz), 1);
+    panel = `<section class="display-panel">
+      <p class="display-kicker">Who is drinking, who is paying</p>
+      <table class="board-table board-people"><caption class="visually-hidden">People, pours, and balances</caption><thead><tr><th>Person</th><th>Poured</th><th>Pours</th><th>Standing</th></tr></thead><tbody>${rows.length ? rows.map((row) => `<tr class="standing-${row.standing}"><td><span class="board-person"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(row)}</span>${escapeHtml(row.display_name)}</span></td><td class="num"><span class="board-inline-bar" aria-hidden="true"><span style="width:${((row.oz / maxOz) * 100).toFixed(1)}%"></span></span>${row.oz.toFixed(1)} fl oz</td><td class="num">${row.count}</td><td class="num board-standing">${row.standing === "owes" ? `Owes ${formatMoney(-row.balance)}` : row.standing === "credit" ? `Credit ${formatMoney(row.balance)}` : "Paid up"}</td></tr>`).join("") : '<tr><td colspan="4">No profiles yet.</td></tr>'}</tbody></table>
+    </section>`;
+  } else {
+    const photoFor = new Map((s.unattributed_pours || []).map((item) => [item.id, item.photo_id]));
+    const unrecorded = pours.filter((pour) => !pour.participant_id).slice(0, 24);
+    panel = `<section class="display-panel">
+      <p class="display-kicker">Pours nobody has claimed</p>
+      ${unrecorded.length ? `<div class="unattributed-row">${unrecorded.map((pour) => `<article class="unattributed-card">${photoFor.get(pour.id) ? `<img class="unattributed-photo" src="/api/v1/evidence/photos/${encodeURIComponent(photoFor.get(pour.id))}" alt="Snapshot from this pour" loading="lazy">` : '<div class="unattributed-photo placeholder" aria-hidden="true">CAM</div>'}<div class="unattributed-copy"><strong>${pour.volume_ml === null || pour.volume_ml === undefined ? `${escapeHtml(pour.raw_pulses)} pulses` : escapeHtml(pourMeasurementText(pour.volume_ml, pour.calibration_density_g_per_ml))}</strong><p class="muted">${formatTime(pour.ended_at)}</p></div></article>`).join("")}</div>` : '<p class="empty">Every pour has a name.</p>'}
+    </section>`;
+  }
+
+  return `<section class="display-board ${pouring ? "flowing" : ""}">
+    <header class="display-header">
+      <h1 tabindex="-1">${escapeHtml(keg?.label || "KegPulse")}</h1>
+      <p class="display-status">${pouring ? "Pouring now" : s.connection?.state === "connected" ? "On tap" : "Tap offline"}</p>
+    </header>
+    <nav class="board-tabs" role="tablist" aria-label="Tracking board">${tabs}</nav>
+    ${panel}
   </section>`;
 }
 
@@ -1837,7 +1969,13 @@ function render() {
         void loadCalibrations().finally(() => state.pending.delete("load-calibrations"));
       }
     }
-    else if (current === "/display") main.innerHTML = displayView();
+    else if (current === "/display") {
+      main.innerHTML = displayView();
+      if (boardPoursStale() && !state.pending.has("board-pours")) {
+        state.pending.add("board-pours");
+        void loadBoardPours().finally(() => state.pending.delete("board-pours"));
+      }
+    }
     else if (current === "/participants") main.innerHTML = participantsView();
     else if (current === "/management") main.innerHTML = managementView();
     else if (current === "/settings") main.innerHTML = settingsView();
@@ -2067,6 +2205,12 @@ main.addEventListener("click", async (event) => {
   }
   if (action === "open-keypad") { openKeypad(button.closest("form")); return; }
   if (action === "arm") return arm(button.dataset.participant);
+  if (action === "board-tab") {
+    state.boardTab = button.dataset.tab;
+    state.boardLastInteraction = Date.now();
+    render();
+    return;
+  }
   if (action === "camera-test") return recordCameraTestClip();
   if (action === "discard-capture") {
     const accepted = await confirmAction("Discard this captured sample? Nothing is recorded and the calibration stays as it is.", "Discard sample");
@@ -2151,7 +2295,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-29.1";
+const UI_BUILD = "2026-08-29.2";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;
@@ -2164,6 +2308,40 @@ function maybeReloadForNewBuild(snapshot) {
   location.reload();
 }
 const keypadDialog = document.querySelector("#keypad-dialog");
+const boardTooltip = document.createElement("div");
+boardTooltip.id = "board-tooltip";
+boardTooltip.hidden = true;
+boardTooltip.setAttribute("role", "status");
+document.body.append(boardTooltip);
+function showBoardTooltip(target, x, y) {
+  const detail = target?.dataset?.boardBar;
+  if (!detail) { boardTooltip.hidden = true; return; }
+  boardTooltip.textContent = detail;
+  boardTooltip.hidden = false;
+  const box = boardTooltip.getBoundingClientRect();
+  boardTooltip.style.left = `${Math.max(8, Math.min(window.innerWidth - box.width - 8, x + 12))}px`;
+  boardTooltip.style.top = `${Math.max(8, y - box.height - 12)}px`;
+}
+main.addEventListener("pointermove", (event) => {
+  const target = event.target?.closest?.("[data-board-bar]");
+  if (target) showBoardTooltip(target, event.clientX, event.clientY);
+  else if (!boardTooltip.hidden && !document.activeElement?.dataset?.boardBar) boardTooltip.hidden = true;
+});
+main.addEventListener("pointerleave", () => { boardTooltip.hidden = true; });
+main.addEventListener("focusin", (event) => {
+  const target = event.target?.closest?.("[data-board-bar]");
+  if (!target) return;
+  const box = target.getBoundingClientRect();
+  showBoardTooltip(target, box.left + box.width / 2, box.top);
+});
+main.addEventListener("focusout", () => { boardTooltip.hidden = true; });
+window.setInterval(() => {
+  if (route() !== "/display" || document.hidden) return;
+  if (Date.now() - state.boardLastInteraction < 60_000) return;
+  const index = BOARD_TABS.findIndex(([key]) => key === state.boardTab);
+  state.boardTab = BOARD_TABS[(index + 1) % BOARD_TABS.length][0];
+  render();
+}, 20_000);
 main.addEventListener("toggle", (event) => {
   const id = event.target?.dataset?.pourDetails;
   if (!id) return;

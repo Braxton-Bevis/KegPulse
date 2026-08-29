@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v23-discard-and-autoreload";
+const CACHE_NAME = "kegpulse-shell-v24-tracking-board";
 const SHELL = [
   "/",
   "/static/styles.css",

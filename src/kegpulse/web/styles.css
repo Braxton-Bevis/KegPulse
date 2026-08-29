@@ -689,6 +689,43 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
   .flow-dock { position: sticky; top: .5rem; min-height: 130px; }
 }
 
+/* Tracking board (LAN wall display) */
+.board-tabs { display: flex; gap: .4rem; flex-wrap: wrap; }
+.board-tab {
+  background: var(--surface); border: 2px solid var(--border); color: var(--text);
+  border-radius: 999px; padding: .5rem 1rem; font-weight: 700; min-height: 44px;
+}
+.board-tab.active { background: var(--button-brand); border-color: var(--brand); }
+.display-panel { background: var(--surface); border: 2px solid var(--border); border-radius: 16px; padding: 1.2rem; }
+.board-chart { width: 100%; height: auto; display: block; margin: .4rem 0 1rem; }
+.board-bar { fill: var(--accent); }
+.board-bar-group:hover .board-bar, .board-hit:focus-visible ~ .board-bar { fill: var(--brand-strong); }
+.board-hit { fill: transparent; outline: none; }
+.board-hit:focus-visible { stroke: var(--focus); stroke-width: 2; }
+.board-grid { stroke: var(--surface-2); stroke-width: 1; }
+.board-axis { stroke: var(--border); stroke-width: 1; }
+.board-tick, .board-axis-title { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.board-value { fill: var(--text); font-size: 12px; font-weight: 700; }
+#board-tooltip {
+  position: fixed; z-index: 60; pointer-events: none;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: .4rem .6rem; font-size: .9rem; font-weight: 700;
+  box-shadow: 0 6px 18px rgba(0,0,0,.4);
+}
+.board-table { width: 100%; border-collapse: collapse; }
+.board-table th, .board-table td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--border); }
+.board-table th { color: var(--muted); font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; }
+.board-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.board-person { display: inline-flex; align-items: center; gap: .6rem; font-weight: 700; }
+.board-inline-bar { display: inline-block; vertical-align: middle; width: 110px; height: 10px; margin-right: .5rem; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
+.board-inline-bar span { display: block; height: 100%; background: var(--accent); border-radius: 0 4px 4px 0; }
+.board-standing { font-weight: 800; }
+tr.standing-owes .board-standing { color: var(--danger); }
+tr.standing-credit .board-standing { color: var(--success); }
+tr.standing-even .board-standing { color: var(--muted); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 720px) { .board-inline-bar { width: 60px; } }
+
 /* Unattributed pour notices on home */
 .unattributed-strip { border-color: #7a5a2a; }
 .unattributed-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .8rem; }
