@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Nightly off-machine backup: a scrubbed database snapshot plus JSON export is pushed
+  to a private GitHub repository by a scheduled task (`docs/BACKUP.md`).
 - Fixed live updates falling back to polling in LAN mode: the WebSocket's
   per-frame admin revalidation predated the display mode and closed every
   kiosk and viewer socket. Strict-LAN remote clients still get per-frame

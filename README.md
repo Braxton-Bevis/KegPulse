@@ -231,4 +231,5 @@ Copyright (c) 2026 Braxton Bevis.
 - [Requirement/test traceability](docs/TEST_MATRIX.md)
 - [Windows](docs/WINDOWS.md), [Linux](docs/LINUX.md), and
   [Raspberry Pi](docs/RASPBERRY_PI.md) deployment
+- [Off-machine backups](docs/BACKUP.md) — nightly scrubbed snapshots to a private GitHub repo
 - [v1 changelog](CHANGELOG.md)
