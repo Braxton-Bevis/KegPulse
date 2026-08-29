@@ -252,3 +252,63 @@ def test_unattributed_and_session_videos_share_one_five_slot_pool(
             os.utime(target, (1_000_000 + index, 1_000_000 + index))
 
     assert len(list(video_dir.glob("*.webm"))) == 5
+
+
+def test_unattributed_pour_notices_carry_a_snapshot(
+    media_client: tuple[TestClient, Path],
+) -> None:
+    """The home screen shows recent nameless pours with their camera snapshot."""
+    client, _ = media_client
+    repo = client.app.state.repository
+    client.app.state.repository.set_setting("webcam_enabled", True)
+    headers = csrf(client)
+
+    # An unattributed evidence photo lands first, then the pour that the
+    # autonomous device flow would commit for the same time window.
+    photo = client.post(
+        "/api/v1/evidence/photos",
+        headers=headers | {"Content-Type": "image/jpeg"},
+        content=TINY_JPEG,
+    ).json()
+
+    with repo.db.transaction() as connection:
+        connection.execute(
+            "INSERT INTO pour_events(id, session_id, participant_id, keg_id, calibration_id, "
+            "device_id, boot_id, event_seq, raw_pulses, volume_ml, attributed, quality, "
+            "started_at, ended_at, device_started_ms, device_ended_ms, fault, created_at) "
+            "VALUES('nameless', 'synthetic-recovered-session', NULL, NULL, NULL, "
+            "'4B454750554C5345', "
+            "'0000000000000001', 7, 900, '160', 0, 'unattributed', "
+            "'2020-01-01T00:00:00.000Z', '2020-01-01T00:00:05.000Z', 1, 2, 'none', "
+            "'2099-01-01T00:00:00.000Z')"
+        )
+
+    notices = repo.recent_unattributed_pours()
+    assert [item["id"] for item in notices] == ["nameless"]
+    assert notices[0]["photo_id"] == photo["id"]
+
+    status = client.get("/api/v1/status")
+    assert status.status_code == 200
+    payload = status.json()["unattributed_pours"]
+    assert payload and payload[0]["id"] == "nameless"
+    assert payload[0]["photo_id"] == photo["id"]
+
+    served = client.get(f"/api/v1/evidence/photos/{photo['id']}")
+    assert served.status_code == 200
+    assert served.content == TINY_JPEG
+
+
+def test_unattributed_snapshots_are_mirrored_to_the_videos_folder(
+    media_client: tuple[TestClient, Path],
+) -> None:
+    client, video_dir = media_client
+    client.app.state.repository.set_setting("webcam_enabled", True)
+    headers = csrf(client) | {"Content-Type": "image/jpeg"}
+
+    response = client.post("/api/v1/evidence/photos", headers=headers, content=TINY_JPEG)
+    assert response.status_code == 201
+
+    mirror = video_dir / "unattributed-snapshots"
+    copies = list(mirror.glob("unattributed_*.jpg"))
+    assert copies, f"no mirrored snapshot in {mirror}"
+    assert copies[0].read_bytes() == TINY_JPEG

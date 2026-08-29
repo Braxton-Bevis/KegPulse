@@ -413,6 +413,16 @@ class SnapshotSettingsResponse(ResponseModel):
     lan_mode: bool
 
 
+class UnattributedPourNotice(ResponseModel):
+    id: str
+    volume_ml: str | None = None
+    raw_pulses: int
+    quality: str
+    ended_at: str
+    calibration_density_g_per_ml: str | None = None
+    photo_id: str | None = None
+
+
 class StatusResponse(ResponseModel):
     schema_version: int
     revision: int
@@ -430,6 +440,7 @@ class StatusResponse(ResponseModel):
     active_calibration: CalibrationResponse | None = None
     last_verification: VerificationResponse | None = None
     last_pour: PourResponse | None = None
+    unattributed_pours: list[UnattributedPourNotice] = []
     onboarding: OnboardingResponse
     settings: SnapshotSettingsResponse
 

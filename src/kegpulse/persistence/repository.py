@@ -1724,6 +1724,51 @@ class Repository:
             ).fetchone()
         return dict(row)
 
+    def recent_unattributed_pours(self, *, limit: int = 4) -> list[dict[str, Any]]:
+        """Newest pours still lacking a person, each with a snapshot when one exists.
+
+        Session-bound photos match directly; autonomous device flow stores its
+        evidence without a session, so those match by the pour's time window.
+        """
+        with self.db.read() as connection:
+            pours = connection.execute(
+                "SELECT pe.id, pe.session_id, pe.volume_ml, pe.raw_pulses, pe.quality, "
+                "pe.started_at, pe.ended_at, pe.created_at, "
+                "c.default_density_g_per_ml AS calibration_density_g_per_ml "
+                "FROM pour_events pe "
+                "LEFT JOIN calibrations c ON c.id = pe.calibration_id "
+                "WHERE pe.participant_id IS NULL "
+                "ORDER BY pe.ended_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            output: list[dict[str, Any]] = []
+            for row in pours:
+                photo = None
+                if row["session_id"]:
+                    photo = connection.execute(
+                        "SELECT id FROM pour_photos WHERE session_id=? "
+                        "ORDER BY captured_at LIMIT 1",
+                        (row["session_id"],),
+                    ).fetchone()
+                if photo is None:
+                    photo = connection.execute(
+                        "SELECT id FROM pour_photos WHERE session_id IS NULL "
+                        "AND captured_at BETWEEN ? AND ? ORDER BY captured_at LIMIT 1",
+                        (row["started_at"], row["created_at"]),
+                    ).fetchone()
+                output.append(
+                    {
+                        "id": row["id"],
+                        "volume_ml": row["volume_ml"],
+                        "raw_pulses": row["raw_pulses"],
+                        "quality": row["quality"],
+                        "ended_at": row["ended_at"],
+                        "calibration_density_g_per_ml": row["calibration_density_g_per_ml"],
+                        "photo_id": photo["id"] if photo else None,
+                    }
+                )
+        return output
+
     def add_pour_photo(
         self, session_id: str | None, relative_path: str, size_bytes: int, sha256: str
     ) -> dict[str, Any]:

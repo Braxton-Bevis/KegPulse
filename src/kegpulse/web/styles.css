@@ -689,6 +689,23 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
   .flow-dock { position: sticky; top: .5rem; min-height: 130px; }
 }
 
+/* Unattributed pour notices on home */
+.unattributed-strip { border-color: #7a5a2a; }
+.unattributed-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .8rem; }
+.unattributed-card {
+  display: flex; align-items: center; gap: .8rem;
+  padding: .6rem; border-radius: 12px; background: #24292c;
+  flex-wrap: wrap;
+}
+.unattributed-photo {
+  width: 72px; height: 72px; object-fit: cover; border-radius: 10px;
+  background: #191d1f; flex-shrink: 0;
+}
+.unattributed-photo.placeholder { display: grid; place-items: center; color: var(--muted-text, #9aa5aa); font-weight: 800; font-size: .8rem; }
+.unattributed-copy { flex: 1; min-width: 90px; }
+.unattributed-copy p { margin: .1rem 0 0; }
+.unattributed-card .reassign-form { flex-basis: 100%; }
+
 /* Remote wall display */
 .display-board { display: flex; flex-direction: column; gap: 1.2rem; }
 .display-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }

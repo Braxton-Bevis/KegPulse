@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import uuid
@@ -76,6 +77,8 @@ from .persistence.export import rows_to_csv_chunks, rows_to_json_chunks
 from .security import SESSION_COOKIE, SecurityManager, allowed_host, allowed_origin
 from .serialio import DeviceManager, PortCandidateProvider, SimulatorTransport, enumerate_ports
 from .serialio.transport import FlowTransport
+
+LOGGER = logging.getLogger("kegpulse.app")
 
 
 def _origin(request: Request) -> str:
@@ -730,6 +733,16 @@ def create_app(
             raise
         for pruned_relative in repository.prune_unattributed_photos(keep=48):
             (paths.photos / pruned_relative).unlink(missing_ok=True)
+        # A permanent, human-browsable copy: unlike the in-app evidence pool,
+        # this mirror is never pruned, so the operator can review or link it
+        # later. Lives beside the pour videos.
+        mirror_dir = paths.videos / "unattributed-snapshots"
+        try:
+            mirror_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            (mirror_dir / f"unattributed_{stamp}_{photo_name[:8]}.jpg").write_bytes(body)
+        except OSError:
+            LOGGER.warning("unattributed snapshot mirror failed", exc_info=True)
         return stored
 
     def _canonical_participant(participant_id: str) -> str:
@@ -831,11 +844,20 @@ def create_app(
     @app.get("/api/v1/management/photos/{photo_id}", include_in_schema=False)
     async def pour_photo(photo_id: str, request: Request) -> FileResponse:
         management_admin(request)
+        return _pour_photo_file(photo_id)
+
+    def _pour_photo_file(photo_id: str) -> FileResponse:
         photo = repository.get_pour_photo(photo_id)
         path = (paths.photos / str(photo["relative_path"])).resolve()
         if paths.photos.resolve() not in path.parents or not path.is_file():
             raise HTTPException(status_code=404, detail="pour photo file not found")
         return FileResponse(path, media_type="image/jpeg")
+
+    @app.get("/api/v1/evidence/photos/{photo_id}", include_in_schema=False)
+    async def evidence_photo(photo_id: str, request: Request) -> FileResponse:
+        """Thumbnails for the home and wall-display unattributed pour notices."""
+        display_access(request)
+        return _pour_photo_file(photo_id)
 
     @app.get(
         "/api/v1/export.{format}",

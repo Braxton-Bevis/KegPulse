@@ -1125,6 +1125,19 @@ function homeView() {
   const liveAmount = s.live_volume_ml !== null && s.live_volume_ml !== undefined
     ? pourMeasurementText(s.live_volume_ml, s.active_calibration?.default_density_g_per_ml)
     : `${activePulses} raw ${activePulses === 1 ? "pulse" : "pulses"}`;
+  const unattributedList = s.unattributed_pours || [];
+  const unattributedStrip = unattributedList.length ? `
+    <section class="card unattributed-strip" aria-labelledby="unattributed-title">
+      <p class="section-kicker">Needs a name</p><h2 id="unattributed-title">Unattributed pours</h2>
+      <div class="unattributed-row">${unattributedList.map((row) => `
+        <article class="unattributed-card">
+          ${row.photo_id
+            ? `<img class="unattributed-photo" src="/api/v1/evidence/photos/${encodeURIComponent(row.photo_id)}" alt="Snapshot from this pour" loading="lazy">`
+            : '<div class="unattributed-photo placeholder" aria-hidden="true">CAM</div>'}
+          <div class="unattributed-copy"><strong>${row.volume_ml !== null && row.volume_ml !== undefined ? escapeHtml(pourMeasurementText(row.volume_ml, row.calibration_density_g_per_ml)) : `${escapeHtml(row.raw_pulses)} pulses`}</strong><p class="muted">${formatTime(row.ended_at)}</p></div>
+          ${state.reassignPourId === row.id ? reassignmentEditor(row) : `<button class="secondary" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button>`}
+        </article>`).join("")}</div>
+    </section>` : "";
   const buttons = participants.map((participant) => `
     <button class="participant-button" data-action="arm" data-participant="${escapeHtml(participant.id)}" aria-label="${escapeHtml(participant.display_name)}" aria-describedby="home-device-detail" ${armDisabled ? "disabled" : ""}>
       <span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(participant)}</span>
@@ -1171,6 +1184,7 @@ function homeView() {
       </div>
       ${participants.length === 0 ? '<p class="muted">No profiles yet. “Start pour” records an unattributed event; you can assign it later.</p>' : ""}
     </section>
+    ${unattributedStrip}
   `, "home-page");
 }
 

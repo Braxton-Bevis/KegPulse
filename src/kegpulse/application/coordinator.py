@@ -942,6 +942,7 @@ class KegPulseCoordinator:
             "active_calibration": calibration,
             "last_verification": verifications[0] if verifications else None,
             "last_pour": pours[0] if pours else None,
+            "unattributed_pours": self.repository.recent_unattributed_pours(),
             "onboarding": {
                 "needs_keg": keg is None,
                 "needs_calibration": calibration is None,
