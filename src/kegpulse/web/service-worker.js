@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v22-unattributed-notices";
+const CACHE_NAME = "kegpulse-shell-v23-discard-and-autoreload";
 const SHELL = [
   "/",
   "/static/styles.css",

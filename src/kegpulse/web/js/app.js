@@ -39,6 +39,7 @@ const state = {
   videoSessionId: null,
   videoSawFlow: false,
   cameraTesting: false,
+  cancelledSessionId: null,
   diagnostics: null,
   reassignPourId: null,
   lastAnnouncedPulses: null,
@@ -685,7 +686,8 @@ function reconcileRoute(previous, next) {
   const session = next?.session;
   const terminal = next?.terminal_notice;
   const deviceState = next?.device?.status?.state;
-  if (session && ["arming", "armed", "pouring", "settling", "finalizing"].includes(session.status)) {
+  if (session && session.session_id !== state.cancelledSessionId
+    && ["arming", "armed", "pouring", "settling", "finalizing"].includes(session.status)) {
     state.dismissedTerminalId = null;
     if (route() === "/" || route() === "/complete") navigate("/pour");
   } else if (
@@ -751,6 +753,7 @@ function updateFlowRate(previous, next) {
 }
 
 function applySnapshot(snapshot) {
+  maybeReloadForNewBuild(snapshot);
   if (state.snapshot && Number(snapshot.revision) < Number(state.snapshot.revision)) return;
   const previousGuideTitle = route() === "/settings" && state.snapshot?.mode === "demo"
     ? demoGuideContext("/settings").guide?.title
@@ -1476,7 +1479,7 @@ function pourView() {
     <p class="countdown" aria-live="polite">${escapeHtml(countdown)}</p>
     <p>${escapeHtml(note)}</p>
     ${cameraMonitor}
-    ${["timed_out", "interrupted_uncertain"].includes(status) ? '<button data-action="dismiss-terminal">Return home</button>' : status === "complete" && purpose !== "pour" ? '<a class="button" href="#/calibration">Enter scale mass</a>' : `
+    ${["timed_out", "interrupted_uncertain"].includes(status) ? '<button data-action="dismiss-terminal">Return home</button>' : status === "complete" && purpose !== "pour" ? '<div class="button-row"><a class="button" href="#/calibration">Enter scale mass</a><button class="secondary" data-action="discard-capture">Discard sample</button></div>' : `
       <button class="${afterFlow ? "danger" : "secondary"}" data-action="cancel" ${state.pending.has("cancel") ? "disabled" : ""}>${cancelLabel}</button>`}
   </div></section>`;
 }
@@ -1638,7 +1641,7 @@ function sampleReview(detail) {
 
 function calibrationCaptureCard(capture, captureDensity) {
   if (capture?.status !== "complete") return "";
-  return `<section class="card quick-cal"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<button>Save measured check</button></form></section>`;
+  return `<section class="card quick-cal"><h2>${capture.purpose === "verification" ? "Enter verification mass" : `Enter mass for sample ${capture.target_ordinal}`}</h2><p>${escapeHtml(capture.captured_raw_pulses)} raw pulses captured. Selected density: <strong>${escapeHtml(captureDensity)} g/mL</strong>.</p><form id="capture-commit-form" data-purpose="${capture.purpose}" data-session="${capture.session_id}" data-calibration="${capture.calibration_id || ""}" class="grid two"><label>Scale mass (g)<input name="mass_g" type="number" inputmode="decimal" min="0.1" max="10000" step="0.01" required></label><label>Density (g/mL)<input name="density_g_per_ml" type="number" inputmode="decimal" min="0.5" max="2" step="0.001" value="${escapeHtml(captureDensity)}" required></label>${capture.purpose === "calibration" ? '<label><input name="included" type="checkbox" checked> Include this sample</label>' : ""}<div class="button-row"><button>Save measured check</button><button type="button" class="secondary" data-action="discard-capture">Discard sample</button></div></form></section>`;
 }
 
 function calibrationRunCard(detail, { hero = false } = {}) {
@@ -1875,8 +1878,12 @@ async function cancelPour() {
     const accepted = await confirmAction("Counted pulses will be retained and saved as an interrupted partial pour. End now?", "End and save partial");
     if (!accepted) return;
   }
+  const cancelling = state.snapshot?.session?.session_id || null;
   try {
     await mutation("cancel", "/api/v1/sessions/cancel");
+    // A stale snapshot can still show this session arming for a moment; make
+    // sure it cannot drag the kiosk back onto the pour screen.
+    state.cancelledSessionId = cancelling;
     // A pending calibration sample must not hijack the screen after a cancel.
     navigate("/");
   } catch (error) { showError(error); }
@@ -2061,6 +2068,16 @@ main.addEventListener("click", async (event) => {
   if (action === "open-keypad") { openKeypad(button.closest("form")); return; }
   if (action === "arm") return arm(button.dataset.participant);
   if (action === "camera-test") return recordCameraTestClip();
+  if (action === "discard-capture") {
+    const accepted = await confirmAction("Discard this captured sample? Nothing is recorded and the calibration stays as it is.", "Discard sample");
+    if (!accepted) return;
+    try {
+      await mutation("discard-capture", "/api/v1/calibrations/capture/discard");
+      showToast("Sample discarded");
+      if (route() === "/pour") navigate("/");
+    } catch (error) { showError(error); }
+    return;
+  }
   if (action === "avatar-remove") {
     const accepted = await confirmAction("Remove this profile photo? A new one is captured automatically the next time they pour.", "Remove photo");
     if (accepted) {
@@ -2134,6 +2151,18 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
+const UI_BUILD = "2026-08-29.1";
+
+function maybeReloadForNewBuild(snapshot) {
+  const served = snapshot?.settings?.ui_build;
+  if (!served || served === UI_BUILD) return;
+  if (snapshot?.session) return; // never interrupt a pour in progress
+  let already = null;
+  try { already = sessionStorage.getItem("kegpulse-reloaded-for"); } catch { /* storage blocked */ }
+  if (already === served) return;
+  try { sessionStorage.setItem("kegpulse-reloaded-for", served); } catch { /* storage blocked */ }
+  location.reload();
+}
 const keypadDialog = document.querySelector("#keypad-dialog");
 main.addEventListener("toggle", (event) => {
   const id = event.target?.dataset?.pourDetails;

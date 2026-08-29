@@ -49,6 +49,8 @@ class KegPulseCoordinator:
         self.repository = repository
         self.manager = manager
         self.config = config
+        # Build id of the shipped web UI; pages reload when it changes.
+        self.ui_build: str | None = None
         self.simulator = simulator
         self._lock = asyncio.Lock()
         self._revision = 0
@@ -963,6 +965,7 @@ class KegPulseCoordinator:
                 "settling_ms": self.config.settling_ms,
                 "serial_port": self.repository.get_setting("serial_port", self.config.serial_port),
                 "lan_mode": self.config.lan_mode,
+                "ui_build": self.ui_build,
             },
         }
 

@@ -411,6 +411,7 @@ class SnapshotSettingsResponse(ResponseModel):
     settling_ms: int
     serial_port: str | None = None
     lan_mode: bool
+    ui_build: str | None = None
 
 
 class UnattributedPourNotice(ResponseModel):

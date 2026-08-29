@@ -374,3 +374,32 @@ def test_websocket_starts_with_full_snapshot(client: TestClient) -> None:
         snapshot = socket.receive_json()
         assert snapshot["schema_version"] == 1
         assert "connection" in snapshot and "participants" in snapshot
+
+
+def test_completed_capture_can_be_discarded_without_a_mass(client: TestClient) -> None:
+    csrf = headers(client)
+    calibration = client.post(
+        "/api/v1/calibrations",
+        headers=csrf,
+        json={"liquid": "water", "density_g_per_ml": "1.000"},
+    ).json()
+    capture = client.post(
+        f"/api/v1/calibrations/{calibration['id']}/capture/arm",
+        headers=csrf,
+        json={"idempotency_key": str(uuid.uuid4()), "ordinal": 1},
+    ).json()
+    client.post("/api/v1/demo/action", headers=csrf, json={"action": "pulse", "count": 400})
+    client.post("/api/v1/demo/action", headers=csrf, json={"action": "finish"})
+    wait_json(
+        lambda: client.get(f"/api/v1/sessions/{capture['session_id']}").json(),
+        lambda value: value["status"] == "complete",  # type: ignore[index]
+    )
+    assert client.get("/api/v1/status").json()["pending_capture"] is not None
+
+    discarded = client.post("/api/v1/calibrations/capture/discard", headers=csrf)
+    assert discarded.status_code == 200, discarded.text
+    assert client.get("/api/v1/status").json()["pending_capture"] is None
+    assert client.get("/api/v1/status").json()["settings"]["ui_build"]
+
+    again = client.post("/api/v1/calibrations/capture/discard", headers=csrf)
+    assert again.status_code == 409

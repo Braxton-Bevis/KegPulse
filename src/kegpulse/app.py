@@ -81,6 +81,16 @@ from .serialio.transport import FlowTransport
 LOGGER = logging.getLogger("kegpulse.app")
 
 
+def _read_ui_build(script: Path) -> str | None:
+    """The UI_BUILD constant baked into app.js; served so stale pages reload."""
+    try:
+        text = script.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'const UI_BUILD = "([^"]{1,64})"', text)
+    return match.group(1) if match else None
+
+
 def _origin(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers['host']}"
 
@@ -141,6 +151,7 @@ def create_app(
     manager = DeviceManager(provider, measurement_context_provider=repository.measurement_context)
     coordinator = KegPulseCoordinator(repository, manager, config, simulator=simulator)
     security = SecurityManager(repository, config)
+    coordinator.ui_build = _read_ui_build(Path(__file__).with_name("web") / "js" / "app.js")
     if config.lan_mode and not security.pin_configured:
         database.close()
         raise RuntimeError("LAN mode requires an administrator PIN configured on loopback first")
@@ -483,6 +494,19 @@ def create_app(
             purpose="verification",
             calibration_id=calibration["id"],
         )
+
+    @app.post("/api/v1/calibrations/capture/discard", response_model=OkResponse)
+    async def discard_pending_capture(request: Request) -> dict[str, Any]:
+        """Drop a completed sample that will never be weighed, so it stops waiting."""
+        operational(request)
+        pending = repository.latest_pending_capture()
+        if pending is None or pending["status"] != "complete":
+            raise HTTPException(
+                status_code=409, detail="no completed sample is waiting for a scale mass"
+            )
+        repository.update_provisional_status(str(pending["session_id"]), "discarded")
+        await coordinator.publish()
+        return {"ok": True}
 
     @app.post("/api/v1/verifications/capture/commit", response_model=VerificationResponse)
     async def commit_verification_capture(
