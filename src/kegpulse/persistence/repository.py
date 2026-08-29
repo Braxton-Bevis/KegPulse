@@ -1738,6 +1738,9 @@ class Repository:
                 "FROM pour_events pe "
                 "LEFT JOIN calibrations c ON c.id = pe.calibration_id "
                 "WHERE pe.participant_id IS NULL "
+                # A splash under ~150 pulses (about an ounce) is drip noise, not
+                # a pour someone needs to claim.
+                "AND pe.raw_pulses >= 150 "
                 "ORDER BY pe.ended_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
