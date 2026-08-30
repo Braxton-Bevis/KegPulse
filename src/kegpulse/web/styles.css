@@ -690,7 +690,7 @@ dialog::backdrop { background: rgb(0 0 0 / 55%); }
 }
 
 /* Kiosk refresh button (browser chrome is hidden in kiosk mode) */
-.nav-refresh { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: .35rem .8rem; font-weight: 700; min-height: 40px; }
+.nav-refresh { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 999px; padding: .5rem 1rem; font-weight: 700; min-height: 44px; min-width: 44px; }
 .nav-refresh:hover, .nav-refresh:focus-visible { color: var(--text); border-color: var(--brand); }
 .kiosk-refresh-row { text-align: center; margin: 1rem 0 0; }
 
