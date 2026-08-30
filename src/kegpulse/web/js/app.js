@@ -2340,7 +2340,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-29.3";
+const UI_BUILD = "2026-08-30.1";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;
@@ -2352,6 +2352,164 @@ function maybeReloadForNewBuild(snapshot) {
   try { sessionStorage.setItem("kegpulse-reloaded-for", served); } catch { /* storage blocked */ }
   location.reload();
 }
+// ---- In-app on-screen keyboard ------------------------------------------
+// Snap-browser accessibility auto-show keyboards are unreliable in kiosk
+// mode, so the app carries its own. Shows for touch-focused editable fields
+// on coarse-pointer devices (or when localStorage kegpulse-osk = "on";
+// "off" disables it entirely).
+const osk = document.querySelector("#osk");
+const oskRows = document.querySelector("#osk-rows");
+let oskTarget = null;
+let oskShift = false;
+let oskSymbols = false;
+
+function oskPreference() {
+  try { return localStorage.getItem("kegpulse-osk"); } catch { return null; }
+}
+
+function oskWanted() {
+  const preference = oskPreference();
+  if (preference === "off") return false;
+  if (preference === "on") return true;
+  return window.matchMedia("(pointer: coarse)").matches;
+}
+
+function oskIsNumeric(element) {
+  if (element.type === "number") return true;
+  const mode = (element.getAttribute("inputmode") || "").toLowerCase();
+  return mode === "decimal" || mode === "numeric";
+}
+
+function oskEditable(element) {
+  if (!element || element.closest("#keypad-dialog") || element.closest("#osk")) return null;
+  if (element.tagName === "TEXTAREA") return element.readOnly ? null : element;
+  if (element.tagName !== "INPUT") return null;
+  const type = (element.type || "text").toLowerCase();
+  if (!["text", "number", "search", "email", "url", "tel", "datetime-local"].includes(type)) return null;
+  return element.readOnly || element.disabled ? null : element;
+}
+
+const OSK_LETTER_ROWS = [
+  ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
+  ["a", "s", "d", "f", "g", "h", "j", "k", "l"],
+  ["z", "x", "c", "v", "b", "n", "m"],
+];
+const OSK_SYMBOL_ROWS = [
+  ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+  ["-", "/", ":", ";", "(", ")", "$", "&", "@"],
+  [".", ",", "?", "!", "'", '"', "#", "%", "+"],
+];
+
+function oskKeyButton(label, action, classes) {
+  const safe = escapeHtml(label);
+  return `<button type="button" data-osk="${escapeHtml(action)}" class="${classes || ""}">${safe}</button>`;
+}
+
+function renderOsk() {
+  if (!oskTarget) return;
+  let rows;
+  if (oskIsNumeric(oskTarget)) {
+    rows = [
+      ["7", "8", "9"].map((k) => oskKeyButton(k, `char:${k}`)).join(""),
+      ["4", "5", "6"].map((k) => oskKeyButton(k, `char:${k}`)).join(""),
+      ["1", "2", "3"].map((k) => oskKeyButton(k, `char:${k}`)).join(""),
+      [oskKeyButton(".", "char:."), oskKeyButton("0", "char:0"), oskKeyButton("\u232b", "backspace")].join(""),
+      [oskKeyButton("Hide", "hide", "osk-muted osk-wide"), oskKeyButton("\u21b5 Done", "enter", "osk-wide")].join(""),
+    ];
+  } else {
+    const letters = (oskSymbols ? OSK_SYMBOL_ROWS : OSK_LETTER_ROWS).map((row) =>
+      row.map((k) => {
+        const ch = oskShift && !oskSymbols ? k.toUpperCase() : k;
+        return oskKeyButton(ch, `char:${ch}`);
+      }).join(""));
+    rows = [
+      letters[0],
+      letters[1],
+      [oskSymbols ? "" : oskKeyButton("\u21e7", "shift", oskShift ? "osk-wide" : "osk-wide osk-muted"), letters[2], oskKeyButton("\u232b", "backspace", "osk-wide")].join(""),
+      [
+        oskKeyButton(oskSymbols ? "ABC" : "?123", "symbols", "osk-muted osk-wide"),
+        oskKeyButton("Space", "char: ", "osk-space"),
+        oskKeyButton("Hide", "hide", "osk-muted"),
+        oskKeyButton("\u21b5 Done", "enter", "osk-wide"),
+      ].join(""),
+    ];
+  }
+  oskRows.innerHTML = rows.map((row) => `<div class="osk-row">${row}</div>`).join("");
+}
+
+function showOsk(element) {
+  oskTarget = element;
+  oskShift = false;
+  oskSymbols = false;
+  renderOsk();
+  osk.hidden = false;
+  document.body.classList.add("osk-open");
+}
+
+function hideOsk() {
+  oskTarget = null;
+  osk.hidden = true;
+  document.body.classList.remove("osk-open");
+}
+
+function oskInsert(text) {
+  if (!oskTarget) return;
+  oskTarget.focus();
+  let inserted = false;
+  try { inserted = document.execCommand("insertText", false, text); } catch { inserted = false; }
+  if (!inserted) {
+    oskTarget.value += text;
+    oskTarget.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
+
+function oskBackspace() {
+  if (!oskTarget) return;
+  oskTarget.focus();
+  let removed = false;
+  try { removed = document.execCommand("delete", false); } catch { removed = false; }
+  if (!removed) {
+    oskTarget.value = oskTarget.value.slice(0, -1);
+    oskTarget.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
+
+document.addEventListener("focusin", (event) => {
+  if (!oskWanted()) return;
+  const editable = oskEditable(event.target);
+  if (editable) showOsk(editable);
+  else if (!event.target.closest?.("#osk")) hideOsk();
+});
+document.addEventListener("focusout", (event) => {
+  if (event.relatedTarget && (event.relatedTarget.closest?.("#osk") || oskEditable(event.relatedTarget))) return;
+  window.setTimeout(() => {
+    const active = document.activeElement;
+    if (!active || (!active.closest?.("#osk") && !oskEditable(active))) hideOsk();
+  }, 80);
+});
+osk.addEventListener("pointerdown", (event) => {
+  // Keep focus on the input while tapping keys.
+  if (event.target.closest("button")) event.preventDefault();
+});
+osk.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-osk]");
+  if (!button || !oskTarget) return;
+  const action = button.dataset.osk;
+  if (action.startsWith("char:")) {
+    oskInsert(action.slice(5));
+    if (oskShift && !oskSymbols) { oskShift = false; renderOsk(); }
+  } else if (action === "backspace") oskBackspace();
+  else if (action === "shift") { oskShift = !oskShift; renderOsk(); }
+  else if (action === "symbols") { oskSymbols = !oskSymbols; oskShift = false; renderOsk(); }
+  else if (action === "enter") {
+    const target = oskTarget;
+    hideOsk();
+    if (target.tagName === "TEXTAREA") target.blur();
+    else if (target.form) { target.blur(); target.form.requestSubmit?.(); }
+    else target.blur();
+  } else if (action === "hide") hideOsk();
+});
+
 const keypadDialog = document.querySelector("#keypad-dialog");
 const boardTooltip = document.createElement("div");
 boardTooltip.id = "board-tooltip";
