@@ -618,9 +618,11 @@ function updateChrome() {
   badge.textContent = label;
   const inventory = state.snapshot?.inventory;
   const keg = state.snapshot?.keg;
-  kegSummary.textContent = keg
-    ? `${keg.label}: ${formatVolume(inventory?.remaining_ml)}`
-    : "No keg configured";
+  kegSummary.textContent = keg && inventory
+    ? `≈${beersLeft(inventory.remaining_ml)} beers left · ${formatVolume(inventory.remaining_ml)}`
+    : keg
+      ? keg.label
+      : "No keg configured";
   if (keg && inventory) {
     const rawPercent = Number(inventory.percent_remaining);
     const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, rawPercent)) : 0;
@@ -2340,7 +2342,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-30.1";
+const UI_BUILD = "2026-08-30.2";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;

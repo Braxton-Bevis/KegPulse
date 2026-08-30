@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v26-in-app-keyboard";
+const CACHE_NAME = "kegpulse-shell-v27-beers-left-header";
 const SHELL = [
   "/",
   "/static/styles.css",

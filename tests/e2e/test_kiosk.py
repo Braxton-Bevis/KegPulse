@@ -70,6 +70,7 @@ def test_management_is_pin_protected_and_updates_participant_funds(
     live_app.app.state.repository.create_participant("Morgan")
     live_app.app.state.repository.replace_keg("Partial keg", 1000)
     page.goto(f"{live_app.url}/#/management")
+    expect(page.locator("#keg-summary")).to_contain_text("beers left")
     expect(page.get_by_role("heading", name="Management")).to_be_visible()
     expect(page.get_by_label("Unlock with PIN")).to_be_visible()
     page.get_by_label("Unlock with PIN").click()
