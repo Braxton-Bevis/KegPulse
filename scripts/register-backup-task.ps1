@@ -1,4 +1,4 @@
-# Registers (or refreshes) the nightly KegPulse -> GitHub backup as a Windows
+﻿# Registers (or refreshes) the nightly KegPulse -> GitHub backup as a Windows
 # scheduled task for the current user. Run once; safe to re-run.
 param([string]$Time = '04:00')
 
@@ -11,8 +11,9 @@ $Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script`"" `
     -WorkingDirectory $RepoRoot
 # Nightly, plus a catch-up run at logon in case the laptop was asleep overnight.
+$Repeating = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(15) -RepetitionInterval (New-TimeSpan -Hours 4) -RepetitionDuration (New-TimeSpan -Days 3650)
 $Triggers = @(
-    (New-ScheduledTaskTrigger -Daily -At $Time),
+    $Repeating,
     (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
 )
 $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable `
@@ -23,3 +24,4 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Triggers `
     -Force | Out-Null
 
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State | Format-List
+

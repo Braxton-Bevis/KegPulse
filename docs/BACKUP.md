@@ -15,7 +15,7 @@ survives a dead laptop.
 - `scripts/backup-to-github.ps1` wraps it and appends to
   `%LOCALAPPDATA%\KegPulse\KegPulse\logs\github-backup.log`.
 - `scripts/register-backup-task.ps1` registers the Windows scheduled task
-  **KegPulse GitHub backup**: every day at 04:00, plus a catch-up run at logon
+  **KegPulse GitHub backup**: every four hours, plus a catch-up run at logon
   (for nights the laptop was asleep). Run it once per machine; re-running is
   safe.
 
@@ -23,11 +23,12 @@ The working clone lives at `%LOCALAPPDATA%\KegPulse\KegPulse\github-backup`.
 Pushes use the machine's existing GitHub credentials (`gh auth login` or Git
 Credential Manager).
 
-## What is *not* backed up
+## Media is included
 
-Pour photos, avatars, and videos stay on the machine — they are large, and the
-database remains fully usable without them. Copy the `pour-photos` folder and
-`Videos\KegPulse` separately if you want the media too.
+Every pour photo, avatar, video clip, camera test, and unattributed snapshot is
+mirrored into the repository under `media/pour-photos/` and `media/videos/`.
+The working tree always matches what exists on the machine right now; git
+history keeps every previous version.
 
 ## Restoring
 

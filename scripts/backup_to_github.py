@@ -111,6 +111,76 @@ def snapshot_database(source: Path, destination: Path) -> None:
         sidecar.unlink(missing_ok=True)
 
 
+def videos_dir() -> Path:
+    override = os.environ.get("KEGPULSE_VIDEO_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / "Videos" / "KegPulse"
+
+
+def sync_media(clone: Path, data_dir: Path) -> dict[str, dict[str, int]]:
+    """Mirror pour photos, avatars, and videos into the repository.
+
+    The working tree matches what exists on disk right now; git history keeps
+    every previous file, so nothing is lost by the mirror deletes.
+    """
+    sources = {
+        "pour-photos": data_dir / "pour-photos",
+        "videos": videos_dir(),
+    }
+    media_root = clone / "media"
+    stats: dict[str, dict[str, int]] = {}
+    for name, source in sources.items():
+        dest_root = media_root / name
+        copied = removed = unchanged = 0
+        wanted: set[Path] = set()
+        if source.is_dir():
+            for path in source.rglob("*"):
+                if not path.is_file() or path.suffix == ".tmp":
+                    continue
+                relative = path.relative_to(source)
+                wanted.add(relative)
+                target = dest_root / relative
+                if not target.exists() or target.stat().st_size != path.stat().st_size:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
+                    copied += 1
+                else:
+                    unchanged += 1
+        if dest_root.is_dir():
+            for target in sorted(dest_root.rglob("*"), reverse=True):
+                if target.is_file() and target.relative_to(dest_root) not in wanted:
+                    target.unlink()
+                    removed += 1
+                elif target.is_dir() and not any(target.iterdir()):
+                    target.rmdir()
+        stats[name] = {"copied": copied, "unchanged": unchanged, "removed": removed}
+    return stats
+
+
+def write_readme(clone: Path) -> None:
+    newline = chr(10)
+    content = newline.join(
+        [
+            "# KegPulse backups",
+            "",
+            "Automatic snapshots of the complete KegPulse state:",
+            "",
+            "- kegpulse.db - the database (PIN verifier removed)",
+            "- export/ - every table as readable JSON",
+            "- media/pour-photos/ - pour evidence photos and avatars",
+            "- media/videos/ - pour clips, camera tests, unattributed snapshots",
+            "",
+            "Restore: stop KegPulse, copy kegpulse.db over the live database in the",
+            "data directory, copy media/pour-photos/ into the data directory as",
+            "pour-photos/, copy media/videos/ to ~/Videos/KegPulse (or the",
+            "KEGPULSE_VIDEO_DIR target), start KegPulse, and set the PIN again.",
+            "",
+        ]
+    )
+    (clone / "README.md").write_text(content, encoding="utf-8")
+
+
 def export_tables(database: Path, export_dir: Path) -> list[str]:
     export_dir.mkdir(parents=True, exist_ok=True)
     for stale in export_dir.glob("*.json"):
@@ -136,12 +206,15 @@ def export_tables(database: Path, export_dir: Path) -> list[str]:
     return written
 
 
-def write_manifest(clone: Path, source: Path, tables: list[str]) -> None:
+def write_manifest(
+    clone: Path, source: Path, tables: list[str], media: dict[str, dict[str, int]]
+) -> None:
     manifest = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "source_database": str(source),
         "scrubbed_settings": list(SCRUBBED_SETTINGS),
         "tables": tables,
+        "media": media,
         "restore": (
             "Stop KegPulse, copy kegpulse.db over the live database in the data "
             "directory, start KegPulse, then set the administrator PIN again."
@@ -203,8 +276,15 @@ def main() -> int:
     snapshot = clone / "kegpulse.db"
     snapshot_database(source, snapshot)
     tables = export_tables(snapshot, clone / "export")
-    write_manifest(clone, source, tables)
+    media = sync_media(clone, data_dir)
+    write_manifest(clone, source, tables, media)
+    write_readme(clone)
     log(f"snapshot {snapshot.stat().st_size // 1024} KiB, {len(tables)} tables exported")
+    for name, counts in media.items():
+        log(
+            f"media {name}: +{counts['copied']} changed, "
+            f"{counts['unchanged']} unchanged, -{counts['removed']} removed"
+        )
     commit_and_push(clone)
     return 0
 
