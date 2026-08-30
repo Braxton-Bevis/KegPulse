@@ -1763,6 +1763,22 @@ const BOARD_TABS = [
 ];
 const ML_PER_FL_OZ = 29.5735;
 const flOz = (ml) => decimal(ml) / ML_PER_FL_OZ;
+const SEPTEMBER_COUNTER_START = Date.parse("2026-08-30T22:16:01Z");
+
+function septemberTopDrinkers(pours, participants) {
+  const counts = new Map();
+  for (const pour of pours) {
+    if (!pour.participant_id || Date.parse(pour.ended_at) < SEPTEMBER_COUNTER_START) continue;
+    if (pour.volume_ml === null || pour.volume_ml === undefined || decimal(pour.volume_ml) <= 0) continue;
+    counts.set(pour.participant_id, (counts.get(pour.participant_id) || 0) + 1);
+  }
+  return participants.map((person) => ({
+    ...person,
+    septemberDrinks: counts.get(person.id) || 0,
+  })).sort((a, b) => b.septemberDrinks - a.septemberDrinks
+    || a.display_name.localeCompare(b.display_name, undefined, { sensitivity: "base" })
+    || a.id.localeCompare(b.id)).slice(0, 5);
+}
 
 function boardPoursStale() {
   const lastId = state.snapshot?.last_pour?.id || null;
@@ -1899,9 +1915,13 @@ function displayView() {
     </section>`;
   } else if (tab === "people") {
     const rows = boardPeopleRows(pours, s.participants || []);
+    const septemberLeaders = septemberTopDrinkers(pours, s.participants || []);
     const maxOz = Math.max(...rows.map((row) => row.oz), 1);
     panel = `<section class="display-panel">
-      <p class="display-kicker">Who is drinking, who is paying</p>
+      <p class="display-kicker">September Top 5 Drinkers</p>
+      <table class="board-table board-leaderboard"><caption class="visually-hidden">September top five drinkers since the counter reset</caption><thead><tr><th>Rank</th><th>Person</th><th>Drinks</th></tr></thead><tbody>${septemberLeaders.length ? septemberLeaders.map((row, index) => `<tr><td class="num">${index + 1}</td><td><span class="board-person"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(row)}</span>${escapeHtml(row.display_name)}</span></td><td class="num">${row.septemberDrinks} ${row.septemberDrinks === 1 ? "drink" : "drinks"}</td></tr>`).join("") : '<tr><td colspan="3">No profiles yet.</td></tr>'}</tbody></table>
+      <p class="display-sub">Counter reset today. Tied drink counts are alphabetical.</p>
+      <p class="display-kicker">All-time activity and balances</p>
       <table class="board-table board-people"><caption class="visually-hidden">People, pours, and balances</caption><thead><tr><th>Person</th><th>Poured</th><th>Pours</th><th>Standing</th></tr></thead><tbody>${rows.length ? rows.map((row) => `<tr class="standing-${row.standing}"><td><span class="board-person"><span class="participant-avatar" aria-hidden="true">${participantAvatarMarkup(row)}</span>${escapeHtml(row.display_name)}</span></td><td class="num"><span class="board-inline-bar" aria-hidden="true"><span style="width:${((row.oz / maxOz) * 100).toFixed(1)}%"></span></span>${row.oz.toFixed(1)} fl oz</td><td class="num">${row.count}</td><td class="num board-standing">${row.standing === "owes" ? `Owes ${formatMoney(-row.balance)}` : row.standing === "credit" ? `Credit ${formatMoney(row.balance)}` : "Paid up"}</td></tr>`).join("") : '<tr><td colspan="4">No profiles yet.</td></tr>'}</tbody></table>
     </section>`;
   } else {
@@ -2342,7 +2362,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-30.2";
+const UI_BUILD = "2026-08-30.3";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;

@@ -15,6 +15,8 @@ def test_tracking_board_tabs_chart_people_and_unrecorded(page: Page, live_app: L
     repo = live_app.app.state.repository
     configure_measurement(repo)
     person = repo.create_participant("Board tester")
+    repo.create_participant("Zulu tied")
+    repo.create_participant("Alpha tied")
     wait_connected(page, live_app)
 
     # One attributed pour and one unclaimed pour so every tab has content.
@@ -43,7 +45,14 @@ def test_tracking_board_tabs_chart_people_and_unrecorded(page: Page, live_app: L
     expect(page.locator(".board-table")).to_contain_text("Unrecorded")
 
     page.get_by_role("tab", name="People").click()
-    row = page.locator("tr", has_text="Board tester")
+    leaders = page.locator(".board-leaderboard tbody tr")
+    expect(page.get_by_text("September Top 5 Drinkers")).to_be_visible()
+    expect(leaders).to_have_count(3)
+    expect(leaders.nth(0)).to_contain_text("Board tester")
+    expect(leaders.nth(0)).to_contain_text("1 drink")
+    expect(leaders.nth(1)).to_contain_text("Alpha tied")
+    expect(leaders.nth(2)).to_contain_text("Zulu tied")
+    row = page.locator(".board-people tr", has_text="Board tester")
     expect(row).to_be_visible()
     expect(row).to_contain_text("fl oz")
     expect(row.locator(".board-standing")).to_be_visible()
