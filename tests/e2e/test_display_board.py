@@ -37,7 +37,8 @@ def test_tracking_board_tabs_chart_people_and_unrecorded(page: Page, live_app: L
     page.goto(f"{live_app.url}/#/display")
     expect(page.get_by_role("tab", name="Keg")).to_be_visible(timeout=5000)
     expect(page.get_by_role("heading", name="House IPA")).to_be_visible()
-    expect(page.get_by_text("beers", exact=False).first).to_be_visible()
+    expect(page.locator(".display-metric")).to_contain_text("beers left")
+    expect(page.locator(".display-metric")).not_to_contain_text("%")
 
     page.get_by_role("tab", name="Pours").click()
     expect(page.locator("svg.board-chart")).to_be_visible(timeout=10000)

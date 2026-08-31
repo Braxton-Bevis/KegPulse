@@ -1891,9 +1891,9 @@ function displayView() {
     panel = `<div class="display-grid">
       <section class="display-keg">
         <p class="display-kicker">${escapeHtml(keg?.label || "No keg")}</p>
-        <p class="display-metric">${percent.toFixed(0)}<span class="display-unit">%</span></p>
+        <p class="display-metric">${inventory ? `≈${beersLeft(inventory.remaining_ml)}<span class="display-unit"> beers left</span>` : "—"}</p>
         <progress class="progress display-progress" max="100" value="${percent}" aria-label="Keg percent remaining">${percent}%</progress>
-        <p class="display-sub">${inventory ? `${formatVolume(inventory.remaining_ml)} left \u00b7 \u2248${beersLeft(inventory.remaining_ml)} beers \u00b7 ${formatVolume(inventory.poured_ml)} poured` : "No keg installed"}</p>
+        <p class="display-sub">${inventory ? `${formatVolume(inventory.remaining_ml)} left \u00b7 ${percent.toFixed(0)}% \u00b7 ${formatVolume(inventory.poured_ml)} poured` : "No keg installed"}</p>
       </section>
       <section class="display-live">
         <p class="display-kicker">${pouring ? "Live pour" : "Last pour"}</p>
@@ -2362,7 +2362,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-30.3";
+const UI_BUILD = "2026-08-30.4";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;
