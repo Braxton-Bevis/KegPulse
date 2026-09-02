@@ -110,6 +110,7 @@ class PinRequest(ApiModel):
 
 
 class ManagementSettingsUpdate(ApiModel):
+    video_keep: int | None = Field(default=None, ge=5, le=500)
     price_per_fl_oz: Decimal | None = Field(
         default=None, ge=Decimal("0"), le=Decimal("1000"), decimal_places=2
     )
@@ -219,6 +220,7 @@ class PourPhotoResponse(ResponseModel):
 class ManagementResponse(ResponseModel):
     price_cents_per_fl_oz: str
     webcam_enabled: bool
+    video_keep: int = 40
     participants: list[ParticipantResponse]
     ledger: list[AccountLedgerResponse]
     photos: list[PourPhotoResponse]
@@ -415,6 +417,48 @@ class SnapshotSettingsResponse(ResponseModel):
     webcam_enabled: bool = False
 
 
+class ReviewVideoResponse(ResponseModel):
+    file: str
+    kind: Literal["pour", "unattributed", "manual", "cameratest"]
+    size_bytes: int
+    recorded_at: str
+    session_prefix: str | None = None
+
+
+class ReviewPourResponse(PourResponse):
+    """A pour with the snapshot and clip that were captured while it happened."""
+
+    photo_id: str | None = None
+    photo_count: int = 0
+    video: ReviewVideoResponse | None = None
+
+
+class VideoLibraryResponse(ResponseModel):
+    directory: str
+    keep: int
+    total_bytes: int
+    videos: list[ReviewVideoResponse]
+
+
+class CameraRecordRequest(ApiModel):
+    seconds: int = Field(default=8, ge=3, le=30)
+
+
+class CameraFailureRequest(ApiModel):
+    request_id: str = Field(min_length=32, max_length=32)
+    detail: str = Field(min_length=1, max_length=200)
+
+
+class CameraRequestResponse(ResponseModel):
+    id: str
+    seconds: int
+    status: Literal["pending", "done", "failed", "expired"]
+    requested_at: str
+    expires_at: str
+    file: str | None = None
+    detail: str | None = None
+
+
 class UnattributedPourNotice(ResponseModel):
     id: str
     volume_ml: str | None = None
@@ -443,6 +487,7 @@ class StatusResponse(ResponseModel):
     last_verification: VerificationResponse | None = None
     last_pour: PourResponse | None = None
     unattributed_pours: list[UnattributedPourNotice] = []
+    camera_request: CameraRequestResponse | None = None
     onboarding: OnboardingResponse
     settings: SnapshotSettingsResponse
 

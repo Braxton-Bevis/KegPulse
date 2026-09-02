@@ -5,9 +5,10 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from collections import deque
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -57,6 +58,8 @@ class KegPulseCoordinator:
         self._stop = asyncio.Event()
         self._event_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        # A clip requested from the review page; the kiosk browser fulfils it.
+        self._camera_request: dict[str, Any] | None = None
         self._event_retries: deque[tuple[float, int, ManagerEvent]] = deque()
 
     def _diagnostic(self, level: str, code: str, context: dict[str, Any]) -> None:
@@ -873,6 +876,57 @@ class KegPulseCoordinator:
             await self._broadcast_unlocked()
             return self.repository.get_session(provisional["session_id"])
 
+    # Manual camera clips ---------------------------------------------------
+    CAMERA_REQUEST_GRACE_SECONDS = 30
+
+    def camera_request(self) -> dict[str, Any] | None:
+        """Current manual clip request, expiring it when the kiosk never answered."""
+        request = self._camera_request
+        if request is None:
+            return None
+        if request["status"] == "pending" and datetime.now(UTC) > request["_expires"]:
+            request = {**request, "status": "expired"}
+            self._camera_request = request
+        return {key: value for key, value in request.items() if not key.startswith("_")}
+
+    async def request_recording(self, seconds: int) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=seconds + self.CAMERA_REQUEST_GRACE_SECONDS)
+        self._camera_request = {
+            "id": uuid.uuid4().hex,
+            "seconds": seconds,
+            "status": "pending",
+            "requested_at": _iso(now),
+            "expires_at": _iso(expires),
+            "file": None,
+            "detail": None,
+            "_expires": expires,
+        }
+        await self.publish()
+        result = self.camera_request()
+        assert result is not None
+        return result
+
+    async def resolve_recording(
+        self, request_id: str, *, file: str | None = None, detail: str | None = None
+    ) -> dict[str, Any]:
+        current = self.camera_request()
+        if current is None or current["id"] != request_id:
+            raise ConflictError("no matching camera request")
+        if current["status"] != "pending":
+            raise ConflictError("camera request already settled")
+        assert self._camera_request is not None
+        self._camera_request = {
+            **self._camera_request,
+            "status": "done" if file else "failed",
+            "file": file,
+            "detail": detail,
+        }
+        await self.publish()
+        result = self.camera_request()
+        assert result is not None
+        return result
+
     def snapshot(self) -> dict[str, Any]:
         participants = self.repository.list_participants(active_only=True)
         keg = self.repository.current_keg()
@@ -945,6 +999,7 @@ class KegPulseCoordinator:
             "last_verification": verifications[0] if verifications else None,
             "last_pour": pours[0] if pours else None,
             "unattributed_pours": self.repository.recent_unattributed_pours(),
+            "camera_request": self.camera_request(),
             "onboarding": {
                 "needs_keg": keg is None,
                 "needs_calibration": calibration is None,
@@ -1027,3 +1082,7 @@ class KegPulseCoordinator:
             raise ValueError("unknown demo action")
         await asyncio.sleep(0.05)
         await self.publish()
+
+
+def _iso(moment: datetime) -> str:
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Pour review page (`#/review`, behind the administrator PIN): lists pours with a
+  minimum-size filter (fl oz), an unclaimed-only / per-person filter, the mid-pour
+  snapshot, and the camera clip matched to each pour, playable in place, with
+  Assign for unclaimed pours. Backed by `GET /api/v1/management/pours`,
+  `GET /api/v1/management/videos`, and a clip streaming route.
+- Clips can now be requested from the review page on any device: the kiosk
+  browser records a short clip and uploads it (`POST /api/v1/management/camera/record`,
+  fulfilled through `/api/v1/evidence/requested-video`). The page reports saved,
+  failed (with the kiosk's reason), or no answer.
+- Pour clip retention is a management setting (`video_keep`, default 40 clips)
+  instead of a fixed five-slot pool; camera-test clips keep their own two slots.
+- `python -m kegpulse --set-pin 1976` stores the administrator PIN for the data
+  directory directly, for recovery when the kiosk PIN is lost or was set elsewhere.
+- Fixed PIN logins failing on a kiosk left open for a long time: the browser's
+  server session expires after thirty idle minutes, and the login was sent with
+  the stale CSRF token, so the correct PIN was rejected as "valid CSRF token
+  required". The client refreshes its session before every login and now says
+  "Wrong PIN" or "Too many wrong PINs" in plain words.
 - Nightly off-machine backup: a scrubbed database snapshot plus JSON export is pushed
   to a private GitHub repository by a scheduled task (`docs/BACKUP.md`).
 - Fixed live updates falling back to polling in LAN mode: the WebSocket's

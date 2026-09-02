@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--restore", type=Path, help="validate and restore a KegPulse database, then exit"
     )
     parser.add_argument(
+        "--set-pin",
+        metavar="PIN",
+        help="store the administrator PIN (4-20 digits) for this data directory, then exit",
+    )
+    parser.add_argument(
         "--allow-test-shutdown",
         action="store_true",
         default=None,
@@ -236,10 +241,37 @@ def restore_database(paths: AppPaths, source: Path) -> Path:
     return paths.database
 
 
+def set_admin_pin(paths: AppPaths, pin: str) -> int:
+    """Write the PIN verifier straight into the database.
+
+    Works whether or not KegPulse is running: logins always verify against the
+    database, so a running service accepts the new PIN immediately. This is
+    the recovery path when the kiosk PIN was lost, set on a different data
+    directory, or scrubbed by a backup restore.
+    """
+    from kegpulse.config import AppConfig
+    from kegpulse.persistence import Repository
+    from kegpulse.security import SecurityManager
+
+    database = Database(paths.database)
+    try:
+        SecurityManager(Repository(database), AppConfig(demo=False, no_browser=True)).set_pin(pin)
+    except ValueError as exc:
+        print(f"KegPulse PIN error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        database.close()
+    print(f"Administrator PIN stored in {paths.database}")
+    print("Log in with the new PIN; no restart is needed.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     paths = get_app_paths(arguments.data_dir)
     paths.ensure()
+    if arguments.set_pin is not None:
+        return set_admin_pin(paths, arguments.set_pin)
     try:
         instance_lock = InstanceLock(paths.root / ".kegpulse.lock")
         instance_lock.acquire()

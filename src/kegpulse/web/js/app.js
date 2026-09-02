@@ -9,6 +9,10 @@ const menuButton = document.querySelector("#menu-button");
 const nav = document.querySelector("#site-nav");
 const dialog = document.querySelector("#confirm-dialog");
 
+// Unarmed flow under this many pulses (about an ounce) is drip noise: the host
+// keeps it out of the "needs a name" list, and the kiosk keeps no clip of it.
+const DRIP_PULSES = 150;
+
 const state = {
   snapshot: null,
   security: null,
@@ -38,6 +42,7 @@ const state = {
   videoChunks: [],
   videoSessionId: null,
   videoSawFlow: false,
+  videoMaxPulses: 0,
   cameraTesting: false,
   cameraAutoArmAt: 0,
   cameraAutoArming: false,
@@ -49,6 +54,12 @@ const state = {
   boardLastInteraction: 0,
   diagnostics: null,
   reassignPourId: null,
+  review: null,
+  reviewFilter: { who: "unclaimed", minOz: "1", limit: "100" },
+  reviewVideos: null,
+  reviewPlaying: null,
+  reviewPlayingFile: null,
+  cameraRequestHandled: null,
   lastAnnouncedPulses: null,
   lastMeasurementAnnouncement: 0,
   flowRateMlMin: 0,
@@ -773,8 +784,17 @@ function applySnapshot(snapshot) {
   state.snapshot = snapshot;
   syncPourCamera(snapshot);
   syncPourVideo(snapshot);
+  void syncCameraRequest(snapshot);
   reconcileRoute(previous, snapshot);
   updateChrome();
+  if (
+    route() === "/review"
+    && previous?.camera_request?.status === "pending"
+    && snapshot.camera_request
+    && snapshot.camera_request.status !== "pending"
+  ) {
+    void loadReviewVideos();
+  }
   // A snapshot may arrive between a user's final field edit and the form's
   // submit click. Keep the whole focused form intact so its values and click
   // target cannot be replaced mid-interaction.
@@ -782,7 +802,10 @@ function applySnapshot(snapshot) {
     main.contains(document.activeElement)
     && document.activeElement.closest("form") !== null
   ) || (dialog.open && state.dialogInvoker && main.contains(state.dialogInvoker));
-  const rendered = !editing || route() === "/pour";
+  // Likewise a clip that is playing on the review page must not be rebuilt.
+  const watching = route() === "/review"
+    && [...main.querySelectorAll("video.review-video")].some((video) => !video.paused && !video.ended);
+  const rendered = (!editing && !watching) || route() === "/pour";
   if (rendered) render();
   if (rendered && route() === "/settings" && snapshot.mode === "demo") {
     const session = currentDemoSession();
@@ -1260,6 +1283,200 @@ function managementView() {
     <section class="management-band"><h2>Pour evidence</h2><div class="evidence-grid">${photos}</div></section>`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Pour review: unclaimed pours, their snapshots and clips, and the camera.
+function reviewQuery() {
+  const form = document.querySelector("#review-filter-form");
+  if (form) {
+    const data = new FormData(form);
+    state.reviewFilter = {
+      who: String(data.get("who") || "unclaimed"),
+      minOz: String(data.get("min_oz") ?? "1"),
+      limit: String(data.get("limit") || "100"),
+    };
+  }
+  const filter = state.reviewFilter;
+  const params = new URLSearchParams();
+  params.set("limit", filter.limit);
+  if (filter.who === "unclaimed") params.set("unattributed_only", "true");
+  else if (filter.who !== "all") params.set("participant_id", filter.who);
+  const minOz = Number(filter.minOz);
+  if (Number.isFinite(minOz) && minOz > 0) params.set("min_oz", String(minOz));
+  return `/api/v1/management/pours?${params.toString()}`;
+}
+
+async function loadReview() {
+  if (!state.security?.pin_configured || !state.security?.authenticated) {
+    state.review = null;
+    render();
+    return;
+  }
+  try {
+    const [pours, videos] = await Promise.all([api(reviewQuery()), api("/api/v1/management/videos")]);
+    state.review = pours;
+    state.reviewVideos = videos;
+    render();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      state.security = await refreshSecurityContext();
+      state.review = null;
+      render();
+      return;
+    }
+    showError(error);
+  }
+}
+
+async function loadReviewVideos() {
+  if (!state.security?.authenticated) return;
+  try { state.reviewVideos = await api("/api/v1/management/videos"); render(); } catch (error) { showError(error); }
+}
+
+function reviewCard(row) {
+  const oz = flOz(row.volume_ml);
+  const who = row.participant_name ? `<strong>${escapeHtml(row.participant_name)}</strong>` : '<span class="badge warning">Unclaimed</span>';
+  const photo = row.photo_id
+    ? `<img class="review-photo" src="/api/v1/management/photos/${encodeURIComponent(row.photo_id)}" alt="Snapshot from this pour" loading="lazy">`
+    : '<div class="review-photo placeholder" aria-hidden="true">No snapshot</div>';
+  const playing = Boolean(row.video) && state.reviewPlaying === row.id;
+  const clip = playing
+    ? `<video class="review-video" controls autoplay playsinline src="/api/v1/management/videos/${encodeURIComponent(row.video.file)}"></video>`
+    : "";
+  const clipButton = row.video
+    ? `<button type="button" class="secondary" data-action="review-play" data-pour="${escapeHtml(row.id)}">${playing ? "Hide clip" : "Play clip"}</button>`
+    : '<span class="muted">No clip</span>';
+  const assign = row.participant_id
+    ? ""
+    : state.reassignPourId === row.id
+      ? reassignmentEditor(row)
+      : `<button type="button" data-action="show-reassign" data-pour="${escapeHtml(row.id)}">Assign</button>`;
+  const size = row.volume_ml === null || row.volume_ml === undefined
+    ? `<p class="review-size"><strong>${escapeHtml(row.raw_pulses)}</strong> pulses</p>`
+    : `<p class="review-size"><strong>${oz.toFixed(1)}</strong> fl oz</p>`;
+  return `<article class="card review-card">
+    ${photo}
+    <div class="review-body">
+      ${size}
+      <p>${who}</p>
+      <p class="muted">${formatTime(row.ended_at)} · ${escapeHtml(row.raw_pulses)} pulses · ${escapeHtml(String(row.quality).replaceAll("_", " "))}${row.photo_count ? ` · ${row.photo_count} ${row.photo_count === 1 ? "snapshot" : "snapshots"}` : ""}</p>
+      <div class="button-row">${clipButton}${assign}</div>
+    </div>
+    ${clip}
+  </article>`;
+}
+
+function cameraRequestStatus(request) {
+  if (!request) return "";
+  const status = request.status === "pending" && Date.parse(request.expires_at) < Date.now() ? "expired" : request.status;
+  if (status === "pending") return `<p class="warning-text" role="status">Recording a ${escapeHtml(request.seconds)}-second clip on the kiosk…</p>`;
+  if (status === "done") {
+    return `<p class="good-text" role="status">Saved ${escapeHtml(request.file)}</p><div class="button-row"><button type="button" class="secondary" data-action="review-play-file" data-file="${escapeHtml(request.file)}">${state.reviewPlayingFile === request.file ? "Hide clip" : "Play clip"}</button></div>`;
+  }
+  if (status === "failed") return `<p class="warning-text" role="status">Recording failed: ${escapeHtml(request.detail || "unknown reason")}.</p>`;
+  return '<p class="warning-text" role="status">No clip arrived. Is the kiosk open with its camera armed?</p>';
+}
+
+function cameraSection() {
+  const request = state.snapshot?.camera_request;
+  const library = state.reviewVideos;
+  const local = !state.security?.lan_mode || state.security?.local_client !== false;
+  const enabled = cameraShouldRun();
+  const pending = request?.status === "pending" && Date.parse(request.expires_at) >= Date.now();
+  const armedText = local
+    ? (state.cameraStream ? " This kiosk's camera is armed." : ` This kiosk's camera is not armed yet (${state.cameraStatus}).`)
+    : "";
+  const playing = state.reviewPlayingFile
+    ? `<video class="review-video" controls autoplay playsinline src="/api/v1/management/videos/${encodeURIComponent(state.reviewPlayingFile)}"></video>`
+    : "";
+  const clips = library
+    ? (library.videos.length
+      ? `<div class="table-wrap"><table><caption class="visually-hidden">Stored clips</caption><thead><tr><th>Clip</th><th>Recorded</th><th>Size</th><th></th></tr></thead><tbody>${library.videos.slice(0, 40).map((video) => `<tr><td>${escapeHtml(video.kind === "cameratest" ? "camera test" : video.kind)}<br><span class="muted">${escapeHtml(video.file)}</span></td><td>${formatTime(video.recorded_at)}</td><td>${(video.size_bytes / 1048576).toFixed(1)} MB</td><td><button type="button" class="secondary" data-action="review-play-file" data-file="${escapeHtml(video.file)}">${state.reviewPlayingFile === video.file ? "Hide" : "Play"}</button></td></tr>`).join("")}</tbody></table></div>`
+      : '<p class="empty">No clips have been recorded yet.</p>')
+    : '<p class="muted">Loading clips…</p>';
+  return `<section class="management-band" id="review-camera"><h2>Camera</h2>
+    <div class="grid two">
+      <section class="card"><h3>Record a clip now</h3>
+        <p>${enabled ? "The pour camera is enabled." : '<span class="warning-text">The pour camera is disabled.</span> Enable it under Management first.'}${escapeHtml(armedText)}</p>
+        <p class="field-help">Records eight seconds from the kiosk camera and stores it with the pour clips, so you can confirm recording works from anywhere on the network.</p>
+        <div class="button-row"><button type="button" data-action="review-record" ${!enabled || pending ? "disabled" : ""}>${pending ? "Recording…" : "Record 8-second clip"}</button></div>
+        ${cameraRequestStatus(request)}
+      </section>
+      <section class="card"><h3>Clip storage</h3>
+        <p>${library ? `${library.videos.length} ${library.videos.length === 1 ? "clip" : "clips"} · ${(library.total_bytes / 1048576).toFixed(0)} MB` : ""}</p>
+        ${library ? `<p class="muted">${escapeHtml(library.directory)}</p>` : ""}
+        <form id="video-keep-form" class="stack"><label>Keep the newest clips<input name="video_keep" type="number" inputmode="numeric" min="5" max="500" step="1" value="${escapeHtml(library?.keep ?? 40)}" required></label><button>Save</button></form>
+        <p class="field-help">The oldest pour clips are deleted once more than this many exist. Camera-test clips keep two slots of their own.</p>
+      </section>
+    </div>
+    ${playing}
+    ${clips}</section>`;
+}
+
+function reviewView() {
+  if (!state.security?.pin_configured) {
+    return page("Pour review", "Reviewing pours and camera clips requires an administrator PIN.", '<section class="card narrow-card"><p>Create the PIN under <a href="#/management">Management</a> first.</p></section>');
+  }
+  if (!state.security?.authenticated) {
+    return page("Pour review", "Unlock with the administrator PIN to see pours, snapshots, and clips.", `<section class="card narrow-card">${loginFormMarkup(true)}</section>`);
+  }
+  const filter = state.reviewFilter;
+  const people = state.snapshot?.participants || [];
+  const rows = state.review;
+  const totalOz = rows ? rows.reduce((sum, row) => sum + flOz(row.volume_ml), 0) : 0;
+  const unclaimed = rows ? rows.filter((row) => !row.participant_id).length : 0;
+  const summary = rows
+    ? `${rows.length} ${rows.length === 1 ? "pour" : "pours"} · ${totalOz.toFixed(1)} fl oz${filter.who === "all" ? ` · ${unclaimed} unclaimed` : ""}`
+    : "Loading pours…";
+  const cards = rows === null
+    ? ""
+    : rows.length === 0
+      ? '<p class="empty">No pours match these filters.</p>'
+      : `<div class="review-grid">${rows.map(reviewCard).join("")}</div>`;
+  return page("Pour review", "Unclaimed pours, their snapshots, and the clips the camera recorded.", `
+    <section class="card review-filters">
+      <form id="review-filter-form" class="review-filter-row">
+        <label>Show<select name="who">
+          <option value="unclaimed" ${filter.who === "unclaimed" ? "selected" : ""}>Unclaimed only</option>
+          <option value="all" ${filter.who === "all" ? "selected" : ""}>Everyone</option>
+          ${people.map((person) => `<option value="${escapeHtml(person.id)}" ${filter.who === person.id ? "selected" : ""}>${escapeHtml(person.display_name)}</option>`).join("")}
+        </select></label>
+        <label>Minimum size (fl oz)<input name="min_oz" type="number" inputmode="decimal" min="0" max="1000" step="0.5" value="${escapeHtml(filter.minOz)}"></label>
+        <label>Limit<select name="limit">${["50", "100", "250", "500"].map((count) => `<option value="${count}" ${filter.limit === count ? "selected" : ""}>${count}</option>`).join("")}</select></label>
+        <button>Apply</button>
+        <button type="button" class="secondary" data-action="review-refresh">Refresh</button>
+      </form>
+      <p class="muted review-summary" role="status">${summary}</p>
+    </section>
+    ${cards}
+    ${cameraSection()}`);
+}
+
+// The kiosk browser owns the camera, so a clip requested from the review page
+// (possibly on another device) is recorded here and uploaded against the
+// request id. Each request is attempted once per page.
+async function syncCameraRequest(snapshot) {
+  const request = snapshot?.camera_request;
+  if (!request || request.status !== "pending" || state.cameraRequestHandled === request.id) return;
+  if (state.security?.lan_mode && state.security?.local_client === false) return;
+  if (Date.parse(request.expires_at) < Date.now()) return;
+  state.cameraRequestHandled = request.id;
+  const fail = async (detail) => {
+    try {
+      await api("/api/v1/evidence/requested-video/failed", { method: "POST", body: JSON.stringify({ request_id: request.id, detail: String(detail).slice(0, 200) }) });
+    } catch { /* another kiosk window may already have answered */ }
+  };
+  if (!state.cameraStream) { await fail("the kiosk camera is not armed"); return; }
+  if (typeof MediaRecorder === "undefined") { await fail("this kiosk browser cannot record video"); return; }
+  try {
+    const seconds = Math.min(30, Math.max(3, Number(request.seconds) || 8));
+    const blob = await recordClip(seconds * 1000);
+    await api(`/api/v1/evidence/requested-video?request_id=${encodeURIComponent(request.id)}`, { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
+  } catch (error) {
+    await fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
 function attachCameraPreview() {
   for (const video of document.querySelectorAll(".camera-preview video")) {
     if (state.cameraStream) video.srcObject = state.cameraStream;
@@ -1337,6 +1554,24 @@ async function disableCamera() {
   } catch (error) { showError(error); }
 }
 
+async function recordClip(milliseconds) {
+  if (!state.cameraStream) throw new Error("Enable the camera first.");
+  if (typeof MediaRecorder === "undefined") throw new Error("This browser cannot record video.");
+  const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
+  const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
+  const chunks = [];
+  const finished = new Promise((resolve) => { recorder.onstop = resolve; });
+  recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
+  recorder.start(500);
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+  try { recorder.requestData(); } catch { /* not every browser exposes this */ }
+  recorder.stop();
+  await finished;
+  const blob = new Blob(chunks, { type: "video/webm" });
+  if (!blob.size) throw new Error("The camera produced no video data.");
+  return blob;
+}
+
 async function recordCameraTestClip() {
   if (state.cameraTesting) return;
   if (!state.cameraStream) { showError("Enable the camera first."); return; }
@@ -1344,18 +1579,7 @@ async function recordCameraTestClip() {
   state.cameraTesting = true;
   render();
   try {
-    const mime = MediaRecorder.isTypeSupported?.("video/webm;codecs=vp8") ? "video/webm;codecs=vp8" : "video/webm";
-    const recorder = new MediaRecorder(state.cameraStream, { mimeType: mime, videoBitsPerSecond: 1_200_000 });
-    const chunks = [];
-    const finished = new Promise((resolve) => { recorder.onstop = resolve; });
-    recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
-    recorder.start(500);
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-    try { recorder.requestData(); } catch { /* not every browser exposes this */ }
-    recorder.stop();
-    await finished;
-    const blob = new Blob(chunks, { type: "video/webm" });
-    if (!blob.size) throw new Error("The camera produced no video data.");
+    const blob = await recordClip(5000);
     const stored = await api("/api/v1/evidence/test-video", { method: "POST", headers: { "Content-Type": "video/webm" }, body: blob });
     showToast(`Test clip saved: ${stored.file}`);
   } catch (error) {
@@ -1408,6 +1632,9 @@ function syncPourVideo(snapshot) {
   const activePour = (session?.purpose === "pour" && ["armed", "pouring", "settling"].includes(phase))
     || (!session && ["pouring", "settling"].includes(phase));
   if (["pouring", "settling"].includes(phase)) state.videoSawFlow = true;
+  if (state.videoRecorder) {
+    state.videoMaxPulses = Math.max(state.videoMaxPulses || 0, decimal(snapshot?.device?.status?.pulses));
+  }
   if (
     activePour
     && state.cameraStream
@@ -1422,16 +1649,20 @@ function syncPourVideo(snapshot) {
       const recordingSession = session ? session.session_id : "unattributed";
       state.videoSessionId = recordingSession;
       state.videoSawFlow = ["pouring", "settling"].includes(phase);
+      state.videoMaxPulses = decimal(snapshot?.device?.status?.pulses);
       recorder.ondataavailable = (event) => { if (event.data?.size) chunks.push(event.data); };
-      const sawFlowRef = () => state.videoSawFlow;
       recorder.onstop = () => {
-        const keep = sawFlowRef();
+        // An arm that timed out without flow produces no evidence worth
+        // keeping, and neither does unarmed drip noise (under ~150 pulses,
+        // about an ounce): those clips only crowd real pours out of storage.
+        const keep = state.videoSawFlow
+          && (Boolean(session) || (state.videoMaxPulses || 0) >= DRIP_PULSES);
         if (state.videoRecorder === recorder) {
           state.videoRecorder = null;
           state.videoSessionId = null;
           state.videoSawFlow = false;
+          state.videoMaxPulses = 0;
         }
-        // An arm that timed out without flow produces no evidence worth keeping.
         if (keep) void uploadPourVideo(recordingSession, chunks);
       };
       recorder.start(500);
@@ -1451,6 +1682,7 @@ function syncPourVideo(snapshot) {
       state.videoRecorder = null;
       state.videoSessionId = null;
       state.videoSawFlow = false;
+      state.videoMaxPulses = 0;
     }
   }
 }
@@ -2044,6 +2276,7 @@ function render() {
     }
     else if (current === "/participants") main.innerHTML = participantsView();
     else if (current === "/management") main.innerHTML = managementView();
+    else if (current === "/review") main.innerHTML = reviewView();
     else if (current === "/settings") main.innerHTML = settingsView();
     else main.innerHTML = page("Not found", "That screen does not exist.", '<a class="button" href="#/">Return home</a>');
   }
@@ -2150,13 +2383,14 @@ function bindLoginForm() {
     if (!pin) { openKeypad(event.currentTarget); return; }
     if (state.pendingRelock) { try { await state.pendingRelock; } catch { /* relock already settled */ } }
     try {
-      state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+      state.security = await loginWithPin(pin);
       await refresh();
       syncSecurityUi();
       render();
       if (!state.socket) connectSocket();
       showToast("Administrator unlocked");
       if (route() === "/management") await loadManagement();
+      if (route() === "/review") await loadReview();
     } catch (error) { showError(error); }
   });
 }
@@ -2204,6 +2438,20 @@ function bindForms() {
     if (!newPin) { openKeypad(event.currentTarget); return; }
     try { await mutation("pin", "/api/v1/security/pin", { pin: newPin }, "PUT"); state.security = await api("/api/v1/security/context"); showToast("Administrator PIN updated; unlock again with the new PIN"); render(); } catch (error) { showError(error); }
   });
+  const reviewFilterForm = document.querySelector("#review-filter-form");
+  if (reviewFilterForm) {
+    reviewFilterForm.addEventListener("submit", (event) => { event.preventDefault(); void loadReview(); });
+    reviewFilterForm.addEventListener("change", () => { void loadReview(); });
+  }
+  document.querySelector("#video-keep-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); const form = new FormData(event.currentTarget);
+    try {
+      const saved = await mutation("video-keep", "/api/v1/management/settings", { video_keep: Number(form.get("video_keep")) }, "PATCH");
+      if (saved) state.management = saved;
+      showToast("Clip retention saved");
+      await loadReviewVideos();
+    } catch (error) { showError(error); }
+  });
   document.querySelector("#management-settings-form")?.addEventListener("submit", async (event) => {
     event.preventDefault(); const form = new FormData(event.currentTarget);
     try {
@@ -2243,7 +2491,8 @@ function bindForms() {
     try {
       await mutation(`assign-${element.dataset.pour}`, `/api/v1/history/${element.dataset.pour}/reassign`, { participant_id: data.get("participant_id"), reason: data.get("reason") });
       state.reassignPourId = null;
-      await loadHistory();
+      if (route() === "/review") await loadReview();
+      else await loadHistory();
     } catch (error) { showError(error); }
   });
 }
@@ -2279,6 +2528,24 @@ main.addEventListener("click", async (event) => {
   }
   if (action === "reload-page") { location.reload(); return; }
   if (action === "camera-test") return recordCameraTestClip();
+  if (action === "review-refresh") return loadReview();
+  if (action === "review-play") {
+    state.reviewPlaying = state.reviewPlaying === button.dataset.pour ? null : button.dataset.pour;
+    render();
+    return;
+  }
+  if (action === "review-play-file") {
+    state.reviewPlayingFile = state.reviewPlayingFile === button.dataset.file ? null : button.dataset.file;
+    render();
+    return;
+  }
+  if (action === "review-record") {
+    try {
+      await mutation("camera-record", "/api/v1/management/camera/record", { seconds: 8 });
+      showToast("Recording requested; the kiosk camera is capturing 8 seconds");
+    } catch (error) { showError(error); }
+    return;
+  }
   if (action === "discard-capture") {
     const accepted = await confirmAction("Discard this captured sample? Nothing is recorded and the calibration stays as it is.", "Discard sample");
     if (!accepted) return;
@@ -2362,7 +2629,7 @@ document.addEventListener("change", async (event) => {
 });
 
 const keypadEntry = { value: "", formId: null };
-const UI_BUILD = "2026-08-30.4";
+const UI_BUILD = "2026-09-02.1";
 
 function maybeReloadForNewBuild(snapshot) {
   const served = snapshot?.settings?.ui_build;
@@ -2624,14 +2891,30 @@ keypadDialog.addEventListener("keydown", (event) => {
   else if (event.key === "Enter") { event.preventDefault(); keypadPress("ok"); }
 });
 keypadDialog.addEventListener("cancel", () => { keypadEntry.value = ""; keypadEntry.formId = null; });
+// A kiosk left open for hours outlives its server session (30 minutes idle),
+// so a login sent with the stale CSRF token fails as "valid CSRF token
+// required" even with the right PIN. Refresh the context first so the cookie
+// and token are live, and translate the server's replies into plain words.
+async function loginWithPin(pin) {
+  try { await refreshSecurityContext(); } catch { /* the login below reports the real problem */ }
+  try {
+    return await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) throw new ApiError("Wrong PIN. Try again.", 401);
+    if (error instanceof ApiError && error.status === 429) throw new ApiError("Too many wrong PINs. Wait a minute, then try again.", 429);
+    throw error;
+  }
+}
+
 async function submitKeypadLogin(pin) {
   if (state.pendingRelock) { try { await state.pendingRelock; } catch { /* relock settled */ } }
   try {
-    state.security = await api("/api/v1/security/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin }) });
+    state.security = await loginWithPin(pin);
     await refresh();
     syncSecurityUi();
     render();
     if (!state.socket) connectSocket();
+    if (route() === "/review") await loadReview();
     showToast("Administrator unlocked \u2014 tap that action again");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2649,7 +2932,7 @@ function relockAdminOnLeave() {
     .catch(() => {})
     .finally(() => { state.pendingRelock = null; });
 }
-const ADMIN_ROUTES = new Set(["/management", "/settings", "/participants", "/calibration", "/keg"]);
+const ADMIN_ROUTES = new Set(["/management", "/review", "/settings", "/participants", "/calibration", "/keg"]);
 // Transient pour screens: a calibration capture routes through them, so they
 // neither require nor drop administrator access.
 const NEUTRAL_ROUTES = new Set(["/pour", "/complete"]);
@@ -2673,6 +2956,7 @@ window.addEventListener("hashchange", () => {
   updateChrome();
   if (route() === "/history") void loadHistory();
   if (route() === "/management") void loadManagement();
+  if (route() === "/review") void loadReview();
 });
 window.addEventListener("offline", () => {
   setHostAvailability(false, new Error("The kiosk network connection is offline."));
@@ -2691,6 +2975,7 @@ async function initialize() {
       if (ready) {
         if (route() === "/history") await loadHistory();
         if (route() === "/management") await loadManagement();
+        if (route() === "/review") await loadReview();
         connectSocket();
       }
     }

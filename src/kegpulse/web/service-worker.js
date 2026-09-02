@@ -1,4 +1,4 @@
-const CACHE_NAME = "kegpulse-shell-v29-beers-left-wall-metric";
+const CACHE_NAME = "kegpulse-shell-v30-pour-review";
 const SHELL = [
   "/",
   "/static/styles.css",

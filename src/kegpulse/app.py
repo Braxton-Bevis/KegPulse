@@ -8,7 +8,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -33,6 +33,9 @@ from .api.models import (
     CalibrationResponse,
     CalibrationSampleRequest,
     CalibrationSampleResponse,
+    CameraFailureRequest,
+    CameraRecordRequest,
+    CameraRequestResponse,
     CaptureArmRequest,
     CapturedMeasurementRequest,
     DemoAction,
@@ -56,6 +59,7 @@ from .api.models import (
     PourResponse,
     PourVideoResponse,
     ReassignmentRequest,
+    ReviewPourResponse,
     SecurityContextResponse,
     SerialActionResponse,
     SerialPortResponse,
@@ -67,10 +71,12 @@ from .api.models import (
     StatusResponse,
     VerificationRequest,
     VerificationResponse,
+    VideoLibraryResponse,
 )
 from .application import KegPulseCoordinator
 from .config import AppConfig
 from .domain.errors import AuthorizationError, ConflictError, DomainError, NotFoundError
+from .domain.units import ML_PER_US_FL_OZ
 from .paths import AppPaths, get_app_paths
 from .persistence import Database, Repository
 from .persistence.export import rows_to_csv_chunks, rows_to_json_chunks
@@ -79,6 +85,9 @@ from .serialio import DeviceManager, PortCandidateProvider, SimulatorTransport, 
 from .serialio.transport import FlowTransport
 
 LOGGER = logging.getLogger("kegpulse.app")
+# Snapshots of unarmed flow are the only evidence for an unclaimed pour; at one
+# frame per second of flow this keeps roughly the last hour of pouring.
+UNATTRIBUTED_PHOTO_KEEP = 400
 
 
 def _read_ui_build(script: Path) -> str | None:
@@ -192,6 +201,7 @@ def create_app(
             (r"/api/v1/sessions/[0-9a-fA-F-]{32,36}/videos", 33_554_432),
             (r"/api/v1/evidence/videos", 33_554_432),
             (r"/api/v1/evidence/test-video", 33_554_432),
+            (r"/api/v1/evidence/requested-video", 33_554_432),
         ),
     )
 
@@ -573,7 +583,157 @@ def create_app(
             repository.set_setting("beer_price_cents_per_fl_oz", str(cents))
         if payload.webcam_enabled is not None:
             repository.set_setting("webcam_enabled", payload.webcam_enabled)
+        if payload.video_keep is not None:
+            repository.set_setting("video_keep", int(payload.video_keep))
         return repository.management_summary()
+
+    # --- pour review: pours with evidence, the clip library, manual clips ---
+    VIDEO_NAME = re.compile(r"^(pour|unattributed|manual|cameratest)_[A-Za-z0-9_-]{1,80}\.webm$")
+    VIDEO_STAMP = re.compile(r"_(\d{8}_\d{6})_")
+
+    def _video_entry(path: Path) -> dict[str, Any] | None:
+        match = VIDEO_NAME.match(path.name)
+        if not match:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        kind = match.group(1)
+        recorded = datetime.fromtimestamp(stat.st_mtime, UTC)
+        stamp = VIDEO_STAMP.search(path.name)
+        if stamp:
+            with suppress(ValueError):
+                recorded = datetime.strptime(stamp.group(1), "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
+        prefix = None
+        if kind == "pour":
+            parts = path.name.split("_")
+            if len(parts) > 2 and re.fullmatch(r"[0-9a-f]{8}", parts[1]):
+                prefix = parts[1]
+        return {
+            "file": path.name,
+            "kind": kind,
+            "size_bytes": stat.st_size,
+            "recorded_at": recorded.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "session_prefix": prefix,
+            "_recorded": recorded,
+        }
+
+    def _list_videos() -> list[dict[str, Any]]:
+        if not paths.videos.is_dir():
+            return []
+        entries = [entry for entry in map(_video_entry, paths.videos.glob("*.webm")) if entry]
+        entries.sort(key=lambda item: item["_recorded"], reverse=True)
+        return entries
+
+    def _public_video(entry: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in entry.items() if not key.startswith("_")}
+
+    def _parse_iso(value: Any) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _match_video(pour: dict[str, Any], videos: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Attributed clips carry the session prefix; unarmed flow matches by time."""
+        session = str(pour.get("session_id") or "")
+        candidates = [
+            video
+            for video in videos
+            if video["kind"] == "pour" and session and video["session_prefix"] == session[:8]
+        ]
+        ended = _parse_iso(pour.get("ended_at"))
+        if not candidates and ended is not None:
+            started = _parse_iso(pour.get("started_at")) or ended
+            window_start = started - timedelta(seconds=5)
+            window_end = ended + timedelta(seconds=180)
+            candidates = [
+                video
+                for video in videos
+                if video["kind"] in {"unattributed", "manual"}
+                and window_start <= video["_recorded"] <= window_end
+            ]
+        if not candidates:
+            return None
+        if ended is not None:
+            candidates.sort(key=lambda video: abs((video["_recorded"] - ended).total_seconds()))
+        return _public_video(candidates[0])
+
+    @app.get("/api/v1/management/pours", response_model=list[ReviewPourResponse])
+    async def management_pours(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        participant_id: str | None = Query(default=None, max_length=36),
+        unattributed_only: bool = False,
+        min_oz: float = Query(default=0.0, ge=0, le=1000),
+    ) -> list[dict[str, Any]]:
+        management_admin(request)
+        min_ml = float(ML_PER_US_FL_OZ) * min_oz if min_oz > 0 else None
+        pours = repository.pours_with_evidence(
+            limit=limit,
+            participant_id=participant_id,
+            unattributed_only=unattributed_only,
+            min_ml=min_ml,
+        )
+        videos = _list_videos()
+        for pour in pours:
+            pour["video"] = _match_video(pour, videos)
+        return pours
+
+    @app.get("/api/v1/management/videos", response_model=VideoLibraryResponse)
+    async def management_videos(request: Request) -> dict[str, Any]:
+        management_admin(request)
+        videos = _list_videos()
+        return {
+            "directory": str(paths.videos),
+            "keep": repository.video_keep(),
+            "total_bytes": sum(int(video["size_bytes"]) for video in videos),
+            "videos": [_public_video(video) for video in videos],
+        }
+
+    @app.get("/api/v1/management/videos/{name}", include_in_schema=False)
+    async def management_video(name: str, request: Request) -> FileResponse:
+        management_admin(request)
+        if not VIDEO_NAME.match(name):
+            raise HTTPException(status_code=404, detail="clip not found")
+        path = (paths.videos / name).resolve()
+        if paths.videos.resolve() not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="clip not found")
+        return FileResponse(path, media_type="video/webm")
+
+    @app.post("/api/v1/management/camera/record", response_model=CameraRequestResponse)
+    async def request_camera_clip(request: Request, payload: CameraRecordRequest) -> dict[str, Any]:
+        """Ask the kiosk browser (which owns the camera) to record a clip now."""
+        management_admin(request, mutation=True)
+        if not repository.get_setting("webcam_enabled", False):
+            raise HTTPException(status_code=409, detail="pour camera is disabled")
+        current = coordinator.camera_request()
+        if current is not None and current["status"] == "pending":
+            raise HTTPException(status_code=409, detail="a clip is already being recorded")
+        return await coordinator.request_recording(payload.seconds)
+
+    @app.post("/api/v1/evidence/requested-video", status_code=201, response_model=PourVideoResponse)
+    async def upload_requested_video(
+        request: Request, request_id: str = Query(min_length=32, max_length=32)
+    ) -> dict[str, Any]:
+        operational(request)
+        if not request.headers.get("content-type", "").lower().startswith("video/webm"):
+            raise HTTPException(status_code=415, detail="pour videos must be WebM")
+        current = coordinator.camera_request()
+        if current is None or current["id"] != request_id or current["status"] != "pending":
+            raise HTTPException(status_code=409, detail="no pending camera request with that id")
+        body = await request.body()
+        stored = await asyncio.to_thread(_store_pour_video, body, "manual")
+        await coordinator.resolve_recording(request_id, file=str(stored["file"]))
+        return stored
+
+    @app.post("/api/v1/evidence/requested-video/failed", response_model=CameraRequestResponse)
+    async def fail_requested_video(
+        request: Request, payload: CameraFailureRequest
+    ) -> dict[str, Any]:
+        operational(request)
+        return await coordinator.resolve_recording(payload.request_id, detail=payload.detail)
 
     @app.post(
         "/api/v1/management/participants/{participant_id}/funds",
@@ -686,7 +846,14 @@ def create_app(
         # Camera checks keep a small budget of their own so a round of testing
         # cannot evict real pour evidence.
         pools = (
-            ((*paths.videos.glob("pour_*.webm"), *paths.videos.glob("unattributed_*.webm")), 5),
+            (
+                (
+                    *paths.videos.glob("pour_*.webm"),
+                    *paths.videos.glob("unattributed_*.webm"),
+                    *paths.videos.glob("manual_*.webm"),
+                ),
+                repository.video_keep(),
+            ),
             (tuple(paths.videos.glob("cameratest_*.webm")), 2),
         )
         removed = 0
@@ -755,7 +922,7 @@ def create_app(
             temporary.unlink(missing_ok=True)
             final_path.unlink(missing_ok=True)
             raise
-        for pruned_relative in repository.prune_unattributed_photos(keep=48):
+        for pruned_relative in repository.prune_unattributed_photos(keep=UNATTRIBUTED_PHOTO_KEEP):
             (paths.photos / pruned_relative).unlink(missing_ok=True)
         # A permanent, human-browsable copy: unlike the in-app evidence pool,
         # this mirror is never pruned, so the operator can review or link it

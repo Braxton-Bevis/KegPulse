@@ -197,6 +197,7 @@ class Repository:
         return {
             "price_cents_per_fl_oz": str(self.get_setting("beer_price_cents_per_fl_oz", "0")),
             "webcam_enabled": bool(self.get_setting("webcam_enabled", False)),
+            "video_keep": self.video_keep(),
             "participants": participants,
             "ledger": ledger,
             "photos": photos,
@@ -1468,12 +1469,21 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def video_keep(self) -> int:
+        """How many pour clips the videos folder retains (camera tests are separate)."""
+        try:
+            value = int(self.get_setting("video_keep", 40))
+        except (TypeError, ValueError):
+            value = 40
+        return max(5, min(value, 500))
+
     def list_pours(
         self,
         *,
         limit: int = 100,
         participant_id: str | None = None,
         unattributed_only: bool = False,
+        min_ml: float | None = None,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
         where: list[str] = []
@@ -1483,6 +1493,11 @@ class Repository:
             parameters.append(participant_id)
         if unattributed_only:
             where.append("p.participant_id IS NULL")
+        if min_ml is not None and min_ml > 0:
+            # volume_ml is stored as a decimal string; pours without a volume
+            # (no calibration yet) cannot satisfy a size floor.
+            where.append("CAST(p.volume_ml AS REAL) >= ?")
+            parameters.append(float(min_ml))
         clause = " WHERE " + " AND ".join(where) if where else ""
         parameters.append(limit)
         with self.db.read() as connection:
@@ -1498,6 +1513,44 @@ class Repository:
                 parameters,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def pours_with_evidence(
+        self,
+        *,
+        limit: int = 100,
+        participant_id: str | None = None,
+        unattributed_only: bool = False,
+        min_ml: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pours for review, each with a representative snapshot when one exists.
+
+        Session-bound photos match directly; autonomous (unarmed) flow stores
+        its evidence without a session, so those match by the pour's window.
+        The middle frame is chosen: mid-pour is when the person is at the tap.
+        """
+        pours = self.list_pours(
+            limit=limit,
+            participant_id=participant_id,
+            unattributed_only=unattributed_only,
+            min_ml=min_ml,
+        )
+        with self.db.read() as connection:
+            for pour in pours:
+                photos: list[Any] = []
+                if pour.get("session_id"):
+                    photos = connection.execute(
+                        "SELECT id FROM pour_photos WHERE session_id=? ORDER BY captured_at",
+                        (pour["session_id"],),
+                    ).fetchall()
+                if not photos:
+                    photos = connection.execute(
+                        "SELECT id FROM pour_photos WHERE session_id IS NULL "
+                        "AND captured_at BETWEEN ? AND ? ORDER BY captured_at",
+                        (pour["started_at"], pour["created_at"]),
+                    ).fetchall()
+                pour["photo_id"] = photos[len(photos) // 2]["id"] if photos else None
+                pour["photo_count"] = len(photos)
+        return pours
 
     def iter_pours(self, *, page_size: int = 200) -> Iterable[dict[str, Any]]:
         """Yield a stable, complete newest-first export in bounded database pages."""

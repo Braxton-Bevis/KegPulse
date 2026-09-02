@@ -80,6 +80,7 @@ def test_video_upload_stores_and_keeps_only_last_five(
 
     client, video_dir = media_client
     client.app.state.repository.set_setting("webcam_enabled", True)
+    client.app.state.repository.set_setting("video_keep", 5)
     headers = csrf(client) | {"Content-Type": "video/webm"}
 
     for index in range(6):
@@ -213,10 +214,16 @@ def test_unattributed_photo_evidence_is_bounded(
     headers = csrf(client) | {"Content-Type": "image/jpeg"}
     repo = client.app.state.repository
     photos_dir = client.app.state.paths.photos / "unattributed"
+    import kegpulse.app as app_module
 
-    for _ in range(60):
-        response = client.post("/api/v1/evidence/photos", headers=headers, content=TINY_JPEG)
-        assert response.status_code == 201
+    assert app_module.UNATTRIBUTED_PHOTO_KEEP >= 48
+    app_module.UNATTRIBUTED_PHOTO_KEEP = 48
+    try:
+        for _ in range(60):
+            response = client.post("/api/v1/evidence/photos", headers=headers, content=TINY_JPEG)
+            assert response.status_code == 201
+    finally:
+        app_module.UNATTRIBUTED_PHOTO_KEEP = 400
 
     with repo.db.read() as connection:
         rows = connection.execute(
@@ -233,6 +240,7 @@ def test_unattributed_and_session_videos_share_one_five_slot_pool(
 
     client, video_dir = media_client
     client.app.state.repository.set_setting("webcam_enabled", True)
+    client.app.state.repository.set_setting("video_keep", 5)
     headers = csrf(client) | {"Content-Type": "video/webm"}
 
     stored = []

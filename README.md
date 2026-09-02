@@ -24,6 +24,9 @@ hardware. KegPulse is a personal monitoring tool, not a legal-for-trade meter.
 - Runs as a touch/keyboard PWA at 800×480, 1024×600, and desktop sizes with local-only assets.
 - Defaults to exact loopback; mutations use Host/Origin/CSRF checks, and an optional scrypt PIN
   protects administration. Explicit trusted-LAN mode requires a PIN and exact allowlists.
+- Pour review page (PIN protected): unclaimed pours with a minimum-size filter, mid-pour
+  snapshots, matched camera clips played in place, one-tap assignment, on-demand clip recording
+  from any device on the LAN, and a configurable clip retention count.
 - Provides atomic SQLite backup, validated command-line restore, CSV/JSON export, rotating JSON
   logs, writable per-user paths, deterministic fault injection, and diagnostics.
 

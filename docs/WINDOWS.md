@@ -42,6 +42,10 @@ environment because its optional web dependencies conflict with the patched host
 
 # Fullscreen kiosk preference
 .\scripts\run-windows.ps1 -Kiosk
+
+# Store (or reset) the administrator PIN for this machine's data directory.
+# Works while KegPulse is running; log in with the new PIN straight away.
+.\.venv\Scripts\python.exe -m kegpulse --set-pin 1976
 ```
 
 The terminal always prints the URL, normally `http://127.0.0.1:8765`. If no supported browser
